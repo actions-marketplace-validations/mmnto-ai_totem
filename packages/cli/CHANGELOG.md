@@ -1,5 +1,22 @@
 # @mmnto/cli
 
+## 0.3.0
+
+### Minor Changes
+
+- 80aaf73: feat: add `totem anchor` (and `totem add-lesson`) command to interactively add lessons to project memory and trigger a background re-index
+
+### Patch Changes
+
+- @mmnto/totem@0.3.0
+
+## 0.2.2
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@0.2.2
+
 ## 0.2.1
 
 ### Patch Changes
