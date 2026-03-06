@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import * as path from 'node:path';
 
 import { globSync } from 'glob';
@@ -85,28 +85,79 @@ export function resolveFiles(
   return results;
 }
 
+/** Validate that a git ref is safe (hex SHA, HEAD~N, branch name — no shell metacharacters). */
+const SAFE_GIT_REF = /^[a-zA-Z0-9_./:~^{}\-]+$/;
+
 /**
  * Get files changed since a given git ref (e.g., HEAD~1 or a commit SHA).
- * Used for incremental sync.
+ * Also includes untracked files so new files are picked up on incremental sync.
+ * Uses -z for null-delimited output consistent with getGitNonIgnoredFiles.
  */
 export function getChangedFiles(
   projectRoot: string,
   sinceRef: string = 'HEAD~1',
   onWarn?: (msg: string) => void,
 ): string[] | null {
+  if (!SAFE_GIT_REF.test(sinceRef)) {
+    if (onWarn) {
+      onWarn(`Invalid git ref "${sinceRef}" — falling back to full sync.`);
+    }
+    return null;
+  }
+
   try {
-    const output = execSync(`git diff --name-only ${sinceRef}`, {
+    const diffOutput = execFileSync('git', ['diff', '-z', '--name-only', sinceRef], {
       cwd: projectRoot,
       encoding: 'utf-8',
+      shell: process.platform === 'win32',
     });
-    return output
-      .split('\n')
-      .map((line) => line.trim().replace(/\\/g, '/'))
-      .filter(Boolean);
+
+    // Also pick up untracked files (new files not yet committed)
+    let untrackedOutput = '';
+    try {
+      untrackedOutput = execFileSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
+        cwd: projectRoot,
+        encoding: 'utf-8',
+        shell: process.platform === 'win32',
+      });
+    } catch (err) {
+      if (onWarn) {
+        onWarn(
+          `Failed to list untracked files: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    const paths = new Set(
+      (diffOutput + untrackedOutput)
+        .split('\0')
+        .map((p) => p.replace(/\\/g, '/'))
+        .filter(Boolean),
+    );
+
+    return [...paths];
   } catch (err) {
     const msg = `Failed to get changed files from git. Error: ${err instanceof Error ? err.message : String(err)}`;
     if (onWarn) {
       onWarn(msg);
+    }
+    return null;
+  }
+}
+
+/**
+ * Get the current HEAD SHA for sync state tracking.
+ */
+export function getHeadSha(projectRoot: string, onWarn?: (msg: string) => void): string | null {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: projectRoot,
+      encoding: 'utf-8',
+      shell: process.platform === 'win32',
+    }).trim();
+  } catch (err) {
+    if (onWarn) {
+      onWarn(`Failed to read HEAD SHA: ${err instanceof Error ? err.message : String(err)}`);
     }
     return null;
   }
