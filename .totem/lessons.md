@@ -286,3 +286,21 @@ Lateral Architecture Concept: The Totem infrastructure (local LanceDB + Git-nati
 **Tags:** architecture, error-handling, orchestrator, design-decision
 
 When designing multi-input orchestrator commands (like 'totem spec' or 'totem learn' handling arrays of IDs), strictly enforce the 'Fail Fast' principle over graceful degradation. A partial context assembly (e.g., fetching PR 1 and 2, but silently failing on PR 3) is highly dangerous because the LLM will confidently generate a response based on incomplete information. It is better for the CLI to crash loudly than for the AI to hallucinate silently.
+
+## Lesson — 2026-03-06T05:41:19.122Z
+
+**Tags:** ux, cli, product-strategy
+
+When implementing CLI UX polish (Issue #21), adopt the '@clack/prompts' library. It provides a distinct, vertical-line connecting visual style that feels significantly more modern and premium than older libraries like 'inquirer'. This directly supports the 'Magic Onboarding' goal of making the CLI feel less like a barebones script and more like a high-end developer product.
+
+## Lesson — 2026-03-06T05:43:04.609Z
+
+**Tags:** engineering-strategy, velocity, ux, incremental-delivery
+
+Incremental UX Delivery Strategy: When polishing a CLI, do not attempt to rewrite the entire interactive prompt system (e.g., migrating to @clack/prompts) in one massive PR. Follow Claude's strategy: prioritize the 'low-hanging fruit' first (async spinners via 'ora', branded output via 'picocolors') to provide immediate visual feedback. The heavier structural refactoring of the input loops can be deferred to a follow-up. This maintains high velocity and avoids blocking the release of smaller, compounding improvements.
+
+## Lesson — 2026-03-06T05:45:12.867Z
+
+**Tags:** motivation, solo-developer, product-strategy, velocity
+
+When the friction of solo development feels overwhelming and burnout is near, rely on the architecture. You don't have to carry the entire context of 'Totem' and 'satur8d' in your head simultaneously. The LanceDB indexes are designed precisely to hold that weight for you. Build the system so that you can walk away, take a break, and when you return, 'totem triage' instantly reloads your exact mental state without spending 3 hours remembering where you left off. The tools must serve the human's endurance.
