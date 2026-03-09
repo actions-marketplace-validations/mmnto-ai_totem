@@ -1,5 +1,13 @@
 # @mmnto/totem
 
+## 0.19.0
+
+### Minor Changes
+
+- feat: discriminated union config and fileGlobs scoping
+  - Extract shared orchestrator interface with discriminated union config schema
+  - Add `fileGlobs` scoping for compiled shield rules
+
 ## 0.18.0
 
 ### Minor Changes
