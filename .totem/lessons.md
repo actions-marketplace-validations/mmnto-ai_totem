@@ -758,3 +758,27 @@ When positional arguments and CLI flags offer overlapping or conflicting functio
 **Tags:** nodejs, path-processing, trap
 
 Use `path.relative(process.cwd(), path.resolve(process.cwd(), input))` for robust path normalization instead of simple string replacements. This approach correctly handles shell-expanded absolute paths (e.g., from tab-completion) so they match relative paths defined in application configuration.
+
+## Lesson — Always use fully qualified identifiers for caching and telemetry
+
+**Tags:** caching, telemetry, architecture
+
+Always use fully qualified identifiers (e.g., `provider:model`) for cache hashing and telemetry instead of just the model name. This prevents cross-provider cache collisions in environments where different backends happen to share identical model naming conventions.
+
+## Lesson — Ensure validation checks are applied symmetrically
+
+**Tags:** validation, error-handling, fallback
+
+Ensure validation checks are applied symmetrically to both primary and fallback execution paths. Relying on primary-path validation alone creates a trap where invalid configuration only triggers a failure during error recovery (e.g., a quota retry), making the resulting failure much harder to debug.
+
+## Lesson — Use vi.importActual in mocks to preserve utility functions
+
+**Tags:** testing, vitest, mocks
+
+When mocking modules, use `vi.importActual` to maintain the real implementation of pure utility functions while mocking only the side-effect-heavy factories. Re-implementing utility logic inside a mock makes tests brittle and allows them to pass even if the actual implementation changes and breaks.
+
+## Lesson — Block cross-provider routing into specialized providers
+
+**Tags:** architecture, shell-provider, validation
+
+Explicitly block cross-provider routing into specialized providers (like `shell`) that require unique configuration templates not present in the source provider's setup. Failing fast at the routing layer prevents cryptic runtime errors when an orchestrator attempts to execute a prompt without the necessary provider-specific execution context.
