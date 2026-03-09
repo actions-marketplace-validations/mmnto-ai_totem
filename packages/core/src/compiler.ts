@@ -89,16 +89,20 @@ interface DiffAddition {
   file: string;
   line: string;
   lineNumber: number;
+  /** Content of the preceding line in the new file (context or added), null if first in hunk */
+  precedingLine: string | null;
 }
 
 /**
  * Extract added lines from a unified diff.
  * Returns only lines that start with `+` (excluding `+++` file headers).
+ * Tracks the preceding line content (context or added) for suppression support.
  */
 export function extractAddedLines(diff: string): DiffAddition[] {
   const additions: DiffAddition[] = [];
   let currentFile = '';
   let lineNum = 0;
+  let prevLineContent: string | null = null;
 
   for (const rawLine of diff.split('\n')) {
     // Track current file from diff headers
@@ -111,6 +115,7 @@ export function extractAddedLines(diff: string): DiffAddition[] {
       }
       // Strip the "b/" prefix git uses for the destination file
       currentFile = pathPart.startsWith('b/') ? pathPart.slice(2) : pathPart;
+      prevLineContent = null;
       continue;
     }
 
@@ -118,6 +123,7 @@ export function extractAddedLines(diff: string): DiffAddition[] {
     const hunkMatch = rawLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
     if (hunkMatch) {
       lineNum = parseInt(hunkMatch[1]!, 10) - 1; // will be incremented on first line
+      prevLineContent = null;
       continue;
     }
 
@@ -129,15 +135,22 @@ export function extractAddedLines(diff: string): DiffAddition[] {
     // Count lines for position tracking
     if (rawLine.startsWith('+')) {
       lineNum++;
+      const lineContent = rawLine.slice(1); // strip the leading +
       additions.push({
         file: currentFile,
-        line: rawLine.slice(1), // strip the leading +
+        line: lineContent,
         lineNumber: lineNum,
+        precedingLine: prevLineContent,
       });
-    } else if (!rawLine.startsWith('-')) {
-      // Context line (no prefix or space prefix) — increment line counter
+      prevLineContent = lineContent;
+    } else if (rawLine.startsWith('-')) {
+      // Deleted line — NOT in new file, don't update prevLineContent or lineNum
+    } else if (rawLine.startsWith(' ')) {
+      // Context line — in new file
       lineNum++;
+      prevLineContent = rawLine.slice(1);
     }
+    // Ignore other lines (e.g., '\ No newline at end of file')
   }
 
   return additions;
@@ -178,6 +191,30 @@ function fileMatchesGlobs(filePath: string, globs: string[]): boolean {
 
 // ─── Rule execution ──────────────────────────────────
 
+// ─── Inline suppression ─────────────────────────────
+
+const SUPPRESS_MARKER = 'totem-ignore';
+const SUPPRESS_NEXT_LINE_MARKER = 'totem-ignore-next-line';
+
+/**
+ * Check if a line should be suppressed via inline directives.
+ * Supports two forms:
+ * - Same-line: code(); // totem-ignore  (suppresses all rules on this line)
+ * - Next-line: // totem-ignore-next-line on the preceding line (suppresses all rules on this line)
+ *
+ * Syntax-agnostic: works with any comment style (//, #, HTML comments, block comments).
+ */
+function isSuppressed(line: string, precedingLine: string | null): boolean {
+  // Same-line: 'totem-ignore' substring also matches 'totem-ignore-next-line',
+  // so directive lines themselves are inherently suppressed.
+  if (line.includes(SUPPRESS_MARKER)) return true;
+
+  // Next-line: preceding line (context or added) contains the next-line directive
+  if (precedingLine != null && precedingLine.includes(SUPPRESS_NEXT_LINE_MARKER)) return true;
+
+  return false;
+}
+
 /**
  * Apply compiled rules against added lines from a diff.
  * Returns all violations found.
@@ -212,6 +249,9 @@ export function applyRules(
       if (rule.fileGlobs && rule.fileGlobs.length > 0) {
         if (!fileMatchesGlobs(addition.file, rule.fileGlobs)) continue;
       }
+
+      // Skip if suppressed via inline directive
+      if (isSuppressed(addition.line, addition.precedingLine)) continue;
 
       if (re.test(addition.line)) {
         violations.push({
