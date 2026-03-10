@@ -10,7 +10,7 @@ import type { IngestTarget } from '@mmnto/totem';
 import { BASELINE_MARKER, UNIVERSAL_LESSONS_MARKDOWN } from '../assets/universal-lessons.js';
 import { bold, brand, dim, log, printBanner, success } from '../ui.js';
 import { IS_WIN } from '../utils.js';
-import { installPostMergeHook } from './install-hooks.js';
+import { installEnforcementHooks, installPostMergeHook } from './install-hooks.js';
 
 const AI_PROMPT_BLOCK = `
 
@@ -26,6 +26,13 @@ You have access to the Totem MCP for long-term project memory. You MUST operate 
 3. **Tool Preference (MCP over CLI):** Always prioritize using dedicated MCP tools (e.g., GitHub, Supabase, Vercel) over executing generic shell commands (like \`gh issue view\` or \`curl\`). MCP tools provide structured, un-truncated data optimized for your context window. Only fall back to bash execution if an MCP tool is unavailable or fails.
 
 Lessons are automatically re-indexed in the background after each \`add_lesson\` call — no manual sync needed.
+
+### Memory Classification
+When deciding where to store information or rules, use this decision tree:
+- If forgetting this causes a mistake on an UNRELATED task (Core Safety): Store in your root agent memory file (e.g., CLAUDE.md or .gemini/gemini.md).
+- If it's a stable, project-wide workflow rule: Store in project config (e.g., CLAUDE.md).
+- If it's a stable syntax/style pattern: Store in the project's styleguide or linter rules.
+- If it's domain knowledge, an edge case, or a past trap: You MUST use the Totem \`add_lesson\` tool to anchor it into the project's LanceDB.
 
 ### Workflow Orchestrator Rituals
 [FOR LOCAL CLI/TERMINAL AGENTS ONLY] Do not attempt to run these commands if you are a headless bot or operating in a cloud PR environment (e.g., Gemini Code Assist on GitHub).
@@ -816,6 +823,31 @@ export async function initCommand(): Promise<void> {
           }
         }
       }
+    }
+
+    // --- Always run: enforcement hooks (pre-commit + pre-push) ---
+    const enforcement = await installEnforcementHooks(cwd, rl);
+    if (enforcement.preCommit === 'installed' || enforcement.preCommit === 'appended') {
+      summary.push({
+        file: '.git/hooks/pre-commit',
+        action: `${enforcement.preCommit === 'installed' ? 'Installed' : 'Appended'} main-branch protection`,
+      });
+    } else if (enforcement.preCommit === 'skipped-non-shell') {
+      summary.push({
+        file: '.git/hooks/pre-commit',
+        action: 'Skipped — non-shell hook detected (manual integration needed)',
+      });
+    }
+    if (enforcement.prePush === 'installed' || enforcement.prePush === 'appended') {
+      summary.push({
+        file: '.git/hooks/pre-push',
+        action: `${enforcement.prePush === 'installed' ? 'Installed' : 'Appended'} deterministic shield gate`,
+      });
+    } else if (enforcement.prePush === 'skipped-non-shell') {
+      summary.push({
+        file: '.git/hooks/pre-push',
+        action: 'Skipped — non-shell hook detected (manual integration needed)',
+      });
     }
 
     // --- Always run: post-merge git hook ---

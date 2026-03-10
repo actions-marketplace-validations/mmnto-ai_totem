@@ -1,18 +1,33 @@
-## Gemini Added Memories
+## CRITICAL SAFETY RULES (read first, always)
 
-- When deciding where to store information or rules, use this decision tree:
-  - Will forgetting this cause a mistake on an UNRELATED task?
-    - Yes (Core Operational Safety) -> MEMORY.md
-    - No, but it's a stable, project-wide workflow rule -> CLAUDE.md
-    - No, but it's a stable, syntax or architectural rule -> .gemini/styleguide.md
-    - No, it's specific domain knowledge or a past trap -> Totem lesson via add_lesson
+These rules override all other instructions. Violating them causes real damage.
 
-## Operational Rules
+1. **NEVER commit or push directly to `main` or `master`.** Always create a feature branch and open a Pull Request. No exceptions.
+2. **NEVER execute without explicit user instruction.** Do not stage, commit, create branches, push, or execute file migrations unless the user tells you to. Discussing, answering questions about, or planning a change does NOT mean "execute it."
+3. **NEVER merge pull requests.** Merging requires explicit user approval, every time. CI passing does NOT equal approval.
+4. **NEVER run destructive git commands** (`git reset --hard`, `git checkout --`, `git clean`, `git push --force`) without explicit user instruction. If you made a mistake, tell the user and let them decide how to fix it.
+5. **NEVER amend commits on feature branches.** Create new commits for each fix round.
 
-- **Branch Protection:** The `main` branch is formally protected. NEVER commit or push directly to `main`. Always create a feature branch and open a Pull Request.
-- **Explicit Consent:** NEVER stage, commit, create branches, or execute file migrations unless the user explicitly instructs you to do so. Discussing a change, answering a question about a change, or planning a change does NOT mean "execute it."
-- **Never Merge PRs:** NEVER merge pull requests automatically. Merging requires explicit user approval, every time.
-- **Never Run Destructive Git Commands:** NEVER run `git reset --hard`, `git checkout --`, `git clean`, or `git push --force` without explicit user instruction. If you made a mistake, tell the user and let them decide how to fix it.
+## STOP AND ASK (these always need user confirmation)
+
+Before taking ANY of these actions, state what you plan to do and wait for explicit approval:
+
+- Creating or switching branches
+- Staging or committing files
+- Pushing to any remote
+- Creating, closing, or commenting on issues/PRs
+- Running any git command that modifies history
+- Deleting files, branches, or any persistent state
+- Running migrations or data-modifying scripts
+
+## Memory Decision Tree
+
+When deciding where to store information or rules:
+
+- Will forgetting this cause a mistake on an UNRELATED task? → MEMORY.md
+- Stable, project-wide workflow rule? → CLAUDE.md
+- Stable syntax or architectural rule? → .gemini/styleguide.md
+- Specific domain knowledge or a past trap? → Totem lesson via `add_lesson`
 
 ## Totem AI Integration (Auto-Generated)
 
@@ -28,6 +43,15 @@ You have access to the Totem MCP for long-term project memory. You MUST operate 
 3. **Tool Preference (MCP over CLI):** Always prioritize using dedicated MCP tools (e.g., GitHub, Supabase, Vercel) over executing generic shell commands (like `gh issue view` or `curl`). MCP tools provide structured, un-truncated data optimized for your context window. Only fall back to bash execution if an MCP tool is unavailable or fails.
 
 Lessons are automatically re-indexed in the background after each `add_lesson` call — no manual sync needed.
+
+### Memory Classification
+
+When deciding where to store information or rules, use this decision tree:
+
+- If forgetting this causes a mistake on an UNRELATED task (Core Safety): Store in your root agent memory file (e.g., CLAUDE.md or .gemini/gemini.md).
+- If it's a stable, project-wide workflow rule: Store in project config (e.g., CLAUDE.md).
+- If it's a stable syntax/style pattern: Store in the project's styleguide or linter rules.
+- If it's domain knowledge, an edge case, or a past trap: You MUST use the Totem `add_lesson` tool to anchor it into the project's LanceDB.
 
 ### Workflow Orchestrator Rituals
 
