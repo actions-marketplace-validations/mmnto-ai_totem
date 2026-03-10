@@ -80,6 +80,58 @@ export function parseModelString(
   return { provider: defaultProvider, model: value };
 }
 
+// ─── Centralized model resolution (#248) ────────────
+
+/** Characters allowed in model names — restricts shell metacharacters. */
+const MODEL_NAME_RE = /^[\w./:_-]+$/;
+
+export interface ResolvedOrchestrator {
+  parsed: { provider: string; model: string };
+  invoke: InvokeOrchestrator;
+  qualifiedModel: string;
+}
+
+/**
+ * Parse and validate a model string, resolve cross-provider routing,
+ * and return the appropriate invoker. Centralizes the validation logic
+ * to guarantee symmetric validation across primary and fallback paths.
+ */
+export function resolveOrchestrator(
+  rawModel: string,
+  baseProvider: string,
+  baseInvoke: InvokeOrchestrator,
+): ResolvedOrchestrator {
+  if (rawModel.startsWith('-') || !MODEL_NAME_RE.test(rawModel)) {
+    throw new Error(
+      `[Totem Error] Invalid model name '${rawModel}'. Model names may only contain word characters, dots, slashes, colons, underscores, and hyphens.`,
+    );
+  }
+
+  const parsed = parseModelString(rawModel, baseProvider);
+
+  if (parsed.provider === 'shell' && baseProvider !== 'shell') {
+    throw new Error(
+      `[Totem Error] Cannot route to 'shell' provider from a '${baseProvider}' config.\n` +
+        `The shell provider requires a 'command' template in the orchestrator config.`,
+    );
+  }
+
+  if (!parsed.model || parsed.model.startsWith('-')) {
+    throw new Error(
+      `[Totem Error] Invalid model name in '${rawModel}'. The model portion must not be empty or start with a hyphen.`,
+    );
+  }
+
+  const invoke =
+    parsed.provider === baseProvider
+      ? baseInvoke
+      : createOrchestrator({ provider: parsed.provider } as Parameters<
+          typeof createOrchestrator
+        >[0]);
+
+  return { parsed, invoke, qualifiedModel: rawModel };
+}
+
 // ─── Factory ─────────────────────────────────────────
 
 /**
