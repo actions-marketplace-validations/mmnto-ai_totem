@@ -29,8 +29,7 @@ design/
 .DS_Store
 Thumbs.db
 
-# Strategy & Private Docs
-.strategy/
+# Legacy directory (now lives inside .strategy submodule)
 .analysis/
 
 # CLI Dogfooding Artifacts
