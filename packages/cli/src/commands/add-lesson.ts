@@ -1,36 +1,53 @@
-import { spawn } from 'node:child_process';
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { stdin as input, stdout as output } from 'node:process';
-import * as readline from 'node:readline/promises';
-
-import { generateLessonHeading } from '@mmnto/totem';
-
-import { log } from '../ui.js';
-import { IS_WIN, loadConfig, loadEnv, resolveConfigPath, sanitize } from '../utils.js';
-
-function detectSyncCommand(cwd: string): { cmd: string; args: string[] } {
-  if (fs.existsSync(path.join(cwd, 'pnpm-lock.yaml'))) {
-    return { cmd: IS_WIN ? 'pnpm.cmd' : 'pnpm', args: ['exec', 'totem', 'sync', '--incremental'] };
-  }
-  if (fs.existsSync(path.join(cwd, 'yarn.lock'))) {
-    return { cmd: IS_WIN ? 'yarn.cmd' : 'yarn', args: ['totem', 'sync', '--incremental'] };
-  }
-  return { cmd: IS_WIN ? 'npx.cmd' : 'npx', args: ['totem', 'sync', '--incremental'] };
-}
+const TAG = 'AddLesson';
 
 export async function addLessonCommand(lessonArg?: string): Promise<void> {
+  const { spawn } = await import('node:child_process');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { stdin: input, stdout: output } = await import('node:process');
+  const readline = await import('node:readline/promises');
+  const { generateLessonHeading, writeLessonFile } = await import('@mmnto/totem'); // totem-ignore
+  const { log } = await import('../ui.js');
+  const { IS_WIN, isGlobalConfigPath, loadConfig, loadEnv, resolveConfigPath, sanitize } =
+    await import('../utils.js');
+
+  function detectSyncCommand(cwd: string): { cmd: string; args: string[] } {
+    if (fs.existsSync(path.join(cwd, 'pnpm-lock.yaml'))) {
+      return {
+        cmd: IS_WIN ? 'pnpm.cmd' : 'pnpm',
+        args: ['exec', 'totem', 'sync', '--incremental'],
+      };
+    }
+    if (fs.existsSync(path.join(cwd, 'yarn.lock'))) {
+      return { cmd: IS_WIN ? 'yarn.cmd' : 'yarn', args: ['totem', 'sync', '--incremental'] };
+    }
+    return { cmd: IS_WIN ? 'npx.cmd' : 'npx', args: ['totem', 'sync', '--incremental'] };
+  }
+
+  const { loadCustomSecrets, maskSecrets } = await import('@mmnto/totem'); // totem-ignore
+
   const cwd = process.cwd();
   const configPath = resolveConfigPath(cwd);
+  if (isGlobalConfigPath(configPath)) {
+    const { TotemConfigError } = await import('@mmnto/totem');
+    throw new TotemConfigError(
+      'Cannot add lessons without a local project.',
+      "Run 'totem init' to create a local .totem/ directory first.",
+      'CONFIG_MISSING',
+    );
+  }
   loadEnv(cwd);
   const config = await loadConfig(configPath);
+
+  // Load user-defined custom secrets for DLP (#921)
+  const customSecrets = loadCustomSecrets(cwd, config.totemDir, (msg) => log.warn(TAG, msg));
 
   const totemDir = path.join(cwd, config.totemDir);
   if (!fs.existsSync(totemDir)) {
     fs.mkdirSync(totemDir, { recursive: true });
   }
 
-  const lessonsPath = path.join(totemDir, 'lessons.md');
+  const lessonsDir = path.join(totemDir, 'lessons');
 
   let lessonText = lessonArg;
   const tags: string[] = [];
@@ -65,8 +82,20 @@ export async function addLessonCommand(lessonArg?: string): Promise<void> {
   }
 
   if (!lessonText || !lessonText.trim()) {
-    log.error('Totem', 'Lesson text cannot be empty.');
+    log.error('Totem Error', 'Lesson text cannot be empty.');
     return;
+  }
+
+  // Warn and redact if lesson text contains custom secret patterns (#921)
+  if (customSecrets.length > 0) {
+    const redacted = maskSecrets(lessonText, customSecrets);
+    if (redacted !== lessonText) {
+      log.warn(
+        TAG,
+        'Custom secret pattern detected in lesson text. The text will be automatically redacted.',
+      );
+      lessonText = redacted;
+    }
   }
 
   const safeLesson = sanitize(lessonText);
@@ -74,10 +103,11 @@ export async function addLessonCommand(lessonArg?: string): Promise<void> {
     tags.length > 0 ? tags.map((t) => sanitize(t).replace(/\n/g, ' ')).join(', ') : 'manual';
   const heading = generateLessonHeading(safeLesson);
 
-  const entry = `\n## Lesson — ${heading}\n\n**Tags:** ${safeTagString}\n\n${safeLesson.trim()}\n`;
+  const entry = `## Lesson — ${heading}\n\n**Tags:** ${safeTagString}\n\n${safeLesson.trim()}\n`;
 
-  fs.appendFileSync(lessonsPath, entry, 'utf-8');
-  log.success('Totem', `Lesson saved to ${config.totemDir}/lessons.md`);
+  const writtenPath = writeLessonFile(lessonsDir, entry);
+  const fileName = path.basename(writtenPath);
+  log.success('Totem', `Lesson saved to ${config.totemDir}/lessons/${fileName}`); // totem-ignore
 
   const logPath = path.join(totemDir, 'mcp-sync.log');
   log.dim('Totem', 'Triggering background re-index...');
@@ -92,6 +122,7 @@ export async function addLessonCommand(lessonArg?: string): Promise<void> {
       windowsHide: true,
     });
     child.unref();
+    fs.closeSync(logFd);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     log.warn('Totem', `Failed to trigger background sync: ${message}`);

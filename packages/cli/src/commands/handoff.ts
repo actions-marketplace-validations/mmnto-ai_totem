@@ -1,136 +1,91 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { getGitBranch, getGitDiff, getGitDiffStat, getGitLogSince, getGitStatus } from '../git.js';
-import { log } from '../ui.js';
-import {
-  getSystemPrompt,
-  loadConfig,
-  loadEnv,
-  resolveConfigPath,
-  runOrchestrator,
-  sanitize,
-  wrapXml,
-  writeOutput,
-} from '../utils.js';
+import { readAllLessons } from '@mmnto/totem'; // totem-context: static import required — readRecentLessons is a sync exported helper used in tests
+
+import { sanitize } from '../utils.js';
 
 // ─── Constants ──────────────────────────────────────────
 
 const TAG = 'Handoff';
-const MAX_DIFF_CHARS = 50_000;
 const LESSONS_TAIL_LINES = 100;
+const RECENT_COMMITS_COUNT = 10;
+const MAX_SLUG_LENGTH = 60;
 
-// ─── System prompt ──────────────────────────────────────
-
-const SYSTEM_PROMPT = `# Handoff System Prompt — End-of-Session State Transfer
-
-## Purpose
-Produce an end-of-session handoff snapshot that captures everything the next session (or the next developer) needs to resume work immediately.
-
-## Role
-You are writing a concise, tactical "End of Shift" handoff. You have access to the current git state, uncommitted changes, and lessons learned during this session. Your job is to synthesize this into a snapshot that lets the next session bootstrap instantly — no detective work required.
-
-## Rules
-- Be concrete and specific — file paths, branch names, issue numbers
-- Distinguish between what IS done vs what NEEDS to be done next
-- If there are uncommitted changes, describe what they represent and whether they look ready to commit
-- If the working tree is clean, say so and focus on what was accomplished and what's next
-- Capture any lessons or traps discovered during this session
-- Be concise — this is a tactical handoff, not a retrospective
-
-## Output Format
-Respond with ONLY the sections below. No preamble, no closing remarks.
-
-### Branch & State
-[Current branch, clean/dirty status, what the branch represents]
-
-### What Was Done
-[Summary of work completed this session based on the diff and git state. If no changes, say "No uncommitted changes — session may have been exploratory or changes were already committed."]
-
-### Uncommitted Changes
-[Description of what the uncommitted changes contain and their state (staged vs unstaged). If clean, say "Working tree is clean."]
-
-### Lessons & Traps
-[Lessons learned during this session from the memory file. If none, say "No new lessons recorded this session."]
-
-### Next Steps
-[Clear, ordered list of what the next session should do first. Be specific — not "continue working" but "finish implementing X in file Y, then run tests."]
-`;
+/** Local calendar date as YYYY-MM-DD (avoids UTC off-by-one for evening users). */
+function currentLocalDate(): string {
+  const now = new Date();
+  return [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+  ].join('-');
+}
 
 // ─── Lessons file reader ────────────────────────────────
 
 export function readRecentLessons(cwd: string, totemDir: string): string {
-  const lessonsPath = path.join(cwd, totemDir, 'lessons.md');
-  if (!fs.existsSync(lessonsPath)) return '';
+  const fullTotemDir = path.join(cwd, totemDir);
+  const lessons = readAllLessons(fullTotemDir);
+  if (lessons.length === 0) return '';
 
-  const content = fs.readFileSync(lessonsPath, 'utf-8');
-  const lines = content.split('\n');
+  // Combine all raw lesson text
+  const combined = lessons.map((l) => l.raw).join('\n');
+  const lines = combined.split('\n');
 
-  if (lines.length <= LESSONS_TAIL_LINES) return content.trim();
+  if (lines.length <= LESSONS_TAIL_LINES) return combined.trim();
 
   return lines.slice(-LESSONS_TAIL_LINES).join('\n').trim();
 }
 
-// ─── Prompt assembly ────────────────────────────────────
+// ─── Slug from branch ───────────────────────────────────
 
-function assemblePrompt(
+/**
+ * Derive a filesystem-safe slug from the git branch name.
+ * Falls back to 'session' for main, master, or detached HEAD.
+ */
+export function slugFromBranch(branch: string): string {
+  const generic = ['main', 'master', 'HEAD', '', '(unknown)'];
+  if (generic.includes(branch)) return 'session';
+
+  // Strip common prefixes (feat/, fix/, chore/, hotfix/, etc.)
+  const stripped = branch.replace(/^[a-z]+\//, '');
+  // Sanitize: lowercase, replace non-alphanumeric with hyphens, collapse runs, trim
+  return (
+    stripped
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, MAX_SLUG_LENGTH) || 'session'
+  );
+}
+
+// ─── Journal path resolution ────────────────────────────
+
+/**
+ * Build the journal file path: .totem/journal/YYYY-MM-DD-<slug>.md
+ * If --out is specified, use that path instead.
+ */
+export function resolveJournalPath(
+  cwd: string,
+  totemDir: string,
   branch: string,
-  status: string,
-  diff: string,
-  diffStat: string,
-  lessons: string,
-  systemPrompt: string,
+  outPath?: string,
 ): string {
-  const sections: string[] = [systemPrompt];
+  if (outPath) return outPath;
 
-  // Git state
-  sections.push('=== GIT STATE ===');
-  sections.push(`Branch: ${branch}`);
-  sections.push(`Status:\n${status ? wrapXml('git_status', status) : '(clean working tree)'}`);
-
-  // Diff
-  sections.push('\n=== DIFF ===');
-  if (!diff.trim()) {
-    sections.push('(no uncommitted changes)');
-  } else {
-    if (diffStat) {
-      sections.push(`Diff stat:\n${diffStat}`);
-      sections.push('');
-    }
-    if (diff.length > MAX_DIFF_CHARS) {
-      sections.push(
-        wrapXml(
-          'git_diff',
-          diff.slice(0, MAX_DIFF_CHARS) + `\n... [diff truncated at ${MAX_DIFF_CHARS} chars] ...`,
-        ),
-      );
-    } else {
-      sections.push(wrapXml('git_diff', diff));
-    }
-  }
-
-  // Lessons
-  sections.push('\n=== SESSION LESSONS ===');
-  sections.push(lessons || '(no lessons recorded)');
-
-  return sections.join('\n');
+  const date = currentLocalDate(); // YYYY-MM-DD
+  const slug = slugFromBranch(branch);
+  return path.join(cwd, totemDir, 'journal', `${date}-${slug}.md`);
 }
 
-// ─── Main command ───────────────────────────────────────
+// ─── Journal scaffold builder ───────────────────────────
 
-export interface HandoffOptions {
-  raw?: boolean;
-  out?: string;
-  model?: string;
-  fresh?: boolean;
-  lite?: boolean;
-}
-
-// ─── Lite handoff (zero LLM) ────────────────────────────
-
-const RECENT_COMMITS_COUNT = 10;
-
-export function buildLiteHandoff(
+/**
+ * Build the structured journal scaffold with human-editable sections
+ * at the top and deterministic git state at the bottom.
+ */
+export function buildJournalScaffold(
   branch: string,
   status: string,
   diffStat: string,
@@ -138,13 +93,33 @@ export function buildLiteHandoff(
   lessons: string,
 ): string {
   // Sanitize git-sourced fields to strip ANSI escapes / control chars
-  const sBranch = sanitize(branch); // totem-ignore — ANSI stripping for terminal output safety
+  const sBranch = sanitize(branch);
   const sStatus = sanitize(status);
   const sDiffStat = sanitize(diffStat);
   const sCommits = sanitize(recentCommits);
 
+  const date = currentLocalDate();
   const lines: string[] = [];
 
+  // ── Human-editable section (top) ──
+  lines.push(`# ${date} — ${sBranch}`);
+  lines.push('');
+  lines.push('## What Shipped');
+  lines.push('<!-- What was accomplished this session? -->');
+  lines.push('');
+  lines.push('## Architectural Decisions');
+  lines.push('<!-- Any design choices worth recording? -->');
+  lines.push('');
+  lines.push('## Open Tickets');
+  lines.push('<!-- Tickets filed, referenced, or blocked? -->');
+  lines.push('');
+  lines.push('## Next Steps');
+  lines.push('<!-- What should the next session pick up? -->');
+  lines.push('');
+
+  // ── Deterministic git state (bottom) ──
+  lines.push('---');
+  lines.push('');
   lines.push('### Branch & State');
   lines.push(`${sBranch}; ${sStatus.trim() ? 'dirty working tree' : 'clean working tree'}.`);
   lines.push('');
@@ -183,12 +158,41 @@ export function buildLiteHandoff(
     lines.push('No lessons file found.');
   }
 
-  return lines.join('\n');
+  return lines.join('\n') + '\n';
+}
+
+// ─── Editor launcher ────────────────────────────────────
+
+/**
+ * Open a file in the user's editor. Uses $VISUAL, then $EDITOR, then vi.
+ * Returns true if the editor exited successfully.
+ */
+export async function openInEditor(filePath: string): Promise<boolean> {
+  const { spawnSync } = await import('node:child_process');
+  const editor = process.env['VISUAL'] || process.env['EDITOR'] || 'vi';
+  // Use shell: true so the system shell parses the editor command (handles
+  // quoted paths like "/Applications/Visual Studio Code.app/.../code" --wait
+  // and Windows .cmd/.bat resolution).
+  const result = spawnSync(`${editor} "${filePath}"`, {
+    stdio: 'inherit',
+    shell: true,
+  });
+  return result.status === 0;
 }
 
 // ─── Main command ───────────────────────────────────────
 
+export interface HandoffOptions {
+  stdout?: boolean;
+  lite?: boolean;
+  out?: string;
+}
+
 export async function handoffCommand(options: HandoffOptions): Promise<void> {
+  const { getGitBranch, getGitDiffStat, getGitLogSince, getGitStatus } = await import('../git.js');
+  const { log } = await import('../ui.js');
+  const { loadConfig, loadEnv, resolveConfigPath } = await import('../utils.js');
+
   const cwd = process.cwd();
   const configPath = resolveConfigPath(cwd);
   loadEnv(cwd);
@@ -200,42 +204,52 @@ export async function handoffCommand(options: HandoffOptions): Promise<void> {
   const status = getGitStatus(cwd);
   log.info(TAG, `Branch: ${branch}`);
 
-  // Get diff
-  log.info(TAG, 'Getting uncommitted diff...');
-  const diff = getGitDiff('all', cwd);
-  const diffStat = diff.trim() ? getGitDiffStat(cwd) : '';
-
-  if (diff.trim()) {
-    log.info(TAG, `Diff: ${(diff.length / 1024).toFixed(0)}KB`);
-  } else {
-    log.dim(TAG, 'Working tree is clean.');
-  }
+  const diffStat = status.trim() ? getGitDiffStat(cwd) : '';
+  const recentCommits = getGitLogSince(cwd, undefined, RECENT_COMMITS_COUNT);
 
   // Read recent lessons
-  log.info(TAG, 'Reading recent lessons...');
   const lessons = readRecentLessons(cwd, config.totemDir);
-  log.info(TAG, `Lessons: ${lessons ? `${lessons.split('\n').length} lines` : 'none found'}`);
 
-  // Lite mode — deterministic, zero LLM
-  if (options.lite) {
-    const recentCommits = getGitLogSince(cwd, undefined, RECENT_COMMITS_COUNT);
-    const output = buildLiteHandoff(branch, status, diffStat, recentCommits, lessons);
-    writeOutput(output, options.out);
-    if (options.out) log.success(TAG, `Written to ${options.out}`);
-    log.dim(TAG, 'Lite handoff complete (zero LLM).');
+  // Build scaffold
+  const scaffold = buildJournalScaffold(branch, status, diffStat, recentCommits, lessons);
+
+  // --out: write to the specified path and exit (no editor)
+  if (options.out) {
+    const outDir = path.dirname(options.out);
+    if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true });
+    fs.writeFileSync(options.out, scaffold, 'utf-8');
+    log.success(TAG, `Scaffold written to ${options.out}`);
     return;
   }
 
-  // Resolve system prompt (allow .totem/prompts/handoff.md override)
-  const systemPrompt = getSystemPrompt('handoff', SYSTEM_PROMPT, cwd, config.totemDir);
+  // --stdout / --lite: print to stdout
+  if (options.stdout || options.lite) {
+    process.stdout.write(scaffold);
+    log.dim(TAG, 'Scaffold printed to stdout.');
+    return;
+  }
 
-  // Assemble prompt
-  const prompt = assemblePrompt(branch, status, diff, diffStat, lessons, systemPrompt);
-  log.dim(TAG, `Prompt: ${(prompt.length / 1024).toFixed(0)}KB`);
+  // Default: write scaffold to journal file and open in editor
+  const journalPath = resolveJournalPath(cwd, config.totemDir, branch);
+  const journalDir = path.dirname(journalPath);
+  if (!fs.existsSync(journalDir)) {
+    fs.mkdirSync(journalDir, { recursive: true });
+  }
 
-  const content = await runOrchestrator({ prompt, tag: TAG, options, config, cwd });
-  if (content != null) {
-    writeOutput(content, options.out);
-    if (options.out) log.success(TAG, `Written to ${options.out}`);
+  // If the file already exists, don't overwrite — open it for editing instead
+  if (!fs.existsSync(journalPath)) {
+    fs.writeFileSync(journalPath, scaffold, 'utf-8');
+    log.success(TAG, `Scaffold written to ${journalPath}`);
+  } else {
+    log.info(TAG, `Journal entry already exists: ${journalPath}`);
+  }
+
+  // Open in editor
+  log.info(TAG, 'Opening in editor...');
+  const ok = await openInEditor(journalPath);
+  if (ok) {
+    log.success(TAG, 'Journal entry saved.');
+  } else {
+    log.warn(TAG, `Editor exited with error. Your journal entry is at: ${journalPath}`);
   }
 }

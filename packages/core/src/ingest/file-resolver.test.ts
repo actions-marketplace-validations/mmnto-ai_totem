@@ -1,34 +1,52 @@
-import * as childProcess from 'node:child_process';
+import * as fs from 'node:fs';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import * as crossSpawn from 'cross-spawn';
+import { globSync } from 'glob';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { getChangedFiles, getHeadSha } from './file-resolver.js';
+import { fail, ok } from '../test-utils.js';
+import { getChangedFiles, getHeadSha, resolveFiles } from './file-resolver.js';
 
-vi.mock('node:child_process', () => ({
-  execFileSync: vi.fn(),
+vi.mock('cross-spawn', () => ({
+  sync: vi.fn(),
 }));
+
+vi.mock('glob', () => ({
+  globSync: vi.fn(() => []),
+}));
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, lstatSync: vi.fn() };
+});
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
+beforeEach(() => {
+  // Default the fs mock to a normal (non-symlink) stat so tests that don't pin
+  // lstat exercise the real non-symlink path — not the error fallback a bare
+  // vi.fn() (returning undefined → throws in the guard) would silently route
+  // them through.
+  vi.mocked(fs.lstatSync).mockReturnValue({
+    isSymbolicLink: () => false,
+  } as unknown as fs.Stats);
+});
+
 describe('getHeadSha', () => {
   it('returns trimmed SHA on success', () => {
-    vi.mocked(childProcess.execFileSync).mockReturnValue('abc123def456\n');
+    vi.mocked(crossSpawn.sync).mockReturnValue(ok('abc123def456\n') as never);
     expect(getHeadSha('/project')).toBe('abc123def456');
   });
 
   it('returns null when git fails', () => {
-    vi.mocked(childProcess.execFileSync).mockImplementation(() => {
-      throw new Error('not a git repo');
-    });
+    vi.mocked(crossSpawn.sync).mockReturnValue(fail(new Error('not a git repo')) as never);
     expect(getHeadSha('/project')).toBeNull();
   });
 
   it('calls onWarn when git fails', () => {
-    vi.mocked(childProcess.execFileSync).mockImplementation(() => {
-      throw new Error('not a git repo');
-    });
+    vi.mocked(crossSpawn.sync).mockReturnValue(fail(new Error('not a git repo')) as never);
     const warn = vi.fn();
     getHeadSha('/project', warn);
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('not a git repo'));
@@ -37,22 +55,18 @@ describe('getHeadSha', () => {
 
 describe('getChangedFiles', () => {
   it('returns deduplicated paths from diff and untracked (null-delimited)', () => {
-    vi.mocked(childProcess.execFileSync).mockImplementation(
-      (_cmd: string, args?: readonly string[]) => {
-        if (args && args.includes('diff')) return 'src/a.ts\0src/b.ts\0';
-        if (args && args.includes('ls-files')) return 'src/b.ts\0src/new.ts\0';
-        return '';
-      },
-    );
+    vi.mocked(crossSpawn.sync).mockImplementation(((_cmd: string, args?: readonly string[]) => {
+      if (args && args.includes('diff')) return ok('src/a.ts\0src/b.ts\0');
+      if (args && args.includes('ls-files')) return ok('src/b.ts\0src/new.ts\0');
+      return ok('');
+    }) as never);
     const result = getChangedFiles('/project', 'HEAD~1');
     expect(result).toEqual(expect.arrayContaining(['src/a.ts', 'src/b.ts', 'src/new.ts']));
     expect(result).toHaveLength(3);
   });
 
   it('returns null and warns when git diff fails', () => {
-    vi.mocked(childProcess.execFileSync).mockImplementation(() => {
-      throw new Error('bad ref');
-    });
+    vi.mocked(crossSpawn.sync).mockReturnValue(fail(new Error('bad ref')) as never);
     const warn = vi.fn();
     const result = getChangedFiles('/project', 'HEAD~1', warn);
     expect(result).toBeNull();
@@ -60,12 +74,10 @@ describe('getChangedFiles', () => {
   });
 
   it('still returns diff results when untracked listing fails', () => {
-    vi.mocked(childProcess.execFileSync).mockImplementation(
-      (_cmd: string, args?: readonly string[]) => {
-        if (args && args.includes('diff')) return 'src/a.ts\0';
-        throw new Error('ls-files failed');
-      },
-    );
+    vi.mocked(crossSpawn.sync).mockImplementation(((_cmd: string, args?: readonly string[]) => {
+      if (args && args.includes('diff')) return ok('src/a.ts\0');
+      return fail(new Error('ls-files failed'));
+    }) as never);
     const warn = vi.fn();
     const result = getChangedFiles('/project', 'HEAD~1', warn);
     expect(result).toEqual(['src/a.ts']);
@@ -73,12 +85,10 @@ describe('getChangedFiles', () => {
   });
 
   it('normalizes backslashes to forward slashes', () => {
-    vi.mocked(childProcess.execFileSync).mockImplementation(
-      (_cmd: string, args?: readonly string[]) => {
-        if (args && args.includes('diff')) return 'src\\foo\\bar.ts\0';
-        return '';
-      },
-    );
+    vi.mocked(crossSpawn.sync).mockImplementation(((_cmd: string, args?: readonly string[]) => {
+      if (args && args.includes('diff')) return ok('src\\foo\\bar.ts\0');
+      return ok('');
+    }) as never);
     const result = getChangedFiles('/project');
     expect(result).toEqual(['src/foo/bar.ts']);
   });
@@ -91,8 +101,131 @@ describe('getChangedFiles', () => {
   });
 
   it('accepts valid hex SHA as sinceRef', () => {
-    vi.mocked(childProcess.execFileSync).mockReturnValue('');
+    vi.mocked(crossSpawn.sync).mockReturnValue(ok('') as never);
     const result = getChangedFiles('/project', 'abc123def456');
     expect(result).toEqual([]);
+  });
+});
+
+describe('resolveFiles — submodule support', () => {
+  it('includes submodule files from --recurse-submodules call', () => {
+    vi.mocked(crossSpawn.sync).mockImplementation(((_cmd: string, args?: readonly string[]) => {
+      if (args && args.includes('--recurse-submodules')) {
+        return ok('src/a.ts\0.strategy/north-star.md\0');
+      }
+      // Parent repo ls-files: does NOT include submodule files
+      return ok('src/a.ts\0');
+    }) as never);
+    vi.mocked(globSync).mockReturnValue(['.strategy/north-star.md'] as unknown as string[] & {
+      [Symbol.iterator]: () => IterableIterator<string>;
+    });
+
+    const result = resolveFiles(
+      [{ glob: '.strategy/**/*.md', type: 'spec', strategy: 'markdown-heading' }],
+      '/project',
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].relativePath).toBe('.strategy/north-star.md');
+  });
+
+  it('excludes submodule files not matched by glob', () => {
+    vi.mocked(crossSpawn.sync).mockImplementation(((_cmd: string, args?: readonly string[]) => {
+      if (args && args.includes('--recurse-submodules')) {
+        return ok('.strategy/north-star.md\0.strategy/archive/old.md\0');
+      }
+      return ok('');
+    }) as never);
+    // Glob only matches the non-archived file (archive excluded via ignorePatterns)
+    vi.mocked(globSync).mockReturnValue(['.strategy/north-star.md'] as unknown as string[] & {
+      [Symbol.iterator]: () => IterableIterator<string>;
+    });
+
+    const result = resolveFiles(
+      [{ glob: '.strategy/**/*.md', type: 'spec', strategy: 'markdown-heading' }],
+      '/project',
+      ['.strategy/archive/**'],
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].relativePath).toBe('.strategy/north-star.md');
+  });
+
+  it('works when --recurse-submodules is unsupported', () => {
+    vi.mocked(crossSpawn.sync).mockImplementation(((_cmd: string, args?: readonly string[]) => {
+      if (args && args.includes('--recurse-submodules')) {
+        return fail(new Error('unknown option'));
+      }
+      return ok('src/a.ts\0');
+    }) as never);
+    vi.mocked(globSync).mockReturnValue(['src/a.ts'] as unknown as string[] & {
+      [Symbol.iterator]: () => IterableIterator<string>;
+    });
+
+    const result = resolveFiles(
+      [{ glob: 'src/**/*.ts', type: 'code', strategy: 'typescript-ast' }],
+      '/project',
+    );
+    expect(result).toHaveLength(1);
+    expect(result[0].relativePath).toBe('src/a.ts');
+  });
+});
+
+describe('resolveFiles — symlink guard (mmnto-ai/totem#2354)', () => {
+  it('skips a symlink under an ingest target (never read/indexed) and warns', () => {
+    // git ls-files reports the symlink path (mode 120000 is a valid entry), so
+    // the git-tracked-set gate does NOT filter it — the guard must.
+    vi.mocked(crossSpawn.sync).mockImplementation((() => ok('.totem/lessons/evil.md\0')) as never);
+    vi.mocked(globSync).mockReturnValue(['.totem/lessons/evil.md'] as unknown as string[] & {
+      [Symbol.iterator]: () => IterableIterator<string>;
+    });
+    vi.mocked(fs.lstatSync).mockReturnValue({
+      isSymbolicLink: () => true,
+    } as unknown as fs.Stats);
+    const warn = vi.fn();
+
+    const result = resolveFiles(
+      [{ glob: '.totem/lessons/*.md', type: 'spec', strategy: 'markdown-heading' }],
+      '/project',
+      undefined,
+      warn,
+    );
+
+    expect(result).toHaveLength(0);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('symlink'));
+  });
+
+  it('indexes a regular (non-symlink) file under the same target', () => {
+    vi.mocked(crossSpawn.sync).mockImplementation((() => ok('.totem/lessons/good.md\0')) as never);
+    vi.mocked(globSync).mockReturnValue(['.totem/lessons/good.md'] as unknown as string[] & {
+      [Symbol.iterator]: () => IterableIterator<string>;
+    });
+    vi.mocked(fs.lstatSync).mockReturnValue({
+      isSymbolicLink: () => false,
+    } as unknown as fs.Stats);
+
+    const result = resolveFiles(
+      [{ glob: '.totem/lessons/*.md', type: 'spec', strategy: 'markdown-heading' }],
+      '/project',
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].relativePath).toBe('.totem/lessons/good.md');
+  });
+
+  it('degrades a raced/ENOENT lstat to non-symlink (still resolves the match)', () => {
+    vi.mocked(crossSpawn.sync).mockImplementation((() => ok('.totem/lessons/raced.md\0')) as never);
+    vi.mocked(globSync).mockReturnValue(['.totem/lessons/raced.md'] as unknown as string[] & {
+      [Symbol.iterator]: () => IterableIterator<string>;
+    });
+    vi.mocked(fs.lstatSync).mockImplementation(() => {
+      throw Object.assign(new Error('ENOENT: no such file'), { code: 'ENOENT' });
+    });
+
+    const result = resolveFiles(
+      [{ glob: '.totem/lessons/*.md', type: 'spec', strategy: 'markdown-heading' }],
+      '/project',
+    );
+
+    expect(result).toHaveLength(1);
+    expect(result[0].relativePath).toBe('.totem/lessons/raced.md');
   });
 });

@@ -1,27 +1,14 @@
-import * as path from 'node:path';
+import type { ContentType, LanceStore, SearchResult } from '@mmnto/totem';
 
-import type { ContentType, SearchResult } from '@mmnto/totem';
-import { createEmbedder, LanceStore } from '@mmnto/totem';
-
-import { GitHubCliAdapter } from '../adapters/github-cli.js';
 import type { StandardIssueListItem } from '../adapters/issue-adapter.js';
-import { log } from '../ui.js';
-import {
-  formatResults,
-  getSystemPrompt,
-  loadConfig,
-  loadEnv,
-  requireEmbedding,
-  resolveConfigPath,
-  runOrchestrator,
-  wrapXml,
-  writeOutput,
-} from '../utils.js';
+import { formatLessonSection, formatResults, partitionLessons, wrapXml } from '../utils.js';
 
 // ─── Constants ──────────────────────────────────────────
 
 const TAG = 'Triage';
+const SPEC_SEARCH_POOL = 20;
 const MAX_SPEC_RESULTS = 5;
+const MAX_LESSONS = 5;
 const MAX_SESSION_RESULTS = 5;
 const QUERY_TITLES_TRUNCATE = 2_000;
 const GH_ISSUE_LIMIT = 100;
@@ -34,13 +21,14 @@ const SYSTEM_PROMPT = `# Triage System Prompt — Active Work Roadmap
 You are a strict, highly-focused Product Manager. Your sole purpose is to cut through the noise of an open issue backlog and produce an actionable roadmap. You do not write code. You do not solve technical problems. You prioritize, organize, and set scope boundaries.
 
 ## Core Mission
-Produce a prioritized roadmap from the project's open GitHub issues, strictly informed by recent work momentum from the Totem knowledge base. Define what is being built next.
+Produce a prioritized roadmap from the project's open issues, strictly informed by recent work momentum from the Totem knowledge base. Define what is being built next.
 
 ## Critical Rules
 - **No Implementation:** Refuse to suggest code changes or technical solutions. Focus strictly on user stories, acceptance criteria, and priority.
 - **Be Opinionated:** Give a single, clear recommendation for the next task. No wishy-washy lists.
 - **Momentum:** Use recent session history to understand what was just finished and what is in progress.
 - **Clarity:** Reference issues by number (#NNN) and title. Consider labels and issue age.
+- **Enforce Lessons:** If RELEVANT LESSONS are provided, treat them as hard constraints on prioritization. Issues that conflict with lessons should be deprioritized or flagged.
 
 ## Output Format
 Respond with ONLY the sections below. No preamble, no closing remarks.
@@ -65,18 +53,21 @@ Respond with ONLY the sections below. No preamble, no closing remarks.
 interface RetrievedContext {
   specs: SearchResult[];
   sessions: SearchResult[];
+  lessons: SearchResult[];
 }
 
 async function retrieveContext(query: string, store: LanceStore): Promise<RetrievedContext> {
   const search = (typeFilter: ContentType, maxResults: number) =>
     store.search({ query, typeFilter, maxResults });
 
-  const [specs, sessions] = await Promise.all([
-    search('spec', MAX_SPEC_RESULTS),
+  const [allSpecs, sessions] = await Promise.all([
+    search('spec', SPEC_SEARCH_POOL),
     search('session_log', MAX_SESSION_RESULTS),
   ]);
 
-  return { specs, sessions };
+  const { lessons, specs } = partitionLessons(allSpecs, MAX_LESSONS, MAX_SPEC_RESULTS);
+
+  return { specs, sessions, lessons };
 }
 
 function buildSearchQuery(issues: StandardIssueListItem[]): string {
@@ -88,16 +79,19 @@ function buildSearchQuery(issues: StandardIssueListItem[]): string {
 // ─── Prompt assembly ────────────────────────────────────
 
 export function formatIssueInventory(issues: StandardIssueListItem[]): string {
+  const hasMultiRepo = issues.some((i) => i.repo);
+
   const rows = issues.map((i) => {
     const labels = i.labels.join(', ') || '(none)';
     const updated = i.updatedAt.slice(0, 10); // YYYY-MM-DD
-    return `| #${i.number} | ${i.title} | ${labels} | ${updated} |`;
+    const id = hasMultiRepo && i.repo ? `${i.repo}#${i.number}` : `#${i.number}`;
+    return `| ${id} | ${i.title} | ${labels} | ${updated} |`;
   });
 
   return ['| Issue | Title | Labels | Updated |', '|---|---|---|---|', ...rows].join('\n');
 }
 
-function assemblePrompt(
+export function assemblePrompt(
   issues: StandardIssueListItem[],
   context: RetrievedContext,
   systemPrompt: string,
@@ -119,6 +113,10 @@ function assemblePrompt(
     if (sessionSection) sections.push(sessionSection);
   }
 
+  // Lessons — condensed snippets for fast-boot command
+  const lessonSection = formatLessonSection(context.lessons, undefined, true);
+  if (lessonSection) sections.push(lessonSection);
+
   return sections.join('\n');
 }
 
@@ -132,6 +130,19 @@ export interface TriageOptions {
 }
 
 export async function triageCommand(options: TriageOptions): Promise<void> {
+  const path = await import('node:path');
+  const { createEmbedder, LanceStore } = await import('@mmnto/totem');
+  const { log } = await import('../ui.js');
+  const {
+    getSystemPrompt,
+    loadConfig,
+    loadEnv,
+    requireEmbedding,
+    resolveConfigPath,
+    runOrchestrator,
+    writeOutput,
+  } = await import('../utils.js');
+
   const cwd = process.cwd();
   const configPath = resolveConfigPath(cwd);
   loadEnv(cwd);
@@ -139,7 +150,8 @@ export async function triageCommand(options: TriageOptions): Promise<void> {
 
   // Fetch open issues
   log.info(TAG, 'Fetching open issues...');
-  const adapter = new GitHubCliAdapter(cwd);
+  const { createIssueAdapter } = await import('../adapters/create-issue-adapter.js');
+  const adapter = await createIssueAdapter(cwd, config);
   const issues = adapter.fetchOpenIssues(GH_ISSUE_LIMIT);
 
   if (issues.length === 0) {
@@ -152,15 +164,20 @@ export async function triageCommand(options: TriageOptions): Promise<void> {
   // Connect to LanceDB
   const embedding = requireEmbedding(config);
   const embedder = createEmbedder(embedding);
-  const store = new LanceStore(path.join(cwd, config.lanceDir), embedder);
+  const store = new LanceStore(path.join(cwd, config.lanceDir), embedder, {
+    absolutePathRoot: cwd,
+  });
   await store.connect();
 
   // Retrieve context from LanceDB
   const query = buildSearchQuery(issues);
   log.info(TAG, 'Querying Totem index...');
   const context = await retrieveContext(query, store);
-  const totalResults = context.specs.length + context.sessions.length;
-  log.info(TAG, `Found: ${context.specs.length} specs, ${context.sessions.length} sessions`);
+  const totalResults = context.specs.length + context.sessions.length + context.lessons.length;
+  log.info(
+    TAG,
+    `Found: ${context.specs.length} specs, ${context.sessions.length} sessions, ${context.lessons.length} lessons`,
+  );
 
   // Resolve system prompt (allow .totem/prompts/triage.md override)
   const systemPrompt = getSystemPrompt('triage', SYSTEM_PROMPT, cwd, config.totemDir);

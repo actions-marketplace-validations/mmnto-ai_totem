@@ -1,4 +1,7 @@
+import safeRegex from 'safe-regex2';
+
 import type { ContentType } from './config-schema.js';
+import type { CustomSecret } from './secrets.js';
 
 /** Strip ANSI escape sequences, control characters, and BiDi overrides to prevent terminal injection. */
 const CONTROL_RE =
@@ -65,17 +68,24 @@ export function sanitizeForIngestion(text: string, options: IngestionSanitizeOpt
   let result = text;
 
   // --- Phase 1: BiDi overrides (dangerous in ALL content types) ---
-  if (BIDI_OVERRIDE_RE.test(result)) {
+  // Call .replace() unconditionally — it's a no-op when there are no matches.
+  // Avoids statefulness bug: .test() on a /g regex advances lastIndex, causing
+  // the subsequent .replace() to miss earlier occurrences.
+  const bidiCleaned = result.replace(BIDI_OVERRIDE_RE, '');
+  if (bidiCleaned !== result) {
     onWarn?.(`BiDi override characters detected${filePath ? ` in ${filePath}` : ''} — stripped`);
-    result = result.replace(BIDI_OVERRIDE_RE, '');
+    result = bidiCleaned;
   }
 
   // --- Phase 2: Invisible characters (prose only — code may have valid uses) ---
-  if (chunkType !== 'code' && INVISIBLE_CHARS_RE.test(result)) {
-    onWarn?.(
-      `Invisible Unicode characters detected${filePath ? ` in ${filePath}` : ''} — stripped`,
-    );
-    result = result.replace(INVISIBLE_CHARS_RE, '');
+  if (chunkType !== 'code') {
+    const invisCleaned = result.replace(INVISIBLE_CHARS_RE, '');
+    if (invisCleaned !== result) {
+      onWarn?.(
+        `Invisible Unicode characters detected${filePath ? ` in ${filePath}` : ''} — stripped`,
+      );
+      result = invisCleaned;
+    }
   }
 
   // --- Phase 3: Flag suspicious patterns (all types, warn only, never strip) ---
@@ -98,5 +108,93 @@ export function sanitizeForIngestion(text: string, options: IngestionSanitizeOpt
     onWarn?.(`Suspicious content flagged${filePath ? ` in ${filePath}` : ''}: ${flags.join(', ')}`);
   }
 
+  // --- Phase 4: Secret masking (DLP) — strip secrets before embedding ---
+  result = maskSecrets(result);
+
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// DLP Secret Masking
+// ---------------------------------------------------------------------------
+
+/**
+ * Common secret patterns. Each regex matches a full token.
+ * Conservative — only matches high-confidence patterns to avoid false positives.
+ */
+const SECRET_PATTERNS: Array<{ name: string; re: RegExp; replacement?: string }> = [
+  // API keys with known prefixes (longer/more-specific patterns first)
+  { name: 'API key', re: /\b(sk-proj-[a-zA-Z0-9_-]{20,})\b/g },
+  { name: 'API key', re: /\b(sk-[a-zA-Z0-9]{20,})\b/g },
+  { name: 'API key', re: /\b(AIza[a-zA-Z0-9_-]{30,})\b/g },
+  { name: 'npm token', re: /\b(npm_[a-zA-Z0-9]{20,})\b/g },
+  { name: 'GitHub token', re: /\b(gh[pousr]_[a-zA-Z0-9]{20,})\b/g },
+  { name: 'AWS key', re: /\b(AKIA[A-Z0-9]{16})\b/g },
+  // Generic high-entropy strings after common key assignments — replace only the value
+  {
+    name: 'secret assignment (quoted)',
+    re: /((?:api[_-]?key|secret|token|password|credential)['"]?\s*[:=]\s*['"])([a-zA-Z0-9_\-/.+]{20,})(['"])/gi,
+    replacement: '$1[REDACTED]$3',
+  },
+  {
+    name: 'secret assignment (unquoted)',
+    re: /((?:api[_-]?key|secret|token|password|credential)\s*[:=]\s*)([a-zA-Z0-9_\-/.+]{20,})\b/gi,
+    replacement: '$1[REDACTED]',
+  },
+];
+
+/** Check whether a regex pattern is safe from catastrophic backtracking (ReDoS). */
+export function isRegexSafe(pattern: string): boolean {
+  try {
+    return safeRegex(pattern);
+  } catch {
+    return false;
+  }
+}
+
+/** Compile user-defined custom secrets into executable RegExp instances. */
+export function compileCustomSecrets(
+  secrets: CustomSecret[],
+  onWarn?: (message: string) => void,
+): RegExp[] {
+  const compiled: RegExp[] = [];
+  for (const secret of secrets) {
+    try {
+      if (secret.type === 'literal') {
+        // Escape regex special characters for literal matching
+        const escaped = secret.value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        compiled.push(new RegExp(escaped, 'g'));
+      } else {
+        if (!isRegexSafe(secret.value)) {
+          onWarn?.(`Skipping unsafe regex pattern (potential ReDoS): ${secret.value}`);
+          continue;
+        }
+        compiled.push(new RegExp(secret.value, 'g'));
+      }
+    } catch {
+      // Invalid regex — skip (validated at schema level, this guards against edge cases)
+    }
+  }
+  return compiled;
+}
+
+/** Mask detected secrets with [REDACTED]. Returns the cleaned text. */
+export function maskSecrets(text: string, customSecrets?: CustomSecret[]): string {
+  let result = text;
+  // Built-in patterns first
+  for (const pattern of SECRET_PATTERNS) {
+    // Reset lastIndex for global regexes
+    pattern.re.lastIndex = 0;
+    const replacement = pattern.replacement ?? '[REDACTED]';
+    result = result.replace(pattern.re, replacement);
+  }
+  // Custom user-defined secrets
+  if (customSecrets && customSecrets.length > 0) {
+    const compiled = compileCustomSecrets(customSecrets);
+    for (const re of compiled) {
+      re.lastIndex = 0;
+      result = result.replace(re, '[REDACTED_CUSTOM]');
+    }
+  }
   return result;
 }

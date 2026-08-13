@@ -1,6 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
-import { classifyLines, extensionToLanguage } from './ast-classifier.js';
+import {
+  __resetLangRegistryForTests,
+  __unsealLangRegistryForTests,
+  classifyLines,
+  extensionToLanguage,
+  isBuiltinExtension,
+  isLangRegistrySealed,
+  registeredExtensions,
+  registeredLanguages,
+  registerLang,
+  sealLangRegistry,
+} from './ast-classifier.js';
 
 // ─── extensionToLanguage ────────────────────────────
 
@@ -23,10 +34,146 @@ describe('extensionToLanguage', () => {
     expect(extensionToLanguage('.jsx')).toBe('tsx');
   });
 
+  // mmnto-ai/totem#2513 — `.mts` (TypeScript ESM) and `.cts` (TypeScript
+  // CommonJS) are the same grammar as `.ts`; their absence from the original
+  // six-extension registry armed a diff-dependent run-wide abort at
+  // `rule-engine.ts`'s unmapped-extension guard for any rule globbing them
+  // (specimen: compiled rule fea10369daa04c98).
+  it('resolves .mts and .cts to the typescript grammar (mmnto-ai/totem#2513)', () => {
+    expect(extensionToLanguage('.mts')).toBe('typescript');
+    expect(extensionToLanguage('.cts')).toBe('typescript');
+    expect(registeredExtensions()).toContain('.mts');
+    expect(registeredExtensions()).toContain('.cts');
+    expect(isBuiltinExtension('.mts')).toBe(true);
+    expect(isBuiltinExtension('.cts')).toBe(true);
+  });
+
   it('returns undefined for unsupported extensions', () => {
     expect(extensionToLanguage('.py')).toBeUndefined();
     expect(extensionToLanguage('.rs')).toBeUndefined();
     expect(extensionToLanguage('.md')).toBeUndefined();
+  });
+
+  it('normalizes extension case before lookup', () => {
+    expect(extensionToLanguage('.TS')).toBe('typescript');
+    expect(extensionToLanguage('.Tsx')).toBe('tsx');
+  });
+});
+
+// ─── Language registry surface (mmnto-ai/totem#1653 + #1768) ──
+
+describe('language registry built-ins', () => {
+  it('exposes all eight built-in extensions from registeredExtensions()', () => {
+    expect(registeredExtensions()).toEqual([
+      '.cjs',
+      '.cts',
+      '.js',
+      '.jsx',
+      '.mjs',
+      '.mts',
+      '.ts',
+      '.tsx',
+    ]);
+  });
+
+  it('exposes all three built-in languages from registeredLanguages()', () => {
+    expect(registeredLanguages()).toEqual(['javascript', 'tsx', 'typescript']);
+  });
+
+  it('marks built-in extensions as built-in', () => {
+    expect(isBuiltinExtension('.ts')).toBe(true);
+    expect(isBuiltinExtension('.tsx')).toBe(true);
+    expect(isBuiltinExtension('.rs')).toBe(false);
+  });
+
+  // The shared-loader invariant: every extension mapping to a given language
+  // MUST pass the SAME loader instance to `registerLang`, or the second
+  // registration trips the "already registered with a WASM loader" guard.
+  // Re-running the built-in registration from scratch is the cheapest way to
+  // prove it — a fresh-arrow-per-extension regression throws here.
+  it('re-registers every built-in without tripping the shared-loader guard', () => {
+    expect(() => __resetLangRegistryForTests()).not.toThrow();
+    expect(registeredExtensions()).toHaveLength(8);
+  });
+});
+
+describe('language registry pack-style registration', () => {
+  afterEach(() => {
+    __resetLangRegistryForTests();
+  });
+
+  it('accepts new (extension, language, loader) registration before seal', () => {
+    const fakeLoader = () => '/fake/path/tree-sitter-fakelang.wasm';
+    registerLang('.fake', 'fakelang', fakeLoader);
+    expect(extensionToLanguage('.fake')).toBe('fakelang');
+    expect(registeredExtensions()).toContain('.fake');
+    expect(registeredLanguages()).toContain('fakelang');
+  });
+
+  it('does not mark pack-registered extensions as built-in', () => {
+    registerLang('.fake', 'fakelang', () => '/fake.wasm');
+    expect(isBuiltinExtension('.fake')).toBe(false);
+  });
+
+  it('throws when re-registering an extension to a different language (pack-vs-pack)', () => {
+    registerLang('.fake', 'fakelang', () => '/fake.wasm');
+    expect(() => registerLang('.fake', 'differentlang', () => '/other.wasm')).toThrowError(
+      /already registered to language 'fakelang'.*pack-vs-pack collision/,
+    );
+  });
+
+  it('throws when registering a built-in extension (immutable)', () => {
+    expect(() => registerLang('.ts', 'newlang', () => '/x.wasm')).toThrowError(
+      /already registered to language 'typescript'.*as a built-in.*immutable/,
+    );
+  });
+
+  it('throws when registering an already-registered language with a different loader', () => {
+    const loader1 = () => '/path1.wasm';
+    const loader2 = () => '/path2.wasm';
+    registerLang('.fake', 'fakelang', loader1);
+    expect(() => registerLang('.also-fake', 'fakelang', loader2)).toThrowError(
+      /Language 'fakelang' is already registered/,
+    );
+  });
+
+  it('allows multiple extensions to register to the same language with the same loader', () => {
+    const sharedLoader = () => '/shared.wasm';
+    registerLang('.fake1', 'fakelang', sharedLoader);
+    registerLang('.fake2', 'fakelang', sharedLoader);
+    expect(extensionToLanguage('.fake1')).toBe('fakelang');
+    expect(extensionToLanguage('.fake2')).toBe('fakelang');
+  });
+});
+
+describe('language registry seal contract', () => {
+  afterEach(() => {
+    __resetLangRegistryForTests();
+  });
+
+  it('starts unsealed', () => {
+    expect(isLangRegistrySealed()).toBe(false);
+  });
+
+  it('sealLangRegistry() flips the flag', () => {
+    sealLangRegistry();
+    expect(isLangRegistrySealed()).toBe(true);
+  });
+
+  it('registerLang() after seal throws with ADR-097 § 5 Q5 reference', () => {
+    sealLangRegistry();
+    expect(() => registerLang('.fake', 'fakelang', () => '/f.wasm')).toThrowError(
+      /after engine seal.*ADR-097 § 5 Q5/,
+    );
+  });
+
+  it('__unsealLangRegistryForTests reverts the seal so subsequent tests can register', () => {
+    sealLangRegistry();
+    expect(isLangRegistrySealed()).toBe(true);
+    __unsealLangRegistryForTests();
+    expect(isLangRegistrySealed()).toBe(false);
+    registerLang('.fake', 'fakelang', () => '/f.wasm');
+    expect(extensionToLanguage('.fake')).toBe('fakelang');
   });
 });
 

@@ -13,15 +13,19 @@ concurrency:
 jobs:
   build:
     name: Build & Lint
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v5
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7
         with:
-          node-version: 20
+          node-version: 24
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
@@ -30,6 +34,54 @@ jobs:
 
       - run: pnpm test
 
+      - name: Wind Tunnel (rule fixture tests)
+        run: node packages/cli/dist/index.js test
+
       - run: pnpm lint
 
       - run: pnpm format:check
+
+  docs-governance:
+    name: Docs Governance (maturity surface drift gate)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: the lint receipt recomputes against pinned SHAs.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm build
+
+      - run: pnpm test:docs
+
+      - name: Docs drift gate (inject must be a no-op)
+        run: |
+          pnpm docs:inject
+          git diff --exit-code -- README.md docs/
+
+      - name: Recompute lint receipt (pinned fields must reproduce)
+        run: node tools/gen-lint-receipt.mjs --verify
+
+  wind-tunnel-sha:
+    name: Wind Tunnel SHA Integrity
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request' &&
+      !contains(github.event.pull_request.title, '[WIND-TUNNEL-UPDATE]') &&
+      !contains(github.event.pull_request.body, '[WIND-TUNNEL-UPDATE]')
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Verify wind tunnel SHA
+        run: bash tools/update-wind-tunnel-sha.sh --verify

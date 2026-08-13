@@ -1,4 +1,8 @@
+import { z } from 'zod';
+
 import type { ChunkStrategy, ContentType } from './config-schema.js';
+import type { Embedder } from './embedders/embedder.js';
+import type { AcquireLockOptions } from './lock.js';
 
 /**
  * A single chunk produced by any chunker.
@@ -51,15 +55,83 @@ export interface StoredChunk {
 }
 
 /**
+ * Source context for a LanceStore — identifies which repository the store's
+ * results originate from and where on disk that repository lives. Injected
+ * at LanceStore construction time and stamped onto every SearchResult via
+ * `rowToSearchResult` in the search hot path.
+ *
+ * Used by mmnto/totem#1294 (Cross-Repo Context Mesh) so agents receiving
+ * federated results can distinguish between primary-repo and linked-repo
+ * hits, and so they have an absolute path for `Read` tool calls without
+ * having to reason about which repo root to resolve `filePath` against.
+ */
+export interface SourceContext {
+  /**
+   * Semantic identifier for the source repo. `undefined` for the primary
+   * store (local repo); set to the linked-index name for cross-repo hits
+   * (e.g., `'strategy'`). Safe to display in agent-facing formatters.
+   */
+  sourceRepo?: string;
+  /**
+   * Absolute filesystem path to the root of the repository that owns this
+   * store. Used to resolve `filePath` (which is stored relative to this
+   * root) into `absoluteFilePath` on every SearchResult.
+   */
+  absolutePathRoot: string;
+}
+
+/**
  * Result returned from a search query.
  */
 export interface SearchResult {
   content: string;
   contextPrefix: string;
+  /**
+   * File path relative to the source repository root. Unchanged from the
+   * pre-mmnto/totem#1294 shape — kept for display, lesson-linking, and
+   * incremental-sync purposes.
+   */
   filePath: string;
+  /**
+   * Absolute on-disk path to the source file, computed by joining
+   * `filePath` with the owning LanceStore's `absolutePathRoot`. Always
+   * populated, even for primary-store results. Agents should prefer this
+   * for `Read` / `Edit` tool calls; `filePath` is for display.
+   *
+   * mmnto/totem#1294 rationale: the context window is hostile to agents.
+   * Relative paths invite hallucinated tool calls that resolve against the
+   * wrong repo root. An explicit absolute path eliminates that class of
+   * error at the cost of a few extra bytes per result.
+   */
+  absoluteFilePath: string;
+  /**
+   * Semantic tag identifying the source repo. `undefined` for primary-store
+   * hits; set to the linked-index name (e.g., `'strategy'`) for federated
+   * cross-repo hits. Safe to display in agent-facing formatters to
+   * disambiguate local from cross-repo results.
+   */
+  sourceRepo?: string;
   type: ContentType;
   label: string;
   score: number;
+  /**
+   * True per-hit relevance signal in the 0..1 range — the vector-leg
+   * cosine similarity `1/(1+_distance)` (mmnto-ai/totem#2463). Distinct from
+   * `score`, which in hybrid/federated modes is an RRF rank artifact
+   * (`1/(60+rank)` ≈ 0.016) that carries ordering but destroys the relevance
+   * magnitude. Populated by `rowToSearchResult` for vector-derived rows and
+   * preserved (never overwritten) through both RRF fusion sites. ABSENT iff
+   * the hit had no vector leg (FTS-only), so downstream floor logic can tell
+   * "weak signal" from "no signal at all".
+   */
+  relevance?: number;
+  /**
+   * Which retrieval path produced this hit (mmnto-ai/totem#2463): `'hybrid'`
+   * (vector + FTS with RRF), `'vector'` (vector-only), or `'fts'` (keyword-only
+   * fallback when the embedder is unavailable). Lets agent-facing surfaces
+   * label provenance and route on it.
+   */
+  searchMethod?: 'hybrid' | 'vector' | 'fts';
   metadata: Record<string, string>;
 }
 
@@ -78,6 +150,18 @@ export interface SyncOptions {
 
   /** Callback for progress reporting */
   onProgress?: (message: string) => void;
+
+  /**
+   * Injection seam for the embedder (tests / embedding hosts). When absent,
+   * the pipeline builds one from `config.embedding` via `createEmbedder`.
+   */
+  embedder?: Embedder;
+
+  /**
+   * Lock timing seam (tests — #2564). When absent, the production heartbeat
+   * and staleness defaults apply.
+   */
+  lockOptions?: AcquireLockOptions;
 }
 
 /**
@@ -86,6 +170,54 @@ export interface SyncOptions {
 export interface SyncState {
   lastSyncSha: string;
   timestamp: number;
+  /**
+   * Order-normalized content hash of the effective index-exclusion set
+   * (`ignorePatterns` ∪ `indexIgnorePatterns`) at the last sync. A change on the
+   * next incremental sync means the patterns moved — including a REMOVAL, which
+   * the git-diff window cannot surface — so the newly-eligible files are
+   * re-enqueued (mmnto-ai/totem#2366). Optional: absent in state written before
+   * #2366; readers treat absence as a mismatch (benign — the enqueue is
+   * near-empty for an up-to-date index).
+   */
+  indexExclusionHash?: string;
+}
+
+/**
+ * Persisted checkpoint for a full re-index in progress (mmnto-ai/totem#2562).
+ *
+ * The file's EXISTENCE is the dirty marker: it is written (atomically) before
+ * `store.reset()` and deleted only on successful completion, so a crashed
+ * `--full` leaves a detectable, resumable state instead of a partial store
+ * behind a stale `SyncState` baseline — the lying "Sync complete: 0 files"
+ * sensor. `SyncState` itself keeps its clean "last successful sync" semantics.
+ */
+export interface FullSyncCheckpoint {
+  /** HEAD at epoch start; resume re-diffs against it so changed files re-embed. Null when git is unavailable. */
+  startedHeadSha: string | null;
+
+  /** Epoch start time (ms since Unix epoch) — provenance only */
+  startedAt: number;
+
+  /** Exclusion-set hash at epoch start — provenance; resume re-resolves the live set */
+  indexExclusionHash: string;
+
+  /**
+   * Resume-compatibility fingerprint. A mismatch with the current embedding
+   * config restarts the full sync from zero — vectors from two embedder
+   * configurations must never mix in one store.
+   */
+  embedder: {
+    provider: string;
+    model: string;
+    dimensions: number;
+  };
+
+  /**
+   * Relative paths whose chunks are FULLY flushed to the store. Appended only
+   * after a successful flush; flushes happen at whole-file boundaries, so
+   * membership here means the file is complete in the store for this epoch.
+   */
+  completedFiles: string[];
 }
 
 /**
@@ -95,4 +227,122 @@ export interface SearchOptions {
   query: string;
   typeFilter?: ContentType;
   maxResults?: number;
+  /** When true, combines vector + FTS results using RRF reranking. Requires an FTS index. */
+  hybrid?: boolean;
+  /** File path prefix(es) to restrict results to an architectural boundary. Accepts a single prefix or an array for multi-prefix partitions. */
+  boundary?: string | string[];
+  /**
+   * Opt-in keyword-only degradation (mmnto-ai/totem#2463). When true AND the
+   * embedder cannot resolve (the no-embedder `TotemConfigError`) AND an FTS
+   * index exists, `search` degrades to the FTS-only path (results stamped
+   * `searchMethod: 'fts'`, no `relevance`) instead of throwing. When false or
+   * absent, or when no FTS index exists, the embedder failure propagates
+   * unchanged. Only the embedder-resolution failure class is caught — all
+   * other errors propagate untouched.
+   */
+  allowFtsFallback?: boolean;
+  /**
+   * Invoked when the `allowFtsFallback` degradation actually engages
+   * (mmnto-ai/totem#2463 round 2). Out-of-band on purpose: a fallback that
+   * returns ZERO rows leaves no fts-stamped result to infer from, and callers
+   * (the MCP envelope) must still report the outage rather than a healthy
+   * empty search.
+   */
+  onFtsFallback?: () => void;
 }
+
+/**
+ * Result of a health check against the LanceDB index.
+ */
+export interface HealthCheckResult {
+  healthy: boolean;
+  durationMs: number;
+  totalChunks: number;
+  expectedDimensions: number;
+  storedDimensions: number | null;
+  dimensionMatch: boolean;
+  canarySearchOk: boolean;
+  ftsAvailable: boolean;
+  issues: string[];
+}
+
+// ─── Lesson Frontmatter Schema (ADR-070) ──────────
+
+// Closed role taxonomy (strategy item 020). Lowercase canonical form;
+// preprocessor lowercases input so authoring forgiveness doesn't bleed downstream.
+export const LessonRoleSchema = z.enum([
+  'mutator',
+  'boundary',
+  'aggregator',
+  'hot-path',
+  'boundary-test',
+  'infrastructure',
+  'presentation',
+  'any',
+]);
+
+export type LessonRole = z.infer<typeof LessonRoleSchema>;
+
+// Coerce YAML list / YAML scalar / comma-separated prose / mixed-case input
+// to a canonical lowercase LessonRole[]. Empty input (after split + filter)
+// normalizes to ['any'] so the downstream "no roles apply" failure mode
+// can't surface from authoring slips.
+const appliesToPreprocessor = z.preprocess((val) => {
+  if (val === undefined || val === null) return ['any'];
+  let arr: string[];
+  if (typeof val === 'string') {
+    arr = val
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter((s) => s.length > 0);
+  } else if (Array.isArray(val)) {
+    arr = val.map((s) => String(s).trim().toLowerCase()).filter((s) => s.length > 0);
+  } else {
+    return val;
+  }
+  return arr.length === 0 ? ['any'] : arr;
+}, z.array(LessonRoleSchema).min(1));
+
+export const LessonFrontmatterSchema = z.object({
+  // Core Taxonomy
+  type: z.literal('trap').default('trap'),
+  category: z.enum(['security', 'architecture', 'performance', 'style']).optional(),
+  severity: z.enum(['error', 'warning']).default('error'),
+
+  // Unstructured Metadata (replaces flat **Tags:**)
+  tags: z.array(z.string()).default([]),
+
+  // Scope (replaces inline **Scope:**)
+  scope: z
+    .object({
+      globs: z.array(z.string()).optional(),
+    })
+    .optional(),
+
+  // Role-of-code applicability (strategy item 020). Always non-empty;
+  // missing field defaults to ['any'] for backwards compat across the
+  // pre-1.16.0 corpus.
+  appliesTo: appliesToPreprocessor.default(['any']),
+
+  // Ecosystem Targeting
+  ecosystem: z
+    .object({
+      frameworks: z.array(z.string()).optional(),
+      version: z.string().optional(), // Semver matching — DEFERRED past 1.6.0
+    })
+    .optional(),
+
+  // Governance
+  lifecycle: z.enum(['nursery', 'stable', 'deprecated']).default('stable'),
+  rpn: z.number().min(1).max(10).optional(), // Risk Priority Number (ADR-023) — DEFERRED
+
+  // Pipeline 1 Explicit Compilation (replaces inline fields)
+  compilation: z
+    .object({
+      engine: z.enum(['regex', 'ast', 'ast-grep']).optional(),
+      pattern: z.union([z.string(), z.record(z.unknown())]).optional(),
+    })
+    .optional(),
+});
+
+export type LessonFrontmatter = z.infer<typeof LessonFrontmatterSchema>;

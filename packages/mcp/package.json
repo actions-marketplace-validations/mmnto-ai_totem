@@ -1,8 +1,11 @@
 {
   "name": "@mmnto/mcp",
-  "version": "0.27.0",
-  "description": "MCP server for Totem — AI persistent memory and context layer",
+  "version": "1.116.0",
+  "description": "MCP server for Totem, the local-first toolkit that keeps AI-agent work queryable, enforceable, and derivable as plain files in your codebase",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -24,6 +27,7 @@
   "dependencies": {
     "@mmnto/totem": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "dotenv": "^16.4.0",
     "jiti": "^2.4.0",
     "zod": "^3.24.0"
   },
@@ -47,6 +51,7 @@
     "url": "https://github.com/mmnto-ai/totem/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   }
 }

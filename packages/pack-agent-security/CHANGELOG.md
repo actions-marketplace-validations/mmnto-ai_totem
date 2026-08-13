@@ -1,0 +1,1057 @@
+# @mmnto/pack-agent-security
+
+## 1.116.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.115.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.114.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.113.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.113.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.112.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.111.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.111.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.110.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.109.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.108.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.107.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.107.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.106.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.105.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.104.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.103.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.102.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.101.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.101.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.101.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.100.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.99.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.98.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.98.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.97.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.96.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.95.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.94.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.93.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.92.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.91.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.90.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.89.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.88.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.87.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.86.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.85.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.84.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.83.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.82.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.81.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.81.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.80.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.79.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.78.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.77.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.76.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.76.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.75.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.75.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.75.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.74.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.73.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.73.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.73.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.72.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.72.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.71.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.71.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.70.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.70.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.69.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.68.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.67.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.67.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.66.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.65.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.64.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.64.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.64.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.63.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.62.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.61.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.60.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.59.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.59.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.58.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.58.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.57.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.56.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.55.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.55.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.54.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.54.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.9
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.8
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.7
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.6
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.5
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.4
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.3
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.53.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.52.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.51.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.50.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.49.3
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.49.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.49.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.49.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.48.0
+
+_Cohort-link bump for the Node 24 engine constraint enforcement shipping with this release. The `engines.node: >=24` declaration aligns @mmnto/pack-agent-security's declared compatibility with the cohort's tested CI floor. See `@mmnto/cli` CHANGELOG for the full release rationale._
+
+## 1.47.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.47.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.46.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.45.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.44.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.6
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.5
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.4
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.3
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.43.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.42.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.41.0
+
+Coordinated cohort bump — no direct changes in this package; consumes the `@mmnto/totem` minor.
+
+## 1.40.2
+
+### Patch Changes
+
+- d725010: fix(ci): audit + sweep narrow timing thresholds across packages
+
+  Three independent CI flakes hit across three platforms in three hours after the #1928 merge to main, each on a different timing-window assertion:
+  - **Ubuntu** (`@mmnto/mcp` `ledger-writer.test.ts`): vitest `testTimeout` 5_000ms tripped on cold-import (fixed in #1928).
+  - **macOS** (`@mmnto/totem` `regex-safety/evaluator.test.ts:97`): `softWarningMs: 1` + 1000 trivial-pattern lines finished <1ms on fast hardware; `softWarningTriggered` assertion flipped false.
+  - **Windows** (`@mmnto/cli` `run-compiled-rules.test.ts:203`): `RegexEvaluator` `DEFAULT_CONFIG.timeoutMs: 100` tripped at "timeout after 139ms" on a single-line `.sh` corpus — Windows worker thread spawn + IPC + shared-runner scheduling jitter exceeded the budget.
+
+  This PR audits and uniformly addresses the class:
+
+  **1. Vitest test-runner ceilings (4 configs)** — `packages/{cli,core,pack-agent-security,pack-rust-architecture}/vitest.config.ts` bumped non-Windows floor `5_000` → `15_000` to match the `@mmnto/mcp` precedent set in #1928. Windows stays at 30_000 (subprocess spawn). Comments updated to call out the shared-runner cold-import class explicitly.
+
+  **2. `RegexEvaluator` production defaults** (`packages/core/src/regex-safety/evaluator.ts`) — `timeoutMs: 100 → 250`, `softWarningMs: 50 → 100`. 250ms keeps per-rule budget snappy in production while giving Windows worker IPC + CI scheduling ~2× headroom over the observed worst case (139ms). Backward compatible: callers passing explicit config are unaffected; callers using defaults gain headroom.
+
+  **3. Soft-warning wall-clock test** (`packages/core/src/regex-safety/evaluator.test.ts:92`) — refactored from `softWarningMs: 1` + 1000 lines to `softWarningMs: 5` + 50_000 lines. Same assertion, but 50× wall-clock margin instead of a 1ms threshold racing fast hardware.
+
+  No public API change. Verified locally: 2161 `@mmnto/cli` tests + matching cohort across `@mmnto/totem`, `@mmnto/mcp`, and the two packs all green.
+
+## 1.40.1
+
+Coordinated cohort bump — no direct changes to this pack.
+
+## 1.40.0
+
+### Minor Changes
+
+- 986825c: feat(mcp+cli): Trap Ledger activity writers — MCP `mcp_call` + SessionStart `session_start` (A.3.a writers)
+
+  Stacked on #1919 (A.3.a schema). Wires the two activity-event writers that the A.3.b compliance metric will read. Without these writers, the schema is inert — no events of the new types get produced.
+
+  ## Writers shipped
+
+  **MCP `mcp_call` writer** (`packages/mcp/src/ledger-writer.ts`):
+  - New `logMcpCall(activityName)` helper. Fire-and-forget; internal try/catch + outer `.catch()` defense-in-depth at call sites.
+  - Wired into `packages/mcp/src/tools/search-knowledge.ts` — emits `{ type: 'mcp_call', activity_name: 'search_knowledge', session_id, source: 'bot' }` at handler entry. Reads `session_id` from `.totem/ledger/.session-id` if present (TTL 24h), omits when missing.
+  - Other MCP tools (`describe_project`, `add_lesson`, `verify_execution`) intentionally NOT wired in this PR — `search_knowledge` is the only one ADR-029's compliance metric measures. Symmetric wiring deferred to A.3.c when broader observability lands.
+
+  **SessionStart hook writer** (`packages/cli/src/commands/init-templates.ts`):
+  - `CLAUDE_SESSION_START` template extended to mint a session UUID via `crypto.randomUUID()`, persist to `.totem/ledger/.session-id`, and append a `session_start` activity event to `events.ndjson` BEFORE the existing `totem describe` briefing.
+  - Inline implementation (no `@mmnto/totem` import) — hook scripts run via `node` from project root before any package resolution, so they can't depend on the totem npm packages being installed.
+  - Gemini SessionStart hook (`GEMINI_SESSION_START`) intentionally NOT updated in this PR. Symmetric Gemini parity deferred to a follow-on.
+
+  ## New core utilities (`packages/core/src/session-id.ts`)
+  - `mintSessionId()` — wraps `crypto.randomUUID()`.
+  - `writeSessionId(totemDir, sessionId)` — persists to `.totem/ledger/.session-id`. Swallows expected fs error classes (ENOENT/EACCES/EPERM/EROFS) via the optional `onWarn` callback and rethrows unexpected error classes per Tenet 4 Fail Loud.
+  - `readSessionId(totemDir, ttlHours?)` — reads + validates UUID shape + checks mtime against TTL (default 24h). Returns `undefined` for missing/expired/malformed files.
+
+  ## Tests
+  - `packages/core/src/session-id.test.ts` — 15 tests covering mint uniqueness, write/read round-trip, malformed UUID rejection, TTL expiration (file backdating via `utimesSync`), custom TTL argument, trailing-whitespace tolerance, plus fs error class discrimination on read (ENOENT/EACCES/EPERM/EROFS swallow vs unexpected rethrow per Tenet 4).
+  - `packages/mcp/src/ledger-writer.test.ts` — 5 tests covering event emission, session_id population/omission, getContext failure (must not throw), append-don't-overwrite.
+  - `packages/mcp/src/tools/search-knowledge.test.ts` — 2 new integration tests verifying handler emits `mcp_call` with `activity_name: 'search_knowledge'`, including the dimension-mismatch error path (invocation, not success, is what ADR-029 measures).
+  - `packages/cli/src/commands/init.test.ts` — 5 new tests covering the SessionStart template's session-id minting, persistence, ledger-event emission, agent_source stamping (Claude-specific), and fire-and-forget error-handling.
+
+  ## Backward compatibility
+
+  Same forward-only story as A.3.a schema:
+  - Pre-writers Trap Ledgers don't contain `mcp_call` or `session_start` events — readers parse them fine when they appear post-upgrade.
+  - SessionStart hook ledger-write block is in its own try/catch; if it fails (read-only filesystem, missing perms, etc.), the briefing path still runs.
+
+  ## ADR alignment
+  - ADR-029 § Session Heuristic: explicit UUID supersedes the rolling-2h activity heuristic when `.session-id` is present.
+  - ADR-078 § Event Attribution: `source: 'bot'` for both writers (emitter = MCP server / hook subsystem). In this lift, `session_start` includes `agent_source: 'claude'` (the Claude hook template knows its vendor); MCP `mcp_call` agent attribution is deferred to A.3.c via orchestrator → MCP correlation propagation.
+  - ADR-077 Smart Briefing: SessionStart hook already shipped (`installClaudeHooks` scaffolds the script); this PR only extends its body.
+
+  ## Out of scope (next sub-lifts)
+  - **A.3.b** — `totem doctor --compliance` reads these events and computes the ADR-029 metric (~1 week).
+  - **A.3.c** — orchestrator → MCP correlation_id propagation; populates `agent_source` (~1 week).
+  - **A.4.a / A.4.b** — PreToolUse soft-block + pre-push hard-block (per C-12); reads `mcp_call` events to gate Write/Edit on `proposals/active/**`, `adr/**`, `research/**`.
+  - **Gemini SessionStart writer** — symmetric pattern, deferred for parity sweep.
+  - **Other MCP tools** (`describe_project`, `add_lesson`, `verify_execution`) — wire `logMcpCall` when needed for broader observability.
+
+## 1.39.0
+
+### Minor Changes
+
+- 1934f13: feat(core): Trap Ledger schema extension — agent attribution + activity events (A.3.a)
+
+  Forward-only schema extension to `LedgerEventSchema` in `packages/core/src/ledger.ts`. First lift of the A.3 telemetry sprint (three-stream claim-discipline consensus, design doc at `mmnto-ai/totem-substrate:.handoff/_shared/2026-05-15-a3a-schema-extension-design.md`).
+
+  **New event types** (activity family):
+  - `mcp_call` — MCP tool invocation; `activity_name` discriminates (`search_knowledge`, `describe_project`, ...)
+  - `tool_call_first_significant` — first non-Read/Grep/Glob orchestrator tool call in session
+  - `hook_fire` — lifecycle hook executed; `activity_name` discriminates (`SessionStart`, `PreToolUse`, `pre-push`, ...)
+  - `session_start` — SessionStart hook fired; new `session_id` minted
+
+  **New optional fields:**
+  - `agent_source: 'claude' | 'gemini' | 'human'` — agent runtime attribution, orthogonal to `source` (emitting subsystem). Implements ADR-078 § Event Attribution; renamed from the ADR's `source` to disambiguate against the load-bearing emitter identifier already in production.
+  - `session_id` (UUID) — session correlation, persisted at `.totem/ledger/.session-id` per ADR-029 § Session Heuristic.
+  - `correlation_id` (UUID) — trace correlation per ADR-014; populated by A.3.c end-to-end propagation work.
+  - `activity_name` — sub-type discriminator for activity events.
+
+  **Field relaxations:** `ruleId` and `file` are now optional at the schema level to accommodate activity events. Writer-side discipline enforces required-by-type for `suppress` / `override` / `exemption`. Promotion to a Zod `discriminatedUnion` is deferred to A.3.c per design doc OQ-1 (strategy-Claude T0345Z disposition agreed; rationale and gap-filler tests in `ledger.test.ts` § "writer-side per-branch field presence" lock the discipline until the schema enforces it structurally).
+
+  **Backward compatibility:**
+  - Pre-A.3.a override events (no new fields) parse fine — all new fields optional.
+  - Post-A.3.a activity events read by pre-A.3.a code: silently dropped (`safeParse` fails on unknown enum value, line skipped). Acceptable — no data corruption, only telemetry-visibility loss in stale tooling. Cohort version bump after merge closes this naturally.
+
+  **Doc-sync (bundled):** `docs/wiki/trap-ledger.md` example corrected — pre-existing drift surfaced during A.3.a empirical pass. Three drifts fixed:
+  - Example `type` was `"exception"` (invalid; not in the enum) → now `"suppress"`.
+  - Example `source` was `"totem-context"` (bypass-marker; conflated with code's emitter identifier) → now `"lint"`.
+  - Prose claimed `// totem-context:` directives log `override` events — corrected to `suppress` per code comment in `LedgerEventSchema.type`.
+
+  Activity-event example added for `mcp_call` / `search_knowledge` shape.
+
+  **Out of scope (next sub-lifts):**
+  - A.3.b: `totem doctor --compliance` reads this schema and computes the ADR-029 metric (~1 week).
+  - A.3.c: orchestrator → MCP `correlation_id` propagation (~1 week).
+  - A.4.a / A.4.b: PreToolUse soft-block + pre-push hard-block pair (per C-12, ships alongside A.3.a).
+
+  ADR-078 surface amendment (rename agent attribution from `source` to `agent_source` in § Decision 2) landed at `mmnto-ai/totem-strategy#329` (commit `b830e0c` on main). Includes the first `Falsifying Metric:` field in the ecosystem per Tenet 19 — sibling capability-claim ADRs 014/029/044 backfilled in `mmnto-ai/totem-strategy#330`.
+
+## 1.38.0
+
+### Minor Changes
+
+- 923deb0: feat(doctor): add `--strict` mode + pre-push hook integration + CI workflow template (#1908)
+
+  Implements Proposal 273 § 7 routing matrix rows 5+6 (Repo + Auto + Both) for the first repo-state diagnostic (`checkAgentsMdCanonical`, shipped in #1907).
+  - `totem doctor --strict` now exits non-zero when any check reports `fail` (`warn` results remain informational). Default behavior unchanged.
+  - Pre-push hook injects `totem doctor --strict` inside the existing strict-tier guard (`is_agent=1` or `TOTEM_HOOK_TIER=strict`), mirroring the `totem review` shield gate. Standard-tier humans bypass; agents and explicit strict-tier operators get the gate.
+  - New `.github/workflows/totem-doctor.yml` template runs `doctor --strict` on PR + push to main. Cohort repos can copy or reference.
+
+  Exit-code decision lives at the CLI edge — `doctorCommand` returns `DiagnosticResult[]` and does not touch `process.exit` / `process.exitCode`.
+
+  **Calibration fix bundled.** `checkEmbeddingConfig` previously reported `fail` when the configured embedder's env key (`OPENAI_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY`) was missing. That misclassified an operator-setup state as a repo defect — empirically surfaced when `totem doctor --strict` ran in CI on this PR (CI intentionally lacks the keys). Both branches now return `warn`, mirroring `checkOllama`'s warn-on-unreachable pattern. The repo's config is correct; the local environment is incomplete.
+
+## 1.37.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.36.0
+
+Coordinated cohort bump — no direct changes to this pack. See `@mmnto/cli`'s
+CHANGELOG.md for the `totem hook` namespace entry.
+
+## 1.35.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.34.3
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.34.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.34.1
+
+Coordinated cohort bump — no direct changes to this pack. See `@mmnto/totem`'s
+CHANGELOG.md for the `generateLessonHeading`/`truncateHeading` mid-clause truncation fix.
+
+## 1.34.0
+
+Coordinated cohort bump — no direct changes to this pack. See `@mmnto/cli`'s
+CHANGELOG.md for the `totem init` Ollama floor probe entry.
+
+## 1.33.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.32.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.31.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.30.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.30.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.29.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.28.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.28.0
+
+### Minor Changes
+
+- bd3fd71: `totem sync` Phase A / Phase B architectural separation (mmnto-ai/totem#1811, ADR-101).
+
+  `totem sync` decomposes into two independently-runnable phases:
+  - **Phase A** — deterministic pack-resolution + `installed-packs.json` write (no API key required, runs in CI).
+  - **Phase B** — vector-store embedding sync (still requires the embedding key; unchanged).
+
+  New mutually-exclusive flags on `totem sync`:
+  - `--packs-only` (Lite tier): write the pack manifest only; skip embedding sync, prune, the global registry update, and the `review-extensions.txt` write. Designed for CI environments without API keys after a `@mmnto/totem` cohort bump where pack-resolution alone needs to run before `totem lint` recognizes newly registered Tree-sitter languages.
+  - `--index-only` (Standard tier): run only the embedding sync; skip pack-resolution. Use when `installed-packs.json` is already current and only the vector store needs to re-embed.
+
+  `--packs-only` hard-errors when combined with `--index-only`, `--full`, or `--prune` — Phase B is skipped under `--packs-only`, so those flags would silently no-op. `--index-only` composes with `--full` and `--prune` since all three modify Phase B.
+
+  The CLI orchestrator now writes `installed-packs.json` BEFORE invoking `runSync` so `--packs-only` can short-circuit cleanly. The default flag-less behavior is observably equivalent to prior releases.
+
+  UX nudge for stale manifests: when a rule expects a Tree-sitter language that isn't registered, the rule-engine now consults `installed-packs.json`'s cohort field and surfaces a structured `STALE_MANIFEST` `TotemError` pointing at `totem sync --packs-only` whenever the manifest is missing, pre-1.27.0, or written by an engine whose `major.minor` differs from the running version. Patch-level cohort drift passes (caret-range pack semver tolerance). Cohort-match falls through to the original "install the pack" `TotemParseError`.
+
+  Schema: `InstalledPacksManifestSchema` gains an optional `cohort: string` field (semver). Pre-1.27.0 manifests without the field continue to parse cleanly. Stamped at write time by `writeInstalledPacksManifest()` from `resolveEngineVersion()`; tests can pre-populate the field to override the stamp.
+
+  New public surfaces (additive):
+  - `resolveEngineVersion(): string`
+  - `detectStaleManifest(opts): StaleManifestDetection | null`
+  - `staleManifestError(detection, context): TotemError`
+  - `TotemErrorCode` adds `'STALE_MANIFEST'` and `'FLAG_CONFLICT'`.
+
+## 1.27.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.26.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.26.0
+
+### Minor Changes
+
+- c00dc7b: **ADR-097 § Q6 amended — engine-version constraint moves from `peerDependencies` to `engines` (closes #1803).**
+
+  Pack manifest resolver (`pack-manifest-writer.ts:readEngineRange`, formerly `readPeerEngineRange`) now reads `engines['@mmnto/totem']` from the resolved pack's `package.json` instead of `peerDependencies['@mmnto/totem']`. The boot-time engine-version cross-check (`pack-discovery.ts:assertEngineRangeSatisfied`) reads the same value via `installed-packs.json#packs[].declaredEngineRange` and continues to fail loud on semver mismatch.
+
+  **Why the move:**
+  - `engines` is npm-canonical for engine-version constraints. `peerDependencies` is for actual peer packages the consumer must install (e.g., `@ast-grep/napi`). Mechanism mapping is now correct.
+  - Symmetry across the cohort. Internal and future external packs declare `engines.@mmnto/totem` consistently; `peerDependencies` is uniformly for actual peer packages only.
+  - Closes the structural collision with `mmnto-ai/totem#1777` (the `1.22.0 → 2.0.0` wiggle root cause): a fixed-group sibling pack cannot peer-dep `@mmnto/totem` without triggering a changesets MAJOR cascade. The `engines` field is not touched by changesets fixed-group auto-bump, so the wiggle stays prevented even with a declared engine constraint.
+
+  **Migration shape:**
+  - `@mmnto/pack-rust-architecture` and `@mmnto/pack-agent-security` now declare `"engines": { "@mmnto/totem": "^1.25.0" }`. Neither declares `@mmnto/totem` in `peerDependencies` (locked by `structure.test.ts` invariants in both packs).
+  - The `not-a-pack` warning in `totem sync` was reworded to point at the actual gap: `"missing engines['@mmnto/totem'] declaration — pack cannot satisfy the engine-version cross-check (ADR-097 § 5 Q6). Add '"engines": { "@mmnto/totem": "^<version>" }' to the pack's package.json and republish."` Pre-#1803 text was misleading per `mmnto-ai/totem#1803`'s reproducer (it claimed the registration callback was missing when the callback was correctly exported).
+  - No fallback to the legacy `peerDependencies['@mmnto/totem']` slot. Pre-1.26.0 packs that declared the engine constraint via peerDeps (none known to exist outside the `@mmnto/*` cohort, all of which are migrated in this cohort) must republish with `engines` declared.
+
+  Closes #1803.
+
+### Patch Changes
+
+- 9f0535d: **Fix `engines['@mmnto/totem']` constraint floor — `^1.25.0` → `^1.26.0`.**
+
+  GCA HIGH catch on the auto-generated Version Packages PR (#1808). The engines-field reader (`pack-manifest-writer.ts:readEngineRange`) ships in `@mmnto/totem@1.26.0`. Engines pre-1.26.0 read `peerDependencies['@mmnto/totem']` and would silently treat these packs as `not-a-pack` (the engines field is invisible to them). Declaring compatibility with `^1.25.0` was technically incorrect — a 1.25.0 engine cannot satisfy these packs even though caret-semver would let it match.
+
+  Tightening the floor to `^1.26.0` makes the constraint match actual runtime compatibility. Fixed-group co-versioning makes this a documentation / safety-rail correction in practice (consumers pinned to a 1.26.x pack pull in the matching 1.26.x engine via the cohort), but the declared range should reflect reality.
+
+  No code change. Constraint-only tightening.
+
+## 1.25.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.24.0
+
+### Minor Changes
+
+- 67c3ad3: **ADR-091 § Bootstrap Semantics: pack pending-verification install→lint promotion (#1684)**
+
+  Closes the cloud-compile bootstrap gap that ADR-091 § Bootstrap Semantics defined: pack rules cannot be trusted to fire on the consumer's codebase until Stage 4 verifies them locally, so they now enter the consumer's manifest as `'pending-verification'` and the next `totem lint` runs the verifier and promotes them per outcome.
+
+  **`CompiledRule.status` enum extended** with a fourth lifecycle value `'pending-verification'` alongside `'active' | 'archived' | 'untested-against-codebase'`. The lint-execution path (`loadCompiledRules`) treats it as inert exactly like `'archived'` and `'untested-against-codebase'`; the admin path (`loadCompiledRulesFile`) returns it unfiltered so the promotion interceptor can find pending entries.
+
+  **`totem install pack/<name>`** now stamps every pack rule `'pending-verification'` regardless of the status the pack shipped with. The pack's authoring environment cannot have run Stage 4 against the consumer's codebase, so the cloud-compile status is meaningless on the consumer side. The install command appends `Run \`totem lint\` to activate pack rules` to its output as the activation hint.
+
+  **`.totem/verification-outcomes.json`** is the new committable side-table that memoizes Stage 4 outcomes across runs. The first lint run after install reads pending rules from the manifest, invokes the Stage 4 verifier on each, maps the outcome to one of the four terminal lifecycle values per Invariant #3, atomically writes the outcomes file with canonical-key-order serialization (Invariant #11 — byte-stable across runs so consumer repos see no phantom diffs), and saves the mutated manifest. Subsequent lint runs read the recorded outcome from the file and skip re-verification (Invariant #4); a pack content update produces a new `lessonHash` which has no recorded outcome, so the verifier runs again (Invariant #5).
+
+  **Per-rule verifier-throw isolation** (Invariant #7): one failing rule's verifier-throw does not abort the lint pass; that rule remains `'pending-verification'` and the next lint retries.
+
+  **Empty-pending fast path** (Invariant #9): the common-case lint pass with zero pending rules pays no verification cost and skips the outcomes-file read entirely.
+
+  **New public API** in `@mmnto/totem`:
+  - `promotePendingRules(rules, deps)` and `applyOutcomeToRule(rule, entry)` — the core interceptor.
+  - `readVerificationOutcomes(filePath, onWarn?)` and `writeVerificationOutcomes(filePath, outcomes)` — the persistence layer.
+  - `VerificationOutcomeEntrySchema`, `VerificationOutcomesFileSchema`, `Stage4OutcomeStored` — Zod schemas.
+  - `VerificationOutcomesStore`, `VerificationOutcomesFile`, `VerificationOutcomeEntry`, `Stage4OutcomeStoredValue`, `PromotePendingRulesDeps`, `PromotePendingRulesResult` — types.
+
+  **Naming-collision context (option B):** the original ADR-091 draft specified `.totem/rule-metrics.json` for the verification-outcomes file, but `packages/core/src/rule-metrics.ts` already exists as a per-machine telemetry-cache module (`triggerCount`, `suppressCount`, `evaluationCount`) with a gitignored `.totem/cache/rule-metrics.json` lifetime. ADR-091 § 65 was amended to specify `.totem/verification-outcomes.json` instead — separate filename for the new committable verification state, separate module name (`verification-outcomes.ts`) for the new schemas + persistence layer.
+
+## 1.23.0
+
+### Minor Changes
+
+- 94ea4a8: **Pack v0.1 alpha pilot: `@mmnto/pack-rust-architecture` lift + ADR-091/097 substrate completion (#1773)**
+
+  First non-trivial consumer of the ADR-097 § 10 Pack v0.1 substrate (#1768/#1769/#1770 in 1.22.0). Validates the substrate end-to-end by registering Rust as a language extension and dispatching ast-grep rules against `.rs` source.
+
+  **`@mmnto/pack-rust-architecture@1.23.0`** — new package (`private: true`)
+  - 8 baseline lessons sourced from `mmnto-ai/liquid-city#134` (slice-6 vehicle-agent + dispersion review cycle, lc-Claude attribution preserved)
+  - Synchronous CJS `register.cjs` wires Rust into both engine paths: `api.registerLanguage('.rs', 'rust', wasmLoader)` for the web-tree-sitter side and `napi.registerDynamicLanguage({ rust })` for the @ast-grep/napi side (v0.1 side-channel, see `@mmnto/totem#1774`)
+  - Bundled `tree-sitter-rust.wasm` (1.1 MB) sourced from `@vscode/tree-sitter-wasm@0.3.1` (MIT, Microsoft) via `prepare`-time copy
+  - `compiled-rules.json` ships one tracer-bullet seed rule (`lesson-8cefba95`, Bevy hot-path `Local<Vec<T>>` per-tick allocation) — full LLM-compile of the 8-lesson set deferred to a focused follow-up since γ (per-language `KIND_ALLOW_LIST`, #1655) is needed before LLM-compile of Rust patterns avoids TS-grammar hallucinations
+  - Runtime integration tests boot the pack via `loadInstalledPacks({ inMemoryPacks })` and verify the seed rule fires on `.rs` source through the full substrate path
+
+  **`@mmnto/totem` — #1654 fix: thread target Lang through the compile-time pattern validator**
+
+  Pre-#1654, `validateAstGrepPattern` always parsed under `Lang.Tsx` regardless of the rule's `fileGlobs`, and `inferBadExampleExts` (smoke gate) used a TS/JS-only regex that silently fell back to the default set for non-TS rules. A Rust pattern would either false-pass under TSX (the `ResMut<TacticalState>` exhibit) or false-fail with a TSX-parser error.
+  - `validateAstGrepPattern(pattern, fileGlobs?)` now resolves the target Lang via `resolveAstGrepLangs(fileGlobs)` and accepts the pattern when any one Lang accepts it. Falls back to `Lang.Tsx` when fileGlobs is empty or no glob carries a registered extension (preserves legacy unscoped-rule semantics).
+  - `inferBadExampleExts` extracts any trailing extension from `fileGlobs` (not just TS/JS); runtime's `extensionToLang` filters out unmapped extensions inside `matchAstGrepPattern` so unmapped extensions cleanly return zero matches without parsing under the wrong grammar.
+  - New `resolveAstGrepLangs` helper exported alongside `extensionToLang` from `ast-grep-query.ts`.
+  - 6 new regression tests covering the LC false-positive exhibit and the TS-fallback preservation invariant.
+
+  **Substrate-extension follow-up filed as #1774 (tier-2, investigation)**: lift the napi-side language registration into `PackRegistrationAPI.registerNapiLanguage` once N≥2 pack consumers exist. PR-B's side-channel pattern in `register.cjs` is the time-boxed precedent that gathers design data; the side-channel is documented as visible debt in the pack's README.
+
+## 1.22.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.21.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.20.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.19.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.18.3
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.18.2
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.18.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.18.0
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.17.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.17.0
+
+### Minor Changes
+
+- 6fd5271: `totem retrospect <pr>` — bot-tax circuit-breaker (mmnto-ai/totem#1713).
+
+  Closes mmnto-ai/totem#1713. Reads a PR's bot-review history live, groups findings into push-based rounds via each review submission's `commit_id` (one round per push, not one round per submission), enriches each finding with cross-PR-recurrence flags read from `.totem/recurrence-stats.json` (mmnto-ai/totem#1715 substrate, read-only) plus rule-coverage flags read from `.totem/compiled-rules.json`, and emits a deterministic verdict per finding: `route-out`, `in-pr-fix`, or `undetermined`. The classifier is a fixed table over the four-axis cube `(severityBucket × roundPosition × crossPrRecurrenceBucket × coveredByRule)`; route-out reasons come from a closed catalog so the report doesn't accumulate one-off prose strings.
+
+  No LLM. No GitHub mutation. Read-only outside the optional `--out <path>` JSON write. Sub-threshold runs exit 0 with a benign skip message; `--force` overrides. The no-LLM invariant is locked down by both a static-source-grep guard (mirrors `totem review --estimate` from mmnto-ai/totem#1714) and a runtime check that every dynamic import in the command file resolves to a non-LLM module.
+
+  New CLI surface: `totem retrospect <pr-number>` with `--threshold <n>` (default 5), `--force`, `--out <path>`. Requires `gh` authenticated against the repo. The `--auto-file` flag proposed in the auto-spec is intentionally deferred to a follow-up ticket (mass-filing is irreversible; v0.1 emits suggested issue titles + bodies the human can copy-paste).
+
+  New core surface: `RetrospectRoundSchema`, `RetrospectClassificationSchema`, `RetrospectFindingSchema`, `RetrospectReportSchema` plus pure helpers `groupFindingsByRound`, `classifyFinding`, `buildStopConditions`, `computeDedupRate`, `signatureOfBody`, `toRoundPosition`, `toCrossPrBucket`. `toSeverityBucket` is now exported from `@mmnto/totem` so the bot-tax cluster (`#1715` + `#1714` + `#1713`) shares one severity vocabulary. `GitHubCliPrAdapter` gains a `fetchReviews(prNumber)` method that reads `gh api repos/.../pulls/N/reviews --paginate` for `commit_id` + `submitted_at` (the existing `fetchPr` JSON shape doesn't include `commit_id`).
+
+## 1.16.1
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.16.0
+
+### Minor Changes
+
+- 2d5b9ac: `totem stats --pattern-recurrence` — cross-PR recurrence clustering substrate.
+
+  Closes mmnto-ai/totem#1715. Fetches bot-review findings (CodeRabbit + Gemini Code Assist) across the most recent merged PRs (`--history-depth`, default 50, capped at 200), folds in trap-ledger `override` events as co-equal signals, clusters them by a normalized signature (paths + line numbers + code-fence content stripped), filters out clusters covered by an existing compiled rule via Jaccard ≥ 0.6 keyword-overlap on the rule's `message`, and writes the surviving patterns at-or-above `--threshold` (default 5) to `.totem/recurrence-stats.json`. The console summary shows the top 5 by occurrence count.
+
+  This is the substrate of truth for the upcoming `totem retrospect <pr>` (mmnto-ai/totem#1713 bot-tax circuit breaker) and `totem review --estimate` (mmnto-ai/totem#1714 pre-flight estimator) — patterns from those features will read this file rather than re-scan PR history per invocation.
+
+  Output shape is versioned (`version: 1`), stable, and Zod-validated; consumers can parse against `RecurrenceStatsSchema` exported from `@mmnto/totem`. Atomic writes via temp + rename keep concurrent invocations safe.
+
+## 1.15.10
+
+### Patch Changes
+
+- 4bb87e2: `totem review` operator-dogfood bundle: override stamps the push-gate cache, plus an explicit `--diff <ref-range>` flag.
+  - **mmnto-ai/totem#1716** — `totem review --override <reason>` now writes `.totem/cache/.reviewed-content-hash` after recording the override, so the push-gate hook unblocks immediately. Closes the tribal-knowledge `git reset --soft HEAD~1 && totem review --staged` workaround used since the override flag was added. New `recordShieldOverride` helper bundles the trap-ledger write and content-hash stamp into a single call site exercised by both the V2 structured-verdict path and the V1 fallback.
+  - **mmnto-ai/totem#1717** — adds `totem review --diff <ref-range>` for explicit diff scope (e.g. `--diff HEAD^..HEAD`, `--diff main...feature`). Bypasses the implicit working-tree → staged → branch-vs-base fallback. The chosen diff source is logged to stderr (`Diff source: explicit-range`, `staged`, `uncommitted`, or `branch-vs-base`) so the operator's mental model matches the actual git invocation. Diffs exceeding 50,000 chars now surface a fail-loud truncation warning at the resolution layer — before the LLM call — so the operator can re-run with a narrower range instead of paying for a degraded review. The flag is documented in `--help`'s "Diff resolution" section. New `getGitDiffRange(cwd, range)` core helper rejects flag-injection ranges (leading `-`) and empty values; arg-array `safeExec` invocation prevents shell-metachar interpretation.
+
+## 1.15.9
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.15.8
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.15.7
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.15.6
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.15.5
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.15.4
+
+### Patch Changes
+
+- d295439: 1.15.4 bundles two compile-worker prompt classifier improvements that surfaced from downstream consumer friction on `mmnto-ai/liquid-city`. Both close fidelity gaps between the lesson prose authors wrote and the compiled rule that shipped.
+
+  ## Test-contract scope classifier (closes #1626)
+  - New `### Test-Contract Scope Classifier (mmnto-ai/totem#1626)` section on both `COMPILER_SYSTEM_PROMPT` and `PIPELINE3_COMPILER_PROMPT`. Teaches the compile-worker to recognize lessons whose hazard is **behavior inside test files** (assertion conventions, spy / mock contracts, test-fixture hygiene) and emit test-inclusive `fileGlobs` instead of the default `!**/*.test.*` exclusion.
+  - Three positive signals classify a lesson as test-contract: the `testing` tag, test-framework calls in `badExample`/`goodExample` (`describe(`, `it(`, `test(`, `expect(`, `vi.mock(`, `jest.mock(`, `beforeEach(`, `afterEach(`, `vi.spyOn(`, `jest.spyOn(`), or lesson-body references to test-execution-specific behavior.
+  - Broad test-inclusive glob set for test-contract rules: `["**/*.test.*", "**/*.spec.*", "**/tests/**/*.*", "**/__tests__/**/*.*"]`. Narrow test-scoped globs (e.g., `packages/e2e/**/*.spec.ts`) are preserved when the lesson clearly targets them.
+  - False-positive trap guard: the word "contract" alone does NOT classify a lesson as test-scoped. Lessons titled "Define strict API Data Contracts" or "Versioning contracts for REST endpoints" describe application-surface invariants. Classification requires the `testing` tag OR test-framework code in the examples alongside any keyword match.
+
+  **Downstream impact:** Two `liquid-city` rules (`"Normalize temp paths for cross-platform equality"`, `"Spy on logger contracts in tests"`) were shipping with scopes that excluded tests and silently never fired. A follow-up chore cycle (`totem compile --upgrade <hash>` per rule) retriages existing corpus against the new prompt.
+
+  ## Declared severity override (closes #1656)
+  - New `parseDeclaredSeverity(body: string)` helper exported from `@mmnto/totem`. Parses `**Severity:** error` / `Severity: warning` prose declarations from a lesson body and returns a normalized `'error' | 'warning' | undefined`. Tolerates common markdown and punctuation shapes: bold markers (`**`, `*`, `_`) on either side, backtick-wrapped values, trailing sentence punctuation (`.`, `,`, `;`, `:`, `!`, `?`), and combined shapes like `**Severity: error**.`. Strict enum equality follows the strip, so out-of-vocabulary tokens (`info`, `critical`) return `undefined`.
+  - `buildCompiledRule` honors a new `declaredSeverityOverride` option on `BuildCompiledRuleOptions`. Post-LLM override wins over `parsed.severity` regardless of LLM emission. Marker fires in `BuildRuleResult.severityOverride` only when the override actually changed the outcome (declared value differs from `emittedSeverity ?? 'warning'`). Marker is threaded through rejection paths too, so telemetry captures prompt-drift even when the rule fails for other reasons.
+  - New `onSeverityOverride` callback on `CompileLessonCallbacks` fires when the override changes the emitted severity. CLI `compile.ts` wires a `writeSeverityOverrideTelemetry` closure that appends records tagged `type: 'severity-override'` to `.totem/temp/telemetry.jsonl` via the cwd-aware `totemDir` (matches the `mmnto-ai/totem#1645` pattern). Fire-and-forget; sink failures do not interfere with compile results.
+  - New `### Declared Severity (mmnto-ai/totem#1656)` directive section on both compile prompts instructs the LLM to honor prose-declared severity in its emitted JSON. Every Output Schema example and every concrete Lesson → Output few-shot example now carries `"severity": "warning"` (the default) to reduce drift at source.
+
+  **Downstream impact:** Five `liquid-city` ADR-008 rules on PR 77 burned ~10 manual severity-edit commits across R2 + R3 rounds because the compile pipeline emitted `"severity": "warning"` despite lesson prose declaring `Severity: error`. The mechanical re-edit loop closes; the next `totem lesson compile` cycle on LC emits declared severity directly.
+
+  ## Strategy submodule bump
+  - `.strategy` submodule pointer advances from `113179c` to `7892892b`. Picks up strategy PR #125 (upstream-feedback items 015 + 016 from liquid-city session-17) and strategy PR #124 (upstream-feedback item 017 — three-layer language support gap addendum that documents the architectural surface of the pending Rust-support arc).
+
+## 1.15.3
+
+### Patch Changes
+
+- b782d4e: 1.15.3 bundles three compile-worker quality fixes and the runtime ReDoS defense. All three extend the ADR-091 Classify stage or harden the deterministic-enforcement path under `totem lint`.
+
+  ## Bounded regex execution (closes #1641)
+  - Runtime per-rule-per-file timeout on regex evaluation via a persistent Node worker thread. Catastrophic-backtracking patterns now terminate at the configured budget instead of hanging `totem lint`. Pre-exhibit defense against a ReDoS attack chain that survives every prior gate (`safe-regex` static check, bidirectional smoke gate, human promotion review).
+  - `totem lint --timeout-mode <strict|lenient>` — new flag on the lint command. `strict` (default) fails non-zero on any timeout; `lenient` skips the offending rule-file pair with a visible warning. Strict mode is the CI path.
+  - New `packages/core/src/regex-safety/` module (`evaluator.ts`, `worker.ts`, `apply-rules-bounded.ts`, `telemetry.ts`). Async `applyRulesToAdditionsBounded` sibling to the sync path, policy-free — returns `{violations, timeoutOutcomes}` and lets the CLI apply strict-vs-lenient exit-code policy.
+  - Telemetry: every terminal outcome (match, no-match, timeout, syntax error) writes a `type: 'regex-execution'` record to `.totem/temp/telemetry.jsonl`, Zod-validated against `RegexTelemetrySchema` with repo-relative path redaction (paths outside the repo root become `<extern:<sha256-12>>`).
+  - Race-condition hardening baked in: `respawnPromise` coalesces concurrent respawn requests, `MAX_CONSECUTIVE_RESPAWNS` guards against infinite spawn loops on a permanently-broken worker, and a cold-start gate prevents the 100ms default from misfiring under CI load.
+
+  ## Context-required classifier (closes #1598)
+  - New `reasonCode: 'context-required'` route on the compile-worker output schema. Lessons whose hazard is scope-bounded by a context the pattern cannot structurally capture (e.g., `"sim.tick() must not advance inside _process"`) now route to the `nonCompilable` ledger instead of compiling into false-positive-prone rules.
+  - Narrow LLM-emittable enum on `CompilerOutputBaseSchema.reasonCode` (not the full `NonCompilableReasonCodeSchema`), preventing the LLM from forging internal codes like `verify-retry-exhausted`. Extends ADR-091's Classify stage.
+  - New **Context Constraints Classifier** section on the compile prompt with marker heuristics (inside / when / only-for-new / must-not) and an explicit **anti-lazy** rule-of-thumb: compilation MUST still succeed when `fileGlobs` / ast-grep `kind:` / `inside:` / `has:` / `regex:` combinators can express the guard.
+
+  ## Semantic-analysis classifier + ledger hygiene
+
+  Closes #1634 + #1627.
+  - Extends the narrow `reasonCode` enum with `'semantic-analysis-required'` covering four sub-classes: multi-file contracts, closure-body AST analysis, system-parameter-aware scoping, project-state-conditional semantics. Sub-class carried in the prose `reason`; one consolidated code keeps the LLM contract tight.
+  - Pipeline 2 and Pipeline 3 `!parsed.compilable` branches switch from per-code conditional checks to `parsed.reasonCode ?? 'out-of-scope'`. Future narrow classifiers thread through without per-code switches.
+  - `LEDGER_RETRY_PENDING_CODES` set + `shouldWriteToLedger(reasonCode)` predicate exported from `@mmnto/totem`. CLI ledger guard now rejects writes for retry-pending codes (`pattern-syntax-invalid`, `pattern-zero-match`, `verify-retry-exhausted`, `missing-badexample`, `missing-goodexample`, `matches-good-example`) so transient smoke-gate rejections no longer permanently mark lessons as unfit.
+  - Symmetric stale-entry prune on both compiled branches (local + cloud) when a lesson compiles cleanly, and on cloud smoke-gate rejection. Cleaned three stale `matches-good-example` entries from the shipped ledger.
+
+## 1.15.2
+
+### Patch Changes
+
+- 1c766c2: 1.15.2 ships the archive-in-place durability substrate from #1587 and the new `totem lesson archive` atomic command.
+
+  ## Governance durability (closes #1587)
+  - `totem lesson compile --refresh-manifest` — new no-LLM primitive that recomputes `compile-manifest.json` output_hash from the current `compiled-rules.json` state. Closes the postmerge inline-archive gap where the no-op compile path only detected input-hash drift. Strict exclusivity with `--force`.
+  - `totem lesson compile --force` now preserves `status`, `archivedReason`, and `archivedAt` additively on rules whose `lessonHash` survives to the new output. Transient compile failures (network / rate-limit / manual reject / example-verification / cloud parse) leave the old rule intact instead of silently dropping it. Implemented via the new `preserveLifecycleFields` helper in core and `upsertRule` / `removeRuleByHash` helpers in the CLI compile loop (replace-by-hash on success; remove-on-skipped; unchanged on failed / noop). Dangling-archive guard preserved — rules whose source lesson was deleted are never resurrected.
+  - `totem lesson archive <hash> [--reason <string>]` — new atomic command mirroring `totem rule promote`. Flips the rule's `status` to `archived`, stamps `archivedAt` on first transition, preserves `archivedAt` on reruns, refreshes the manifest, and regenerates copilot + junie exports — all in one call. Matches prefix on `lessonHash`; duplicate-full-hash collisions surface as data-corruption errors distinct from prefix ambiguity.
+  - `/postmerge` skill doc rewritten to call `totem lesson archive` directly, retiring the hand-rolled `scripts/archive-bad-postmerge-*.cjs` pattern.
+
+## 1.15.1
+
+### Patch Changes
+
+- e69edb2: 1.15.1 ships the `totem proposal new` and `totem adr new` scaffolding commands that close out #1288.
+
+  ## Governance authoring (closes #1288)
+  - `totem proposal new <title>` scaffolds a new strategy proposal at `.strategy/proposals/active/NNN-kebab-title.md` with the canonical template (Status / Author / Date / Milestone + Motivation / Problem Statement / Proposed Solution / Consequences / Decision Needed).
+  - `totem adr new <title>` scaffolds a new ADR at `.strategy/adr/adr-NNN-kebab-title.md` with the Format B convention (`# ADR NNN: Title`, Status / Context / Decision / Consequences).
+  - Both commands auto-increment the number by scanning the target directory, collision-check before any disk writes, and warn-and-continue on post-scaffold hooks so partial failures do not leave orphan files.
+  - Runs `pnpm run docs:inject` automatically when the project has that script configured, so the `PROPOSAL_INBOX` and `ADR_TABLE` dashboards in README.md refresh without manual intervention.
+  - New orchestrator at `packages/cli/src/utils/governance.ts` with 5 helpers and 2 default templates. 34 new tests covering slug validation, collision detection, number inference, template selection, and hook degradation.
+  - `@mmnto/pack-agent-security` allowlist updated for the 2 legitimate `spawn` sites the new commands introduce.
+
+## 1.15.0
+
+### Minor Changes
+
+- f9c287b: 1.15.0 ships Pack Distribution: the first shippable Totem pack, plus the compile-hardening and zero-trust substrate that makes packs safe to distribute.
+
+  ## Pack Distribution
+  - `@mmnto/pack-agent-security` (ADR-089 flagship pack). 5 immutable security rules covering unauthorized process spawning, dynamic code evaluation with non-literal arguments, network exfiltration via hardcoded IPs or suspicious domains (API + shell-string variants), and obfuscated string assembly via byte-level primitives. Every rule ships `immutable: true` + `severity: error` + `category: security` with bad/good fixture pairs and 57 unit tests.
+  - `totem install pack/<name>` command installs a published pack into the local manifest.
+  - `pack-merge` primitive refuses downgrade of immutable rules to warning or archived; bypass attempts log to the Trap Ledger.
+  - Content-hash substrate across TypeScript and bash (review + sync + pre-push hook) so pack integrity verifies without relying on file timestamps.
+
+  ## Zero-trust default (ADR-089)
+  - Pipeline 2 and Pipeline 3 LLM-generated rules now ship `unverified: true` unconditionally. Activation via the atomic `totem rule promote <hash>` CLI or the ADR-091 Stage 4 Codebase Verifier in 1.16.0.
+  - Pipeline 1 (manual) keeps its conditional semantics; human-authored rules are self-evidencing.
+
+  ## Compile hardening (ADR-088 Phase 1)
+  - Layer 3 verify-retry loop: rules that fail their own smoke test re-prompt once before the compiler rejects them.
+  - Compile-time smoke gate runs both `badExample` and `goodExample`; rules that fire on both directions are rejected with reason code `matches-good-example` (closes the over-matching hole that drove the 2026-04-18 security-pack 10-of-10 archive rate).
+  - `archivedAt` timestamp preserved across schema round-trips so the institutional first-archive-provenance ledger survives every compile cycle.
+  - `unverified` flag and `nonCompilable` 4-tuple with 9-value reason-code enum replaces the opaque 2-tuples.
+  - `totem doctor` stale-rule advisory (ADR-088 Phase 1) plus the grandfathered-rule advisory that surfaces the pre-zero-trust cohort categorized by `vintage-pre-1.13.0`, `no-badExample`, and `no-goodExample`.
+
+  ## Platform
+  - Compound ast-grep rules (ADR-087, promoted from Proposal 226). `astGrepYamlRule` field on `CompiledRule` with mutual exclusion on `astGrepPattern`, structural combinators (all / any / not / inside / has / precedes / follows), and canonical-serialization hashing via `canonicalStringify`.
+  - Windows shell-injection fix in `safeExec` via `cross-spawn.sync` (closes a three-week-latent vector).
+  - Cross-Repo Context Mesh (`totem search` federation + `totem doctor` Linked Indexes health check).
+  - Standalone binary distribution unblocked (darwin-arm64, linux-x64, win32-x64).
+
+  ## Positioning
+  - **ADR-090 (Multi-Agent State Substrate).** Scopes Totem as the shared state, enforcement, and audit substrate for multi-agent development. Totem does not own agent routing, capability negotiation, session lifecycle, or live-edit conflict resolution. Future feature admission passes the Scope Decision Test.
+  - **ADR-091 (Ingestion Pipeline Refinements).** Redefines the 1.16.0 ingestion pipeline as a 5-stage funnel: Extract → Classify → Compile → Verify-Against-Codebase → Activate. Renames the legacy `allowlist` terminology to `baseline`.
+  - **ADR-085 (Pack Ecosystem).** Accepted with five deferred decisions resolved: Behavioral SemVer with refinement classification, array-order precedence plus `totem doctor` shadowing warning, Local Supreme Authority with ADR-089 immutable-severity carve-out, Sigstore + in-toto signing, native npm lifecycle with 72-hour unpublish constraint.
+
+  Detailed patch-level changes: CHANGELOG.md entries 1.14.1 through 1.14.17.
+
+## 1.14.17
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.14.16
+
+### Patch Changes
+
+- b7f298c: Ship the ADR-089 zero-trust default and the `totem rule promote` CLI (mmnto-ai/totem#1581, part 1 of 2).
+
+  **Zero-trust default (core):** every LLM-generated rule now ships `unverified: true` unconditionally. Pipeline 2 (verify-retry loop) and Pipeline 3 (Bad/Good example-based) both flip from the pre-#1581 conditional behavior (keyed on Example Hit presence) to unconditional. Pipeline 1 (manual) keeps its pre-#1581 conditional semantics because manual rules are human-authored and self-evidencing; the existing Pipeline 1 Example-Hit guard stays as a safety net.
+
+  Rationale: the LLM cannot self-certify structural invariants. Example Hit/Miss is an LLM-produced artifact of the compile process, not a human sign-off. Activation requires either human promotion via the new CLI below OR the ADR-091 Stage 4 Codebase Verifier in 1.16.0 (which validates rules empirically against actual code, not against LLM-generated snippet fixtures).
+
+  **`totem rule promote <id>` CLI:** flips a rule's `unverified: true` flag to absent (canonical "verified" state), atomically refreshes `compile-manifest.json`'s `output_hash` so `verify-manifest` passes on the next push. Refuses to promote archived rules and refuses when the target rule is already verified. Exits 1 on ambiguous prefix matches with a disambiguation list.
+
+  Hand-editing `compiled-rules.json` to flip `unverified` would break the manifest hash and trip the pre-push `verify-manifest` gate. The promote command is the blessed path; the atomic refresh closes that user trap at source.
+
+  **Scope split:** the "Option 1 + Categorized Advisory" plan locks the 1.15.0 ship gate via this PR. The categorized `totem doctor` advisory that surfaces the 357 grandfathered pre-1.13.0 rules by reason lands as a follow-up PR on a separate branch to keep the reviewable surface tight.
+
+  Closes #1581 (part 1).
+
+- 358336e: Add `archivedAt` to `CompiledRuleBaseSchema` so Zod stops silently stripping it on round-trips (mmnto-ai/totem#1589).
+
+  Pre-#1589, the schema declared `status`, `archivedReason`, `badExample`, `goodExample`, and a half-dozen other lifecycle fields — but not `archivedAt`. Zod's default behavior strips unknown keys during parse/serialize. Every compile-write cycle that round-tripped `compiled-rules.json` through `CompiledRulesFileSchema.parse()` silently erased prior `archivedAt` values from archived rules. Postmerge archive scripts (`scripts/archive-postmerge-*.cjs`) set the field via raw JSON mutation; it survived on disk until the next `totem lesson compile --export` quietly rewrote the file. Observed on PR #1588 (rule `4b091a1bc7d286d6`, archived 2026-04-19, timestamp lost during postmerge re-export). GCA caught the drop and we restored the timestamp manually; this ticket prevents future losses at the schema level.
+
+  The field is declared `z.string().optional()` for backward compatibility with pre-#1589 manifests that never had the field populated. Existing call sites continue to work unchanged.
+
+  Four new tests in `compiler-schema.test.ts` pin the invariant: accepts a rule with `archivedAt` set, preserves the field across a full parse → serialize → parse round-trip, tolerates an active rule without the field, and preserves the full archive tuple (`status` + `archivedReason` + `archivedAt`) together.
+
+  Closes #1589.
+
+## 1.14.15
+
+### Patch Changes
+
+- 89ca890: Extend the compile-time smoke gate with an over-matching check via `goodExample` (mmnto-ai/totem#1580).
+
+  The gate now verifies both directions: the rule MUST match its `badExample` (under-matching check, in place since #1408) AND MUST NOT match its `goodExample` (over-matching check, new). A rule that fires on both sides is over-broad and produces false positives on every lint run, which was the dominant defect class observed in the 2026-04-18 security-pack postmerge incident (10-of-10 bad rate from #1526).
+
+  `CompilerOutputSchema.goodExample` flips from optional to engine-conditional required for regex and ast-grep engines, mirroring the #1420 flip for `badExample`. The `ast` engine (Tree-sitter S-expression queries) remains exempt because the smoke gate does not yet evaluate those. `CompiledRuleSchema.goodExample` stays optional on the persisted-rule boundary for backward compat with pre-#1580 rules.
+
+  Two new reason codes added to `NonCompilableReasonCodeSchema`: `matches-good-example` (over-match rejection) and `missing-goodexample` (defensive path for callers that bypass the schema refine). Rejected lessons surface in the `nonCompilable` ledger with the correct code so `totem doctor` and downstream telemetry can distinguish over-match rejections from other skip categories.
+
+  Pipeline 3 automatically threads the lesson's Good snippet through as `goodExampleOverride`; Pipeline 2 requires the LLM to emit `goodExample` alongside `badExample` via the updated compiler prompt. Pipeline 1 (manual) is unaffected — the gate is opt-in via `enforceSmokeGate`.
+
+  Closes #1580.
+
+## 1.14.14
+
+### Patch Changes
+
+- e073dc0: Flip Pipeline 5 auto-capture on `totem review` from opt-out to opt-in.
+
+  `--no-auto-capture` is renamed to `--auto-capture`; the default is now OFF. Observation rules captured from review findings are context-less (regex drawn from the flagged line, message taken from the reviewer, `fileGlobs` scoped to the whole codebase) and routinely pollute `compiled-rules.json` with rules that fire on unrelated files. The Liquid City Session 6 audit measured an 8-rule wave across 5 review invocations producing 13 new warnings on the next `totem lint`, up from 0.
+
+  To preserve the old behavior, pass `--auto-capture` explicitly. Auto-capture will resume as a default once ADR-091 Stage 2 Classifier + Stage 4 Codebase Verifier ship in 1.16.0 and the LLM-emitted rule loop has gates that prevent context-less emissions.
+
+  Closes #1579.
+
+## 1.14.13
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.14.12
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._
+
+## 1.14.11
+
+_Cohort-link bump (no direct package changes). See `.changeset/config.json` for the fixed-cohort definition._

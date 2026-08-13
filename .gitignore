@@ -4,7 +4,13 @@ node_modules/
 # Build artifacts
 dist/
 .lancedb/
+.lancedb-eval-*/
 .turbo/
+
+# Non-JS ecosystem artifacts (language packs may run locally)
+__pycache__/
+*.pyc
+target/
 
 # Environment
 .env
@@ -13,17 +19,16 @@ dist/
 # IDE & AI tool configs
 .vscode/
 *.code-workspace
-.claude/
-.gemini/settings.json
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
 
-# Gemini hooks & skills ARE committed (no secrets)
+# Gemini settings, hooks & skills ARE committed (hooks-only team file, no
+# secrets — mmnto-ai/totem-strategy#619 ruling 2026-07-22; per-developer
+# content lives at user-level ~/.gemini/settings.json)
 !.gemini/hooks/
 !.gemini/skills/
 .mcp.json
-scratchpad/
-
-# Design assets (local only)
-design/
+.junie/mcp/
 
 # OS
 .DS_Store
@@ -32,13 +37,64 @@ Thumbs.db
 # Legacy directory (now lives inside .strategy submodule)
 .analysis/
 
-# CLI Dogfooding Artifacts
-specs/
-handoff.md
-session-handoff.md
-.totem/temp/
-.totem/cache/
-.totem/*.log
+# Claude Code worktrees (agent isolation copies)
+.claude/worktrees/
 
-# Developer Journal
+# Pack-vendored WASM grammars (copied from @vscode/tree-sitter-wasm at prepare/build time)
+packages/pack-rust-architecture/tree-sitter-rust.wasm
+
+# Totem runtime artifacts
+.totem/ledger/
+.totem/sync.lock
+# Heartbeat temp (#2564): sync.lock.<pid>.hb can survive a crash between its
+# write and the rename; keep leftovers out of git status in the shared tree
+.totem/sync.lock.*
+.totem/temp/
+# Agent draft scratch (dispatch/verdict drafts staged before ECL delivery); local-only, never tracked
+.totem/drafts/
+.totem/cache/
+# Grounded run artifacts (mmnto-ai/totem#2100) — machine-local run records,
+# content-addressed, carry prompt content; never tracked.
+.totem/artifacts/
+.totem/secrets.json
+.totem/*.log
+.totem/*.jsonl
+.totem/.search-called
+.totem/review-extensions.txt
+.totem/installed-packs.json
+.totem/index-manifest.json
+
+# Local-only orchestration per Proposal 282 (mmnto-ai/totem-strategy#341).
+# Each agent writes journals + handoffs into .totem/orchestration/<agent-id>/.
+# Contents are intentionally NOT tracked — substrate (mmnto-ai/totem-substrate)
+# remains the frozen archive for historical orchestration through cutover.
+.totem/orchestration/
+
+# Local scratchpad (personal scratch files go here, not in root)
+scratchpad/
+design/
 .journal/
+
+# Agent & tool artifacts. `.agents/` stays machine-local EXCEPT the four
+# distributed baseline skills (mmnto-ai/totem#2532 slice 1, operator-ruled
+# scoped negation 2026-08-03): the vendor-neutral `.agents/skills/<name>/`
+# surface is read by gemini/agy/kimi (census-proven) + codex (ruled), so those
+# four dirs are tracked; everything else under .agents/ remains local.
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/signon/
+!.agents/skills/signoff/
+!.agents/skills/review-reply/
+!.agents/skills/review-loop/
+# The four names above hand-mirror DISTRIBUTED_CLAUDE_SKILLS (gitignore cannot
+# derive); a lock test in init.test.ts fails the build if the lists drift.
+# Root-anchored `.agents/*` no longer matches NESTED .agents/ dirs the old
+# `.agents/` pattern caught — re-ignore those at depth >= 1:
+*/**/.agents/
+.continue/
+.code-review/
+skills-lock.json
+.claude/skills/autofix/
+.claude/skills/code-review/
+repomix-output.xml

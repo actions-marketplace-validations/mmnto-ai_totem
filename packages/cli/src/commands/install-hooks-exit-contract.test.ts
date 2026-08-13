@@ -1,0 +1,938 @@
+/**
+ * Exit-code contract for `totem hook install` (`hooksCommand`) + the managed
+ * session-hook bounded drift-repair (mmnto-ai/totem#2410 PR-A, slices 2+3).
+ *
+ * This is the dedicated falsifying test for the contract #2406 stabilized and
+ * strategy#894 froze (Tenet 19). It locks:
+ *   - exit 0 ⟺ {fresh install, already-current, bounded drift-repair (git hook AND
+ *     session hook), declared skips (not-a-git-repo, hook-manager-detected)};
+ *   - exit ≠0 ⟺ genuine failure (a hook write throws → propagates → handleError);
+ *   - `--check` is exactly 0/1 (all-present-with-marker vs missing/markerless);
+ *   - a bare install never mutates a non-bounded file (git hook OR session hook);
+ *     `--force` is the only unbounded write; a legacy markerless-end session hook is
+ *     never bare-repaired; a no-marker user file is never touched even under --force;
+ *   - regenerated artifacts always carry marker + end marker (so they self-repair);
+ *   - the two `overwritten` messages are distinct ("Drift-repaired…" vs
+ *     "Force-overwritten…").
+ *
+ * `hooksCommand` reads `process.cwd()` and gates via `process.exit` on `--check`
+ * failure, so the exit-code cases drive it under `process.chdir` + a `process.exit`
+ * spy (the doctor.test.ts idiom); the session-hook matrix drives the pure
+ * `regenerateManagedSessionHooks(cwd, force)` seam directly.
+ */
+import { execFileSync, execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { cleanTmpDir } from '../test-utils.js';
+import {
+  CLAUDE_PREWRITESHIELD,
+  CLAUDE_SESSION_START,
+  GEMINI_BEFORE_TOOL,
+  GEMINI_BEFORE_TOOL_LEGACY_REL,
+  GEMINI_BEFORE_TOOL_REL,
+  GEMINI_SESSION_START,
+  GEMINI_SESSION_START_LEGACY_REL,
+  GEMINI_SESSION_START_REL,
+  MANAGED_SESSION_HOOKS,
+  TOTEM_FILE_END,
+  TOTEM_FILE_MARKER,
+} from './init-templates.js';
+import {
+  hooksCommand,
+  installHooksCommand,
+  installHooksNonInteractive,
+  migrateGeminiHookRegistration,
+  migrateLegacyGeminiHooks,
+  regenerateManagedSessionHooks,
+  resolveHooksDir,
+  TOTEM_PREPUSH_END,
+  TOTEM_PREPUSH_MARKER,
+} from './install-hooks.js';
+
+// ─── Roster invariant (locked contract, mmnto-ai/totem#2410) ─────────
+
+describe('MANAGED_SESSION_HOOKS roster invariant', () => {
+  it('every entry embeds its own marker AND end marker (so regenerated artifacts self-repair)', () => {
+    expect(MANAGED_SESSION_HOOKS.length).toBeGreaterThan(0);
+    for (const { rel, content, marker, endMarker } of MANAGED_SESSION_HOOKS) {
+      expect(content.includes(marker), `${rel} content is missing its marker`).toBe(true);
+      expect(content.includes(endMarker), `${rel} content is missing its end marker`).toBe(true);
+      // The marker must OPEN the file (only whitespace before it) — the ownership
+      // precondition for bounded drift-repair.
+      expect(content.trimStart().startsWith(marker), `${rel} marker must open the file`).toBe(true);
+      // The end marker must CLOSE the region (nothing but whitespace after it).
+      const endIdx = content.indexOf(endMarker);
+      expect(content.slice(endIdx + endMarker.length).trim()).toBe('');
+    }
+  });
+
+  it('covers the six distributed managed artifacts (incl. the PR-B prepare wrapper)', () => {
+    const rels = MANAGED_SESSION_HOOKS.map((h) => h.rel).sort();
+    expect(rels).toEqual(
+      [
+        '.claude/hooks/PreWriteShield.cjs',
+        '.claude/hooks/SessionStart.cjs',
+        '.claude/hooks/gate-wrapper.cjs',
+        // Both Gemini hooks ship as `.cjs` — load-bearing in `"type": "module"`
+        // consumers (BeforeTool: mmnto-ai/totem#2481; SessionStart: mmnto-ai/totem#2488).
+        '.gemini/hooks/BeforeTool.cjs',
+        '.gemini/hooks/SessionStart.cjs',
+        '.totem/prepare.cjs',
+      ].sort(),
+    );
+  });
+});
+
+// ─── Managed session-hook bounded drift-repair (slice 3) ─────────────
+
+describe('regenerateManagedSessionHooks — bounded drift-repair matrix', () => {
+  let tmpDir: string;
+  const CLAUDE_SS = '.claude/hooks/SessionStart.cjs';
+
+  function writeHook(rel: string, content: string): string {
+    const p = path.join(tmpDir, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf-8');
+    return p;
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2410-sess-'));
+  });
+
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('does NOT create a missing session hook (regenerate-only-if-present)', async () => {
+    const results = await regenerateManagedSessionHooks(tmpDir);
+    expect(results).toEqual([]);
+    expect(fs.existsSync(path.join(tmpDir, ...CLAUDE_SS.split('/')))).toBe(false);
+  });
+
+  it('returns exists for a present, byte-identical session hook (already current)', async () => {
+    writeHook(CLAUDE_SS, CLAUDE_SESSION_START);
+    const results = await regenerateManagedSessionHooks(tmpDir);
+    const r = results.find((x) => x.file === CLAUDE_SS)!;
+    expect(r.action).toBe('exists');
+    expect(fs.readFileSync(path.join(tmpDir, ...CLAUDE_SS.split('/')), 'utf-8')).toBe(
+      CLAUDE_SESSION_START,
+    );
+  });
+
+  it('bare drift-repairs a bounded totem-owned session hook (overwritten, no force)', async () => {
+    const p = writeHook(CLAUDE_SS, `${TOTEM_FILE_MARKER}\nstale body\n${TOTEM_FILE_END}\n`);
+    const results = await regenerateManagedSessionHooks(tmpDir);
+    const r = results.find((x) => x.file === CLAUDE_SS)!;
+    expect(r.action).toBe('overwritten');
+    // Regenerated to canonical — and canonical carries marker + end marker.
+    const written = fs.readFileSync(p, 'utf-8');
+    expect(written).toBe(CLAUDE_SESSION_START);
+    expect(written.includes(TOTEM_FILE_MARKER)).toBe(true);
+    expect(written.includes(TOTEM_FILE_END)).toBe(true);
+  });
+
+  it('does NOT bare-repair a legacy marker-headed session hook missing the end marker', async () => {
+    const legacy = `${TOTEM_FILE_MARKER} — Claude Code SessionStart hook\nstale legacy body\n`;
+    const p = writeHook(CLAUDE_SS, legacy);
+    const results = await regenerateManagedSessionHooks(tmpDir);
+    const r = results.find((x) => x.file === CLAUDE_SS)!;
+    expect(r.action).toBe('declined');
+    // Untouched — takes one `totem hook install --force`.
+    expect(fs.readFileSync(p, 'utf-8')).toBe(legacy);
+  });
+
+  it('--force overwrites a legacy markerless-end session hook (the migration path)', async () => {
+    const legacy = `${TOTEM_FILE_MARKER} — Claude Code SessionStart hook\nstale legacy body\n`;
+    const p = writeHook(CLAUDE_SS, legacy);
+    const results = await regenerateManagedSessionHooks(tmpDir, true);
+    const r = results.find((x) => x.file === CLAUDE_SS)!;
+    expect(r.action).toBe('overwritten');
+    expect(fs.readFileSync(p, 'utf-8')).toBe(CLAUDE_SESSION_START);
+  });
+
+  it('does NOT repair a bounded hook with user content AFTER the end marker (bare declines)', async () => {
+    const withTrailingUser = `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\nconsole.log("mine");\n`;
+    const p = writeHook(CLAUDE_SS, withTrailingUser);
+    const results = await regenerateManagedSessionHooks(tmpDir);
+    expect(results.find((x) => x.file === CLAUDE_SS)!.action).toBe('declined');
+    expect(fs.readFileSync(p, 'utf-8')).toBe(withTrailingUser);
+  });
+
+  it('never touches a user-owned file with NO totem marker, even under --force (skipped)', async () => {
+    const userOwned = '// my own SessionStart hook\nconsole.log("mine");\n';
+    const p = writeHook(CLAUDE_SS, userOwned);
+
+    const bare = await regenerateManagedSessionHooks(tmpDir);
+    expect(bare.find((x) => x.file === CLAUDE_SS)!.action).toBe('skipped');
+    expect(fs.readFileSync(p, 'utf-8')).toBe(userOwned);
+
+    const forced = await regenerateManagedSessionHooks(tmpDir, true);
+    expect(forced.find((x) => x.file === CLAUDE_SS)!.action).toBe('skipped');
+    expect(fs.readFileSync(p, 'utf-8')).toBe(userOwned);
+  });
+
+  it('never touches a user file that merely QUOTES the marker (marker not at start), even under --force', async () => {
+    // A user-owned hook that quotes the marker string in a comment/string is NOT
+    // marker-headed (positional gate, mmnto-ai/totem#2413). The old `includes(marker)`
+    // gate would treat it as owned and let --force clobber it.
+    const quotesMarker = `// my own hook\n// I copied this line: ${TOTEM_FILE_MARKER}\nconsole.log("mine");\n`;
+    const p = writeHook(CLAUDE_SS, quotesMarker);
+
+    const bare = await regenerateManagedSessionHooks(tmpDir);
+    expect(bare.find((x) => x.file === CLAUDE_SS)!.action).toBe('skipped');
+    expect(fs.readFileSync(p, 'utf-8')).toBe(quotesMarker);
+
+    const forced = await regenerateManagedSessionHooks(tmpDir, true);
+    expect(forced.find((x) => x.file === CLAUDE_SS)!.action).toBe('skipped');
+    expect(fs.readFileSync(p, 'utf-8')).toBe(quotesMarker);
+  });
+
+  it('repairs each vendor family independently (claude + gemini)', async () => {
+    writeHook(
+      '.claude/hooks/PreWriteShield.cjs',
+      `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\n`,
+    );
+    writeHook('.gemini/hooks/SessionStart.cjs', GEMINI_SESSION_START); // already current
+    const results = await regenerateManagedSessionHooks(tmpDir);
+
+    expect(results.find((x) => x.file === '.claude/hooks/PreWriteShield.cjs')!.action).toBe(
+      'overwritten',
+    );
+    expect(
+      fs.readFileSync(path.join(tmpDir, '.claude', 'hooks', 'PreWriteShield.cjs'), 'utf-8'),
+    ).toBe(CLAUDE_PREWRITESHIELD);
+    expect(results.find((x) => x.file === '.gemini/hooks/SessionStart.cjs')!.action).toBe('exists');
+  });
+});
+
+// ─── hooksCommand exit-code contract (slice 2) ───────────────────────
+
+describe('hooksCommand exit-code contract', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  const hooksDir = () => path.join(tmpDir, '.git', 'hooks');
+  const errorOutput = (): string =>
+    errorSpy.mock.calls
+      .map((c: unknown[]) => c.map((a: unknown) => String(a)).join(' '))
+      .join('\n');
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2410-cmd-'));
+    execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+    originalCwd = process.cwd();
+    process.chdir(tmpDir);
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // A throwing process.exit surfaces a --check failure as a rejection (the CLI
+    // edge would exit non-zero); the install path must never reach it.
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code ?? 0}`);
+    }) as never);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    vi.restoreAllMocks();
+    cleanTmpDir(tmpDir);
+  });
+
+  // ── exit 0 classes ──────────────────────────────────────────────
+
+  it('exit 0: fresh install (no throw, no process.exit)', async () => {
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(hooksDir(), 'pre-push'))).toBe(true);
+  });
+
+  it('exit 0: already-current (second install is a no-op)', async () => {
+    await hooksCommand({});
+    errorSpy.mockClear();
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(errorOutput()).toContain('already installed');
+  });
+
+  it('exit 0: bare git-hook drift-repair prints "Drift-repaired", not "Force-overwritten"', async () => {
+    await hooksCommand({});
+    // Corrupt pre-push to a stale-but-bounded totem-owned whole file.
+    fs.writeFileSync(
+      path.join(hooksDir(), 'pre-push'),
+      `#!/bin/sh\n# ${TOTEM_PREPUSH_MARKER}\nstale\n# ${TOTEM_PREPUSH_END}\n`,
+    );
+    errorSpy.mockClear();
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    const out = errorOutput();
+    expect(out).toContain('Drift-repaired pre-push hook (totem-owned bounded region).');
+    expect(out).not.toContain('Force-overwritten pre-push');
+  });
+
+  it('exit 0: bare session-hook drift-repair prints "Drift-repaired"', async () => {
+    fs.mkdirSync(path.join(tmpDir, '.claude', 'hooks'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, '.claude', 'hooks', 'SessionStart.cjs'),
+      `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\n`,
+    );
+    errorSpy.mockClear();
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(errorOutput()).toContain(
+      'Drift-repaired .claude/hooks/SessionStart.cjs session hook (totem-owned bounded region).',
+    );
+    expect(
+      fs.readFileSync(path.join(tmpDir, '.claude', 'hooks', 'SessionStart.cjs'), 'utf-8'),
+    ).toBe(CLAUDE_SESSION_START);
+  });
+
+  it('exit 0: declared skip — not a git repository', async () => {
+    const nonGit = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2410-nogit-'));
+    process.chdir(nonGit);
+    try {
+      await expect(hooksCommand({})).resolves.toBeUndefined();
+      expect(exitSpy).not.toHaveBeenCalled();
+      expect(errorOutput()).toContain('Not a git repository');
+    } finally {
+      process.chdir(tmpDir);
+      cleanTmpDir(nonGit);
+    }
+  });
+
+  it('exit 0: declared skip — hook manager detected', async () => {
+    fs.mkdirSync(path.join(tmpDir, '.husky'), { recursive: true });
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  it('file-valued core.hooksPath: declares the git-hook skip, session hooks STILL repaired (exit 0)', async () => {
+    // CR #2422 round 2 falsifier: an unresolvable hooks dir (core.hooksPath at a
+    // non-directory — the hooks-disabled idiom) skips GIT hook installation with
+    // the truthful scoped line, while the managed session hooks — vendor
+    // artifacts independent of git-hook state (PR-A slice 3 / lc#806) — are
+    // still drift-repaired. Continuing past the git-hook skip is the contract,
+    // not a leak.
+    const notADir = path.join(tmpDir, 'hooks-disabled.txt');
+    fs.writeFileSync(notADir, 'not a directory\n');
+    execFileSync('git', ['config', 'core.hooksPath', notADir], { cwd: tmpDir });
+    const ssPath = path.join(tmpDir, '.claude', 'hooks', 'SessionStart.cjs');
+    fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+    fs.writeFileSync(ssPath, `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\n`);
+    errorSpy.mockClear();
+
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(errorOutput()).toContain('skipping git hook installation');
+    // The non-directory target never receives a write.
+    expect(fs.readFileSync(notADir, 'utf-8')).toBe('not a directory\n');
+    // The bounded session hook is still repaired after the git-hook skip.
+    expect(fs.readFileSync(ssPath, 'utf-8')).toBe(CLAUDE_SESSION_START);
+  });
+
+  it('hook-manager repo STILL drift-repairs an existing bounded session hook (lc#806 guard)', async () => {
+    // A git-hook manager (husky) means git hooks are the manager's job — a declared
+    // skip for the git side. But the session hooks are Claude/Gemini artifacts,
+    // independent of the manager, so they must still be regenerated: the fix for the
+    // hook-manager early-return that otherwise recreates the lc#806 stale class.
+    fs.mkdirSync(path.join(tmpDir, '.husky'), { recursive: true });
+    const ssPath = path.join(tmpDir, '.claude', 'hooks', 'SessionStart.cjs');
+    fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+    fs.writeFileSync(ssPath, `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\n`);
+    errorSpy.mockClear();
+
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    // The bounded session hook is drift-repaired even though git hooks were skipped.
+    expect(fs.readFileSync(ssPath, 'utf-8')).toBe(CLAUDE_SESSION_START);
+    expect(errorOutput()).toContain(
+      'Drift-repaired .claude/hooks/SessionStart.cjs session hook (totem-owned bounded region).',
+    );
+  });
+
+  // ── exit ≠0: genuine failure ────────────────────────────────────
+
+  it('exit ≠0: a genuine hook-write failure propagates as a thrown error', async () => {
+    // Make the first-installed hook PATH a directory: the installer's read/write of it
+    // throws EISDIR — a genuine FS failure that must PROPAGATE (fail-loud, Tenet 4),
+    // not be swallowed into a false `installed`. (A directory-at-path fault is
+    // cross-platform, unlike an ESM fs spy — vitest cannot redefine fs namespace exports.)
+    fs.mkdirSync(path.join(hooksDir(), 'pre-commit'), { recursive: true });
+    await expect(hooksCommand({})).rejects.toThrow();
+    expect(exitSpy).not.toHaveBeenCalled();
+  });
+
+  // ── --check: exactly 0/1 ────────────────────────────────────────
+
+  it('--check exit 0: all hooks present with markers', async () => {
+    await hooksCommand({});
+    errorSpy.mockClear();
+    await expect(hooksCommand({ check: true })).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(errorOutput()).toContain('All hooks installed');
+  });
+
+  it('--check exit 1: hooks missing (and the remedy names `totem hook install`)', async () => {
+    await expect(hooksCommand({ check: true })).rejects.toThrow('process.exit:1');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    const out = errorOutput();
+    expect(out).toContain('Some hooks are missing');
+    expect(out).toContain('totem hook install');
+    expect(out).not.toContain('Run `totem hooks`');
+  });
+
+  it('--check exit 1: hook present but missing the Totem marker', async () => {
+    // Install, then strip the marker from one hook (markerless → not counted).
+    await hooksCommand({});
+    fs.writeFileSync(path.join(hooksDir(), 'pre-push'), '#!/bin/sh\necho "no marker"\n');
+    await expect(hooksCommand({ check: true })).rejects.toThrow('process.exit:1');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('--check is read-only: it does NOT mutate a drifted session hook', async () => {
+    // Install git hooks so --check passes on the git side (exit 0), then plant a
+    // drifted-but-bounded session hook. --check is a verify-only path and returns
+    // before session-hook regeneration, so the drifted hook must be left untouched.
+    await hooksCommand({});
+    const ssPath = path.join(tmpDir, '.claude', 'hooks', 'SessionStart.cjs');
+    fs.mkdirSync(path.dirname(ssPath), { recursive: true });
+    const drifted = `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\n`;
+    fs.writeFileSync(ssPath, drifted);
+
+    await expect(hooksCommand({ check: true })).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(fs.readFileSync(ssPath, 'utf-8')).toBe(drifted);
+  });
+
+  // ── the two `overwritten` messages are distinct ─────────────────
+
+  it('bare drift-repair and --force overwrite print DISTINCT messages', async () => {
+    await hooksCommand({});
+    const staleBounded = `#!/bin/sh\n# ${TOTEM_PREPUSH_MARKER}\nstale\n# ${TOTEM_PREPUSH_END}\n`;
+
+    // Bare (no --force) bounded drift-repair.
+    fs.writeFileSync(path.join(hooksDir(), 'pre-push'), staleBounded);
+    errorSpy.mockClear();
+    await hooksCommand({});
+    const bareMsg = errorOutput()
+      .split('\n')
+      .find((l) => l.includes('pre-push hook'))!;
+
+    // --force overwrite of the same stale-bounded file.
+    fs.writeFileSync(path.join(hooksDir(), 'pre-push'), staleBounded);
+    errorSpy.mockClear();
+    await hooksCommand({ force: true });
+    const forceMsg = errorOutput()
+      .split('\n')
+      .find((l) => l.includes('pre-push hook'))!;
+
+    expect(bareMsg).toContain('Drift-repaired');
+    expect(forceMsg).toContain('Force-overwritten');
+    expect(bareMsg).not.toBe(forceMsg);
+  });
+
+  // ── bare install never mutates a non-bounded git hook ───────────
+
+  it('bare install never mutates a user hook with an appended totem block (non-bounded)', async () => {
+    const userThenTotem = `#!/bin/sh\nrun_my_tests\n# ${TOTEM_PREPUSH_MARKER}\nstale\n# ${TOTEM_PREPUSH_END}\n`;
+    fs.mkdirSync(hooksDir(), { recursive: true });
+    fs.writeFileSync(path.join(hooksDir(), 'pre-push'), userThenTotem);
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    // User content preserved — only --force may overwrite an unbounded file.
+    expect(fs.readFileSync(path.join(hooksDir(), 'pre-push'), 'utf-8')).toBe(userThenTotem);
+  });
+});
+
+// ─── sanity: installHooksNonInteractive still classifies a fresh repo ─
+
+describe('installHooksNonInteractive (contract sanity)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2410-ni-'));
+  });
+
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('returns null outside a git repo (declared skip, exit 0 at the command edge)', () => {
+    expect(installHooksNonInteractive(tmpDir)).toBeNull();
+  });
+});
+
+// ─── Worktree + gitdir-pointer resolution (mmnto-ai/totem#2418) ──────
+//
+// In a linked worktree `.git` is a FILE (`gitdir: <path>` pointer), so the
+// pre-fix blind `mkdir '.git/hooks'` crashed ENOTDIR and failed the consumer's
+// whole `pnpm install` through the prepare wrapper. The contract names the
+// worktree/submodule pointer cases: resolvable → install into the SHARED hooks
+// dir (what git actually executes); unparseable → declared skip, exit 0.
+
+describe('hooksCommand in a linked worktree (mmnto-ai/totem#2418)', () => {
+  let mainDir: string;
+  let wtParent: string;
+  let wtDir: string;
+  let originalCwd: string;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  const sharedHooksDir = () => path.join(mainDir, '.git', 'hooks');
+  const errorOutput = (): string =>
+    errorSpy.mock.calls
+      .map((c: unknown[]) => c.map((a: unknown) => String(a)).join(' '))
+      .join('\n');
+
+  beforeEach(() => {
+    mainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2418-main-'));
+    execSync('git init', { cwd: mainDir, stdio: 'ignore' });
+    // `git worktree add` needs a commit to branch from.
+    execSync(
+      'git -c user.name=totem -c user.email=totem@test.invalid commit --allow-empty -m init',
+      { cwd: mainDir, stdio: 'ignore' },
+    );
+    wtParent = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2418-wt-'));
+    wtDir = path.join(wtParent, 'wt');
+    // Arg-array spawn — no shell, so the tmp path is never shell-interpreted.
+    execFileSync('git', ['worktree', 'add', wtDir], { cwd: mainDir, stdio: 'ignore' });
+
+    originalCwd = process.cwd();
+    process.chdir(wtDir);
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code ?? 0}`);
+    }) as never);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    vi.restoreAllMocks();
+    cleanTmpDir(wtParent);
+    cleanTmpDir(mainDir);
+  });
+
+  it('resolveHooksDir follows the gitdir pointer to the SHARED hooks dir', () => {
+    // The worktree's `.git` is a pointer FILE, not a directory.
+    expect(fs.statSync(path.join(wtDir, '.git')).isFile()).toBe(true);
+    const resolved = resolveHooksDir(wtDir);
+    expect(resolved).not.toBeNull();
+    // realpathSync.native both sides: git prints the LONG form while os.tmpdir()
+    // can carry a Windows 8.3 alias (RUNNER~1 on GH runners) or a symlinked
+    // tmpdir (macOS /var → /private/var); only the native variant expands both.
+    expect(fs.realpathSync.native(resolved!)).toBe(fs.realpathSync.native(sharedHooksDir()));
+  });
+
+  it('resolveHooksDir in a plain checkout stays .git/hooks', () => {
+    const resolved = resolveHooksDir(mainDir);
+    expect(resolved).not.toBeNull();
+    expect(fs.realpathSync.native(resolved!)).toBe(fs.realpathSync.native(sharedHooksDir()));
+  });
+
+  it('exit 0: install from the worktree lands in the shared hooks dir (no ENOTDIR)', async () => {
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    for (const hook of ['pre-commit', 'pre-push', 'post-merge', 'post-checkout']) {
+      expect(
+        fs.existsSync(path.join(sharedHooksDir(), hook)),
+        `${hook} missing from the shared hooks dir`,
+      ).toBe(true);
+    }
+    // The pointer file survives untouched — nothing tried to mkdir through it.
+    expect(fs.statSync(path.join(wtDir, '.git')).isFile()).toBe(true);
+  });
+
+  it('--check from the worktree sees the shared hooks (exit 0)', async () => {
+    await hooksCommand({});
+    errorSpy.mockClear();
+    await expect(hooksCommand({ check: true })).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(errorOutput()).toContain('All hooks installed');
+  });
+
+  it('installHooksNonInteractive from the worktree classifies all four hooks', () => {
+    const result = installHooksNonInteractive(wtDir);
+    expect(result).not.toBeNull();
+    expect(result!.preCommit).toBe('installed');
+    expect(result!.prePush).toBe('installed');
+    expect(result!.postMerge).toBe('installed');
+    expect(result!.postCheckout).toBe('installed');
+  });
+});
+
+describe('hooksCommand with an unparseable .git pointer file (declared skip)', () => {
+  let tmpDir: string;
+  let originalCwd: string;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+  let exitSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2418-badptr-'));
+    // A `.git` FILE whose content is not a `gitdir:` pointer — git reports
+    // `fatal: invalid gitfile format` for it.
+    fs.writeFileSync(path.join(tmpDir, '.git'), 'not a gitdir pointer\n');
+    originalCwd = process.cwd();
+    process.chdir(tmpDir);
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit:${code ?? 0}`);
+    }) as never);
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    vi.restoreAllMocks();
+    cleanTmpDir(tmpDir);
+  });
+
+  it('exit 0: install declares the skip instead of crashing prepare', async () => {
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    const out = errorSpy.mock.calls
+      .map((c: unknown[]) => c.map((a: unknown) => String(a)).join(' '))
+      .join('\n');
+    expect(out).toContain('not a directory or a resolvable gitdir pointer');
+  });
+
+  it('resolveHooksDir returns null for the unparseable pointer (never a blind join)', () => {
+    expect(resolveHooksDir(tmpDir)).toBeNull();
+  });
+
+  it('legacy installHooksCommand declares the skip too — exit 0, never handleError (#2422 round)', async () => {
+    // The hidden `totem install-hooks` command routes here; pre-fix its callees
+    // let the resolveGitRoot throw reach handleError → exit 1, violating the
+    // #2410 declared-skip contract on that entry point.
+    await expect(installHooksCommand()).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    const out = errorSpy.mock.calls
+      .map((c: unknown[]) => c.map((a: unknown) => String(a)).join(' '))
+      .join('\n');
+    expect(out).toContain('not a directory or a resolvable gitdir pointer');
+  });
+
+  it('installHooksNonInteractive maps the bad pointer to the declared-skip null (direct API path)', () => {
+    expect(installHooksNonInteractive(tmpDir)).toBeNull();
+  });
+});
+
+describe('resolveHooksDir with core.hooksPath aimed at a non-directory (#2422 round)', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2418-hookspath-'));
+    execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+  });
+
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('returns null instead of a write-target that can never receive hooks', () => {
+    // The /dev/null hooks-disabled idiom, portably: point core.hooksPath at an
+    // existing FILE. `git rev-parse --git-path hooks` returns it verbatim; the
+    // resolver must classify it as the declared skip, not hand it to mkdir.
+    const notADir = path.join(tmpDir, 'hooks-disabled.txt');
+    fs.writeFileSync(notADir, 'not a directory\n');
+    execFileSync('git', ['config', 'core.hooksPath', notADir], { cwd: tmpDir });
+    expect(resolveHooksDir(tmpDir)).toBeNull();
+  });
+});
+
+// ─── Gemini BeforeTool .js→.cjs upgrade migration (mmnto-ai/totem#2481) ───
+
+describe('Gemini BeforeTool .js→.cjs migration', () => {
+  let tmpDir: string;
+
+  function writeFileRel(rel: string, content: string): void {
+    const p = path.join(tmpDir, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf-8');
+  }
+  function readRel(rel: string): string {
+    return fs.readFileSync(path.join(tmpDir, ...rel.split('/')), 'utf-8');
+  }
+  function existsRel(rel: string): boolean {
+    return fs.existsSync(path.join(tmpDir, ...rel.split('/')));
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2481-migrate-'));
+  });
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('converges a pre-migration consumer to exactly one .cjs registration + removes the stale .js', async () => {
+    // Fixture: a consumer that adopted the pre-#2481 hook — the fail-open `.js` file
+    // plus a `.gemini/settings.json` BeforeTool command pointing at it (nested
+    // matcher/hooks shape, alongside unrelated user keys).
+    writeFileRel(GEMINI_BEFORE_TOOL_LEGACY_REL, GEMINI_BEFORE_TOOL);
+    writeFileRel(
+      '.gemini/settings.json',
+      JSON.stringify(
+        {
+          mcpServers: { totem: { command: 'npx' } },
+          hooks: {
+            BeforeTool: [
+              {
+                matcher: '.*',
+                hooks: [
+                  { type: 'command', command: '$GEMINI_PROJECT_DIR/.gemini/hooks/BeforeTool.js' },
+                ],
+              },
+            ],
+          },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+
+    const fileResults = await migrateLegacyGeminiHooks(tmpDir);
+    const registration = migrateGeminiHookRegistration(tmpDir);
+
+    // Stale .js removed; .cjs successor materialized with canonical content.
+    expect(fileResults).toEqual([{ file: GEMINI_BEFORE_TOOL_LEGACY_REL, action: 'migrated' }]);
+    expect(existsRel(GEMINI_BEFORE_TOOL_LEGACY_REL)).toBe(false);
+    expect(existsRel(GEMINI_BEFORE_TOOL_REL)).toBe(true);
+    expect(readRel(GEMINI_BEFORE_TOOL_REL)).toBe(GEMINI_BEFORE_TOOL);
+
+    // Exactly one registration, now pointing at the .cjs — no `.js` ref survives
+    // anywhere in the file; unrelated user keys preserved.
+    expect(registration).toEqual({ changed: true });
+    const rawAfter = readRel('.gemini/settings.json');
+    expect(rawAfter).not.toMatch(/BeforeTool\.js(?!\w)/);
+    const settings = JSON.parse(rawAfter);
+    expect(settings.hooks.BeforeTool[0].hooks[0].command).toBe(
+      '$GEMINI_PROJECT_DIR/.gemini/hooks/BeforeTool.cjs',
+    );
+    expect(settings.mcpServers).toEqual({ totem: { command: 'npx' } });
+  });
+
+  it('is idempotent — a second pass is a no-op (flat command shape too)', async () => {
+    writeFileRel(GEMINI_BEFORE_TOOL_LEGACY_REL, GEMINI_BEFORE_TOOL);
+    // Migration INPUT only — this flat {type, command} entry is a shape Gemini's
+    // processHookDefinition DISCARDS (a registration must nest its commands as
+    // hooks: [{type, command}]; matcher is optional). It exercises the basename
+    // rewrite on whatever the user wrote, not a registration shape Gemini would
+    // run (mmnto-ai/totem#2611).
+    writeFileRel(
+      '.gemini/settings.json',
+      JSON.stringify(
+        {
+          hooks: { BeforeTool: [{ type: 'command', command: 'node .gemini/hooks/BeforeTool.js' }] },
+        },
+        null,
+        2,
+      ) + '\n',
+    );
+
+    await migrateLegacyGeminiHooks(tmpDir);
+    expect(migrateGeminiHookRegistration(tmpDir)).toEqual({ changed: true });
+
+    // Second pass: nothing left to migrate on either seam.
+    expect(await migrateLegacyGeminiHooks(tmpDir)).toEqual([]);
+    expect(migrateGeminiHookRegistration(tmpDir)).toEqual({ changed: false });
+    const settings = JSON.parse(readRel('.gemini/settings.json'));
+    expect(settings.hooks.BeforeTool[0].command).toBe('node .gemini/hooks/BeforeTool.cjs');
+  });
+
+  it('never creates a registration where none exists (arming stays deferred)', () => {
+    expect(migrateGeminiHookRegistration(tmpDir)).toEqual({ changed: false });
+    expect(existsRel('.gemini/settings.json')).toBe(false);
+  });
+
+  it('fail-soft on malformed settings JSON: preserves user content, reports err', () => {
+    const raw = '{ this is not valid json ';
+    writeFileRel('.gemini/settings.json', raw);
+    const res = migrateGeminiHookRegistration(tmpDir);
+    expect(res.changed).toBe(false);
+    expect(res.err).toMatch(/invalid JSON/i);
+    expect(readRel('.gemini/settings.json')).toBe(raw); // untouched
+  });
+
+  it('leaves a user-owned BeforeTool.js (no Totem marker) untouched', async () => {
+    const userJs = '// my own hook\nmodule.exports = () => {};\n';
+    writeFileRel(GEMINI_BEFORE_TOOL_LEGACY_REL, userJs);
+    const results = await migrateLegacyGeminiHooks(tmpDir);
+    expect(results).toEqual([{ file: GEMINI_BEFORE_TOOL_LEGACY_REL, action: 'skipped' }]);
+    expect(readRel(GEMINI_BEFORE_TOOL_LEGACY_REL)).toBe(userJs);
+    expect(existsRel(GEMINI_BEFORE_TOOL_REL)).toBe(false);
+  });
+
+  it('declines a drifted-unbounded legacy .js without --force, migrates it under --force', async () => {
+    // Marker opens the file, but user content trails the end marker → not bounded.
+    writeFileRel(GEMINI_BEFORE_TOOL_LEGACY_REL, `${GEMINI_BEFORE_TOOL}\n// local customization\n`);
+
+    expect(await migrateLegacyGeminiHooks(tmpDir)).toEqual([
+      { file: GEMINI_BEFORE_TOOL_LEGACY_REL, action: 'declined' },
+    ]);
+    expect(existsRel(GEMINI_BEFORE_TOOL_LEGACY_REL)).toBe(true);
+    expect(existsRel(GEMINI_BEFORE_TOOL_REL)).toBe(false);
+
+    expect(await migrateLegacyGeminiHooks(tmpDir, true)).toEqual([
+      { file: GEMINI_BEFORE_TOOL_LEGACY_REL, action: 'migrated' },
+    ]);
+    expect(existsRel(GEMINI_BEFORE_TOOL_LEGACY_REL)).toBe(false);
+    expect(readRel(GEMINI_BEFORE_TOOL_REL)).toBe(GEMINI_BEFORE_TOOL);
+  });
+});
+
+// ─── Gemini SessionStart .js→.cjs upgrade migration (mmnto-ai/totem#2488) ───
+//
+// The BeforeTool sibling above (mmnto-ai/totem#2481) built the machinery; this
+// describe locks the SAME ownership gate for the SessionStart artifact.
+// NO registration analog: `totem init` never emits a `.gemini/settings.json`
+// SessionStart command, and Gemini CLI has no filename-convention discovery (the
+// #2558 posture — the file executes only via host/plain-node paths), so
+// `migrateGeminiHookRegistration` stays BeforeTool-scoped and there is nothing
+// to rewrite here.
+
+describe('Gemini SessionStart .js→.cjs migration', () => {
+  let tmpDir: string;
+
+  function writeFileRel(rel: string, content: string): void {
+    const p = path.join(tmpDir, ...rel.split('/'));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, content, 'utf-8');
+  }
+  function readRel(rel: string): string {
+    return fs.readFileSync(path.join(tmpDir, ...rel.split('/')), 'utf-8');
+  }
+  function existsRel(rel: string): boolean {
+    return fs.existsSync(path.join(tmpDir, ...rel.split('/')));
+  }
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-2488-migrate-'));
+  });
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('migratesLegacySessionStartJsToCjs — materializes the .cjs successor and removes the stale .js', async () => {
+    // Fixture: a consumer that adopted the pre-#2488 briefing hook — the fail-open
+    // `.js` file carrying canonical (marker-headed, end-marker-bounded) content.
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, GEMINI_SESSION_START);
+
+    const results = await migrateLegacyGeminiHooks(tmpDir);
+
+    expect(results).toEqual([{ file: GEMINI_SESSION_START_LEGACY_REL, action: 'migrated' }]);
+    expect(existsRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(false);
+    expect(existsRel(GEMINI_SESSION_START_REL)).toBe(true);
+    expect(readRel(GEMINI_SESSION_START_REL)).toBe(GEMINI_SESSION_START);
+  });
+
+  it('is idempotent — a second pass is a no-op', async () => {
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, GEMINI_SESSION_START);
+    await migrateLegacyGeminiHooks(tmpDir);
+
+    expect(await migrateLegacyGeminiHooks(tmpDir)).toEqual([]);
+    expect(readRel(GEMINI_SESSION_START_REL)).toBe(GEMINI_SESSION_START);
+  });
+
+  it('leaves a user-owned SessionStart.js (no Totem marker) untouched', async () => {
+    const userJs = '// my own session hook\nconsole.log("mine");\n';
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, userJs);
+    const results = await migrateLegacyGeminiHooks(tmpDir);
+    expect(results).toEqual([{ file: GEMINI_SESSION_START_LEGACY_REL, action: 'skipped' }]);
+    expect(readRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(userJs);
+    expect(existsRel(GEMINI_SESSION_START_REL)).toBe(false);
+  });
+
+  it('declines a drifted-unbounded legacy .js without --force, migrates it under --force', async () => {
+    // Marker opens the file, but user content trails the end marker → not bounded.
+    writeFileRel(
+      GEMINI_SESSION_START_LEGACY_REL,
+      `${GEMINI_SESSION_START}\n// local customization\n`,
+    );
+
+    expect(await migrateLegacyGeminiHooks(tmpDir)).toEqual([
+      { file: GEMINI_SESSION_START_LEGACY_REL, action: 'declined' },
+    ]);
+    expect(existsRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(true);
+    expect(existsRel(GEMINI_SESSION_START_REL)).toBe(false);
+
+    expect(await migrateLegacyGeminiHooks(tmpDir, true)).toEqual([
+      { file: GEMINI_SESSION_START_LEGACY_REL, action: 'migrated' },
+    ]);
+    expect(existsRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(false);
+    expect(readRel(GEMINI_SESSION_START_REL)).toBe(GEMINI_SESSION_START);
+  });
+
+  it('never clobbers a user-owned file at the successor path — both files stay, skip disclosed (spec 2488 dual-presence)', async () => {
+    // The consumer adopted totem's briefing hook (bounded legacy `.js`) and then
+    // hand-authored its own `.cjs` at the successor path — exactly the shape of a
+    // user-owned ESM rewrite. The ownership gate must protect the successor even
+    // under `--force`, mirroring regenerateManagedSessionHooks.
+    const userCjs = '// my own ESM-safe briefing\nconsole.log("mine");\n';
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, GEMINI_SESSION_START);
+    writeFileRel(GEMINI_SESSION_START_REL, userCjs);
+
+    for (const force of [undefined, true] as const) {
+      const results = await migrateLegacyGeminiHooks(tmpDir, force);
+      expect(results).toEqual([
+        {
+          file: GEMINI_SESSION_START_LEGACY_REL,
+          action: 'skipped',
+          reason: 'user-owned-successor',
+        },
+      ]);
+      expect(readRel(GEMINI_SESSION_START_REL)).toBe(userCjs);
+      expect(readRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(GEMINI_SESSION_START);
+    }
+  });
+
+  it('repairs a totem-owned successor to canonical while removing the legacy', async () => {
+    // A stale-but-marker-owned `.cjs` at the successor path is totem territory:
+    // the migration's canonical write is an idempotent repair, not a clobber.
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, GEMINI_SESSION_START);
+    writeFileRel(GEMINI_SESSION_START_REL, `${TOTEM_FILE_MARKER}\nstale\n${TOTEM_FILE_END}\n`);
+
+    const results = await migrateLegacyGeminiHooks(tmpDir);
+
+    expect(results).toEqual([{ file: GEMINI_SESSION_START_LEGACY_REL, action: 'migrated' }]);
+    expect(existsRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(false);
+    expect(readRel(GEMINI_SESSION_START_REL)).toBe(GEMINI_SESSION_START);
+  });
+
+  it('declines a marker-headed drifted-unbounded successor without --force, overwrites it under --force', async () => {
+    // Same bar as the legacy arm and as regenerateManagedSessionHooks: a bare run
+    // repairs only bounded totem-owned files; `--force` overwrites any marker-headed
+    // one. Without this arm the successor gate would be strictly MORE destructive
+    // than the function it mirrors (falsification round 2, mmnto-ai/totem#2488).
+    const drifted = `${GEMINI_SESSION_START}\n// my customization past the end marker\n`;
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, GEMINI_SESSION_START);
+    writeFileRel(GEMINI_SESSION_START_REL, drifted);
+
+    expect(await migrateLegacyGeminiHooks(tmpDir)).toEqual([
+      { file: GEMINI_SESSION_START_LEGACY_REL, action: 'declined', reason: 'drifted-successor' },
+    ]);
+    expect(readRel(GEMINI_SESSION_START_REL)).toBe(drifted);
+    expect(readRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(GEMINI_SESSION_START);
+
+    expect(await migrateLegacyGeminiHooks(tmpDir, true)).toEqual([
+      { file: GEMINI_SESSION_START_LEGACY_REL, action: 'migrated' },
+    ]);
+    expect(existsRel(GEMINI_SESSION_START_LEGACY_REL)).toBe(false);
+    expect(readRel(GEMINI_SESSION_START_REL)).toBe(GEMINI_SESSION_START);
+  });
+
+  it('migrates BOTH Gemini artifacts in one pass when a consumer carries both legacy files', async () => {
+    writeFileRel(GEMINI_SESSION_START_LEGACY_REL, GEMINI_SESSION_START);
+    writeFileRel(GEMINI_BEFORE_TOOL_LEGACY_REL, GEMINI_BEFORE_TOOL);
+
+    const results = await migrateLegacyGeminiHooks(tmpDir);
+
+    expect([...results].sort((a, b) => a.file.localeCompare(b.file))).toEqual([
+      { file: GEMINI_BEFORE_TOOL_LEGACY_REL, action: 'migrated' },
+      { file: GEMINI_SESSION_START_LEGACY_REL, action: 'migrated' },
+    ]);
+    expect(existsRel(GEMINI_BEFORE_TOOL_REL)).toBe(true);
+    expect(existsRel(GEMINI_SESSION_START_REL)).toBe(true);
+  });
+});

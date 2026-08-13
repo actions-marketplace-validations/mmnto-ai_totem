@@ -1,104 +1,154 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { stdin as input, stdout as output } from 'node:process';
-import * as readline from 'node:readline/promises';
 
 import { z } from 'zod';
 
 import type { IngestTarget } from '@mmnto/totem';
 
-import { BASELINE_MARKER, UNIVERSAL_LESSONS_MARKDOWN } from '../assets/universal-lessons.js';
-import { bold, brand, dim, log, printBanner, success } from '../ui.js';
-import { IS_WIN } from '../utils.js';
-import { installEnforcementHooks, installPostMergeHook } from './install-hooks.js';
+import {
+  type HookCommandSchema,
+  mergeClaudeHooksKey,
+  type ParsedSettings,
+  preToolUseHasMatcher,
+  type ScaffoldOutcome,
+} from './host-hooks.js';
+import {
+  AI_TOOLS,
+  type AiToolInfo,
+  type Ecosystem,
+  type EmbeddingTier,
+  type HookInstallerResult,
+} from './init-detect.js';
+import {
+  AI_PROMPT_BLOCK,
+  CLAUDE_PRETOOLUSE_ENTRY,
+  CLAUDE_PREWRITESHIELD,
+  CLAUDE_PREWRITESHIELD_ENTRY,
+  CLAUDE_SESSION_START,
+  CLAUDE_SESSION_START_ENTRY,
+  DISTRIBUTED_CLAUDE_SKILLS,
+  GEMINI_BEFORE_TOOL,
+  GEMINI_BEFORE_TOOL_REL,
+  GEMINI_SESSION_START,
+  GEMINI_SESSION_START_REL,
+  GEMINI_SKILL,
+  isBoundedOwnedFile,
+  LEGACY_SENTINEL,
+  markerOpensFile,
+  PREPARE_SCRIPT_COMMAND,
+  PREPARE_SCRIPT_REL,
+  PREPARE_WRAPPER,
+  REFLEX_END,
+  REFLEX_START,
+  REFLEX_VERSION,
+  REFLEX_VERSION_RE,
+  SKILL_MARKER_END,
+  SKILL_MARKER_START,
+  TOTEM_FILE_END,
+  TOTEM_FILE_MARKER,
+} from './init-templates.js';
 
-const AI_PROMPT_BLOCK = `
+// Re-export moved items so existing consumers (including tests) don't break
+export type { AiToolInfo, HookInstallerResult } from './init-detect.js';
+export { buildNpxCommand, detectEmbeddingTier } from './init-detect.js';
+export {
+  AI_PROMPT_BLOCK,
+  generateConfig,
+  generateConfigForFormat,
+  REFLEX_VERSION,
+} from './init-templates.js';
 
-## Totem AI Integration (Auto-Generated)
-You have access to the Totem MCP for long-term project memory. You MUST operate with the following reflexes:
+// ─── Ollama floor probe (mmnto-ai/totem#1851 PR-2) ──────────
+// Init-time companion to the doctor.ts `checkOllama` diagnostic shipped
+// in PR-1 (mmnto-ai/totem#1860). Surfaces the embedder fallback floor
+// before the user picks an embedding tier so cloud-key auto-detection
+// doesn't silently bury Ollama as an option (Tenet 16).
 
-### Memory Reflexes
-1. **Pull Before Planning:** Before writing specs, architecture, or fixing complex bugs, use \`search_knowledge\` to retrieve domain constraints and past traps.
-2. **Proactive Anchoring (The 3 Triggers):** You must autonomously call \`add_lesson\` when any of the following occur — do NOT wait for the user to ask:
-   - **The Trap Trigger:** If you spend >2 turns fixing a bug caused by a framework quirk, unexpected API response, or edge case. (Anchor the symptom + fix).
-   - **The Pivot Trigger:** If the user introduces a new architectural pattern or deprecates an old one. (Anchor the rule).
-   - **The Handoff Trigger:** At the end of a session or when wrapping up a complex feature, extract the non-obvious lessons learned and anchor them.
-3. **Tool Preference (MCP over CLI):** Always prioritize using dedicated MCP tools (e.g., GitHub, Supabase, Vercel) over executing generic shell commands (like \`gh issue view\` or \`curl\`). MCP tools provide structured, un-truncated data optimized for your context window. Only fall back to bash execution if an MCP tool is unavailable or fails.
+export const OLLAMA_FLOOR_DEFAULT_BASE_URL = 'http://localhost:11434';
 
-Lessons are automatically re-indexed in the background after each \`add_lesson\` call — no manual sync needed.
+const OLLAMA_FLOOR_FRAMING = 'no API key, no quota, runs locally';
 
-### Memory Classification
-When deciding where to store information or rules, use this decision tree:
-- If forgetting this causes a mistake on an UNRELATED task (Core Safety): Store in your root agent memory file (e.g., CLAUDE.md or .gemini/gemini.md).
-- If it's a stable, project-wide workflow rule: Store in project config (e.g., CLAUDE.md).
-- If it's a stable syntax/style pattern: Store in the project's styleguide or linter rules.
-- If it's domain knowledge, an edge case, or a past trap: You MUST use the Totem \`add_lesson\` tool to anchor it into the project's LanceDB.
-
-### Workflow Orchestrator Rituals
-[FOR LOCAL CLI/TERMINAL AGENTS ONLY] Do not attempt to run these commands if you are a headless bot or operating in a cloud PR environment (e.g., Gemini Code Assist on GitHub).
-Totem provides CLI commands that map to your development lifecycle. Use them at these moments:
-1. **Start of Session:** Run \`totem briefing\` to get oriented with current branch state, open PRs, and recent context. Run \`totem triage\` if you need to pick a new task.
-2. **Before Implementation:** Run \`totem spec <issue-url-or-topic>\` to generate an architectural plan and review related context before writing code.
-3. **Before PR/Push:** Run \`totem shield\` to analyze uncommitted changes against project knowledge — catches architectural drift and pattern violations.
-4. **End of Session:** Run \`totem handoff\` to generate a snapshot for the next agent session with current progress and open threads.
-
-### Cloud / PR Review Bots
-[FOR CLOUD BOTS ONLY — e.g., Gemini Code Assist, GitHub Copilot PR Review]
-You do NOT have access to the local CLI. Instead, use the Totem MCP tools directly:
-1. **Before reviewing a PR:** Call \`search_knowledge\` with queries about the files and patterns being changed to check for known traps and architectural constraints.
-2. **Before suggesting changes:** Call \`search_knowledge\` to verify your suggestion aligns with established project patterns and past lessons.
-3. **When you spot a recurring issue:** Call \`add_lesson\` to persist the trap so future reviews catch it automatically.
-
-### Context Management Guardrail
-You must be highly defensive of your own context window. If you notice this session becoming long, or if you are asked to read multiple massive files at once, you MUST proactively warn the user about impending context loss. When warning the user, suggest they run \`totem bridge\` to condense their mid-task state so they can safely clear the chat and resume. If you receive a \`<totem_system_warning>\` tag in a tool response, read it silently and synthesize a natural-language warning to the user — do NOT echo the raw XML.
-`;
-
-interface DetectedProject {
-  hasTypeScript: boolean;
-  hasSrc: boolean;
-  hasDocs: boolean;
-  hasSpecs: boolean;
-  hasContext: boolean;
-  hasSessions: boolean;
+export async function probeOllamaFloor(): Promise<{
+  available: boolean;
+  baseUrl: string;
+  message: string;
+}> {
+  const baseUrl = OLLAMA_FLOOR_DEFAULT_BASE_URL;
+  let available = false;
+  try {
+    const { isOllamaAvailable } = await import('@mmnto/totem');
+    available = await isOllamaAvailable(baseUrl);
+  } catch (err) {
+    // Probe is best-effort: import error or any contract regression in
+    // `isOllamaAvailable` is treated as floor-absent so init does not
+    // abort mid-flight (we run between buildTargets and embedding-tier
+    // branching, so a throw here would leave the user in partial state).
+    // Re-throw truly unexpected non-Error throws to surface them to the
+    // top-level handler instead of silently swallowing them.
+    if (!(err instanceof Error)) {
+      throw err;
+    }
+    available = false;
+  }
+  const message = available
+    ? `Ollama floor detected at ${baseUrl} (recommended fallback — ${OLLAMA_FLOOR_FRAMING}).`
+    : `Ollama floor not detected (recommended fallback — ${OLLAMA_FLOOR_FRAMING}). Install: https://ollama.com.`;
+  return { available, baseUrl, message };
 }
-
-type AiTool = 'Claude Code' | 'Gemini CLI' | 'Cursor';
-
-export interface HookInstallerResult {
-  file: string;
-  action: 'created' | 'exists' | 'skipped' | 'merged';
-  err?: string;
-}
-
-interface AiToolInfo {
-  name: AiTool;
-  mcpPath: string;
-  reflexFile: string | null;
-  serverEntry: Record<string, unknown>;
-  hookInstaller?: (cwd: string) => Promise<HookInstallerResult[]>;
-}
-
-export function buildNpxCommand(isWin: boolean): { command: string; args: string[] } {
-  return isWin
-    ? { command: 'cmd', args: ['/c', 'npx', '-y', '@mmnto/mcp'] }
-    : { command: 'npx', args: ['-y', '@mmnto/mcp'] };
-}
-
-const TOTEM_FILE_MARKER = '// [totem] auto-generated';
 
 /**
- * Scaffold a file with idempotency — skips if the marker is already present.
- * Creates parent directories as needed.
+ * Scaffold a file with idempotency — skips any file the totem `marker` does NOT
+ * OPEN (a user-owned file, or one that merely QUOTES the marker in its body — the
+ * positional ownership gate shared with `regenerateManagedSessionHooks`,
+ * mmnto-ai/totem#2413). When the caller threads an `endMarker`, a marker-headed
+ * whole file that is a bounded totem-owned region (marker opens it, end marker
+ * present, nothing after) and whose content has DRIFTED from canonical is repaired
+ * in place (`refreshed`) — the #2406 git-hook bounded drift-repair, generalized to
+ * the session-hook family (mmnto-ai/totem#2410, the lc#806 stale-SessionStart fix).
+ * A marker-headed file that is NOT bounded (legacy template with no end marker, or
+ * user content after the end marker) keeps the pre-#2410 `exists` behavior and emits
+ * a one-line notice. Creates parent directories as needed.
  */
 export function scaffoldFile(
   filePath: string,
   content: string,
   marker: string = TOTEM_FILE_MARKER,
-): { action: 'created' | 'exists' | 'skipped'; err?: string } {
+  endMarker?: string,
+): { action: 'created' | 'exists' | 'skipped' | 'refreshed'; err?: string } {
   try {
     if (fs.existsSync(filePath)) {
       const existing = fs.readFileSync(filePath, 'utf-8');
-      if (existing.includes(marker)) {
+      // Positional ownership gate (mmnto-ai/totem#2413): the marker must OPEN the file.
+      // A file that merely quotes the marker string is user-owned → `skipped`, never
+      // written (harmonized with regenerateManagedSessionHooks; both non-destructive).
+      if (markerOpensFile(existing, marker)) {
+        if (existing === content) {
+          return { action: 'exists' };
+        }
+        // Content drifted. Bounded drift-repair only when the caller threaded an end
+        // marker AND the on-disk file is a bounded totem-owned whole file.
+        if (endMarker !== undefined && isBoundedOwnedFile(existing, marker, endMarker)) {
+          fs.writeFileSync(filePath, content, 'utf-8');
+          return { action: 'refreshed' };
+        }
+        // Marker opens the file but we are not refreshing it. Two distinct causes,
+        // two distinct notices (mmnto-ai/totem#2413 accuracy fix — the old message
+        // asserted "unbounded" even when the caller simply withheld the end marker):
+        if (endMarker === undefined) {
+          // This caller did not request a bounded refresh (e.g. the Gemini skill,
+          // which is marker-block replace territory, not whole-file regeneration).
+          console.error(
+            `[Totem] ${path.basename(filePath)} differs from canonical, but this installer does not manage its whole-file refresh — run \`totem hook install --force\` to regenerate a managed hook.`,
+          );
+        } else {
+          // The caller threaded an end marker but the on-disk region is genuinely
+          // unbounded (legacy no-end-marker file, or user content after the end
+          // marker). The regenerated (post-force) artifact carries the end marker, so
+          // subsequent bare self-repair works.
+          console.error(
+            `[Totem] ${path.basename(filePath)} has drifted but is not a bounded totem-owned region — run \`totem hook install --force\` to regenerate.`,
+          );
+        }
         return { action: 'exists' };
       }
       return { action: 'skipped' };
@@ -117,64 +167,160 @@ export function scaffoldFile(
   }
 }
 
-const { command: npxCmd, args: npxArgs } = buildNpxCommand(IS_WIN);
-
-// --- Gemini CLI hook templates ---
-
-const GEMINI_SESSION_START = `// [totem] auto-generated — Gemini CLI SessionStart hook
-// Runs \`totem briefing\` at the start of every Gemini CLI session.
-const { execSync } = require('child_process');
-
-try {
-  const output = execSync('totem briefing', {
-    encoding: 'utf-8',
-    timeout: 30000,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  process.stderr.write(output);
-} catch (err) {
-  process.stderr.write('[Totem Error] Briefing unavailable: ' + (err instanceof Error ? err.message : String(err)) + '\\n');
-}
-`;
-
-const GEMINI_BEFORE_TOOL = `// [totem] auto-generated — Gemini CLI BeforeTool hook
-// Intercepts git push/commit to run \`totem shield\` before proceeding.
-const { execSync } = require('child_process');
-
-module.exports = function beforeTool(toolName, toolInput) {
-  if (toolName !== 'run_shell_command') return;
-  const cmd = typeof toolInput === 'string' ? toolInput : JSON.stringify(toolInput);
-  if (!/git\\s+(push|commit)/.test(cmd) && !/["']git["'].*["'](push|commit)["']/.test(cmd)) return;
-
-  try {
-    execSync('totem shield', { encoding: 'utf-8', timeout: 60000, stdio: 'inherit' });
-  } catch (err) {
-    throw new Error('[Totem Error] Shield check failed. Fix violations before pushing.\\n' + err.message);
+/**
+ * Wire a consumer `package.json`'s `prepare` script to the init-distributed prepare
+ * wrapper (mmnto-ai/totem#2410 PR-B). User-owned content is never overwritten (Prop 289):
+ *
+ *   - No `prepare` script            → set `"prepare": "node .totem/prepare.cjs"` (`wired`).
+ *   - `prepare` already exactly that → `exists` (no write; the file is left byte-identical).
+ *   - A DIFFERENT existing `prepare` (or a non-string value) → `declined` (NO write, byte-
+ *     identical): the caller prints the canonical line to add manually.
+ *   - No `package.json`              → `missing` (nothing to wire).
+ *   - Unreadable / invalid JSON / a non-object root / a present-but-non-object
+ *     `scripts` → `unparseable` (surfaced, never a crash; a non-object `scripts` is
+ *     user content we must NOT silently replace — the decline posture, not a clobber).
+ *   - A write that throws (perms/FS) → `write-failed` (distinct from a parse/shape
+ *     problem, so the caller can tell "couldn't read your file" from "couldn't save it").
+ *
+ * On the `wired` path the file is rewritten with 2-space JSON + a trailing newline
+ * (mirrors `scaffoldMcpConfig`, the repo's package.json-edit precedent); existing keys
+ * keep their order and `prepare` is appended within `scripts` (stable key order).
+ */
+export function wirePreparePackageJson(pkgPath: string): {
+  action: 'wired' | 'exists' | 'declined' | 'missing' | 'unparseable' | 'write-failed';
+  /** The different existing `prepare` value, for the decline notice (present only when a string). */
+  existing?: string;
+  err?: string;
+} {
+  if (!fs.existsSync(pkgPath)) {
+    return { action: 'missing' };
   }
-};
-`;
 
-const GEMINI_SKILL = `<!-- [totem] auto-generated — Totem Architect skill -->
-# Totem Architect
+  let raw: string;
+  try {
+    raw = fs.readFileSync(pkgPath, 'utf-8');
+    // totem-context: intentional cleanup — surface a read failure as a returned result (the `err` field the caller logs), never a silent swallow; the established scaffoldMcpConfig IO posture.
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { action: 'unparseable', err: `Could not read ${path.basename(pkgPath)}: ${message}` };
+  }
 
-Before designing, planning, or implementing features, query the project's memory index for relevant context:
+  let parsedRoot: unknown;
+  try {
+    parsedRoot = JSON.parse(raw);
+    // totem-context: intentional cleanup — surface invalid package.json as a returned result (`err`), the established scaffoldMcpConfig parse posture; init logs it and declines rather than crashing.
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      action: 'unparseable',
+      err: `Could not parse ${path.basename(pkgPath)} (invalid JSON): ${message}`,
+    };
+  }
 
-1. Use the \`search_knowledge\` MCP tool with a query describing what you're about to build.
-2. Review returned lessons, specs, and code patterns before writing any code.
-3. If you discover a trap or architectural constraint, factor it into your design.
+  // The root must be a plain object. `JSON.parse` also yields `null`, arrays, and
+  // scalars (`null`/`5`/`"x"`/`[]`) — dereferencing `.scripts` on those either throws
+  // (null) or reads garbage, and we must never write a wrapper into a non-object root.
+  if (parsedRoot === null || typeof parsedRoot !== 'object' || Array.isArray(parsedRoot)) {
+    return {
+      action: 'unparseable',
+      err: `${path.basename(pkgPath)} is not a JSON object — cannot wire a prepare script.`,
+    };
+  }
+  const parsed = parsedRoot as Record<string, unknown>;
 
-This ensures you build on existing knowledge rather than repeating past mistakes.
-`;
+  const scriptsRaw = parsed.scripts;
+  // A PRESENT `scripts` that is not a plain object (a string, array, number, null) is
+  // user content — replacing it would clobber it, violating the decline posture. Surface
+  // it as unparseable rather than silently overwriting (mmnto-ai/totem#2416 F1).
+  if (
+    scriptsRaw !== undefined &&
+    (scriptsRaw === null || typeof scriptsRaw !== 'object' || Array.isArray(scriptsRaw))
+  ) {
+    return {
+      action: 'unparseable',
+      err: `${path.basename(pkgPath)} "scripts" is not an object — leaving it unchanged.`,
+    };
+  }
+  const scripts = scriptsRaw as Record<string, unknown> | undefined;
+  const existingPrepare = scripts ? scripts.prepare : undefined;
 
-async function installGeminiHooks(cwd: string): Promise<HookInstallerResult[]> {
+  if (existingPrepare !== undefined) {
+    if (typeof existingPrepare === 'string' && existingPrepare.trim() === PREPARE_SCRIPT_COMMAND) {
+      return { action: 'exists' };
+    }
+    // A different `prepare` (or a non-string value) is user-owned — never overwrite it.
+    return {
+      action: 'declined',
+      ...(typeof existingPrepare === 'string' ? { existing: existingPrepare } : {}),
+    };
+  }
+
+  // No `prepare` script — set it, appending `prepare` at the end of `scripts` (or
+  // creating `scripts` at the end of the object) so existing key order is preserved.
+  parsed.scripts = { ...(scripts ?? {}), prepare: PREPARE_SCRIPT_COMMAND };
+  try {
+    fs.writeFileSync(pkgPath, JSON.stringify(parsed, null, 2) + '\n', 'utf-8');
+    // totem-context: intentional cleanup — surface a write failure as a returned result (`err`) for the caller to log, never a silent swallow; the established scaffoldMcpConfig IO posture.
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { action: 'write-failed', err: `Could not write ${path.basename(pkgPath)}: ${message}` };
+  }
+  return { action: 'wired' };
+}
+
+// --- Gemini CLI hook installer ---
+
+/**
+ * Whether a consumer owns a custom `<stem>.js` sibling of a managed `<stem>.cjs` vendor
+ * hook (mmnto-ai/totem#2601 — the strategy#482 incident: the generic template dropped
+ * beside a repo's own SessionStart.js, double-firing or regressing orientation depending
+ * on Gemini's hook discovery). Ownership is the same positional gate `scaffoldFile` and
+ * `migrateLegacyGeminiHooks` use, so a marker-headed sibling — the legacy `.js`→`.cjs`
+ * migration case — never reports here; only an UNOWNED sibling does. A sibling that
+ * cannot be read is not provably totem-owned and reports (non-destructive posture,
+ * never a crash). Returns the sibling's basename when one is present.
+ *
+ * This is a PREDICATE, not the policy: whether a report withholds the scaffold or only
+ * discloses a coexistence depends on whether the managed `.cjs` already exists — see
+ * `installGeminiHooks`, the sole caller.
+ */
+export function findUnownedHookSibling(cjsPath: string): string | undefined {
+  if (!cjsPath.endsWith('.cjs')) return undefined;
+  const siblingPath = `${cjsPath.slice(0, -'.cjs'.length)}.js`;
+  if (!fs.existsSync(siblingPath)) return undefined;
+  // totem-context: intentional cleanup — an unreadable sibling cannot be proven totem-owned, so it withholds the scaffold (non-destructive) rather than aborting init.
+  try {
+    const existing = fs.readFileSync(siblingPath, 'utf-8');
+    if (markerOpensFile(existing, TOTEM_FILE_MARKER)) return undefined;
+    // totem-context: intentional cleanup — see directive above the try; dual placement so the rule fires on either the catch-keyword line or the catch-body line.
+  } catch {
+    // fall through to withhold
+  }
+  return path.basename(siblingPath);
+}
+
+export async function installGeminiHooks(cwd: string): Promise<HookInstallerResult[]> {
   const results: HookInstallerResult[] = [];
-  const files: Array<{ rel: string; content: string; marker: string }> = [
+  // The two whole-file hooks carry the managed end marker (mmnto-ai/totem#2410) so a
+  // drifted-but-bounded artifact self-repairs on re-init; the skill is marker-block
+  // replace territory (no end marker threaded here).
+  const files: Array<{ rel: string; content: string; marker: string; endMarker?: string }> = [
     {
-      rel: '.gemini/hooks/SessionStart.js',
+      // Ships as `.cjs` — load-bearing in `"type": "module"` consumers
+      // (mmnto-ai/totem#2488); see GEMINI_SESSION_START_REL.
+      rel: GEMINI_SESSION_START_REL,
       content: GEMINI_SESSION_START,
       marker: TOTEM_FILE_MARKER,
+      endMarker: TOTEM_FILE_END,
     },
-    { rel: '.gemini/hooks/BeforeTool.js', content: GEMINI_BEFORE_TOOL, marker: TOTEM_FILE_MARKER },
+    {
+      // Ships as `.cjs` — load-bearing in `"type": "module"` consumers
+      // (mmnto-ai/totem#2481); see GEMINI_BEFORE_TOOL_REL.
+      rel: GEMINI_BEFORE_TOOL_REL,
+      content: GEMINI_BEFORE_TOOL,
+      marker: TOTEM_FILE_MARKER,
+      endMarker: TOTEM_FILE_END,
+    },
     {
       rel: '.gemini/skills/totem.md',
       content: GEMINI_SKILL,
@@ -182,10 +328,94 @@ async function installGeminiHooks(cwd: string): Promise<HookInstallerResult[]> {
     },
   ];
 
-  for (const { rel, content, marker } of files) {
+  for (const { rel, content, marker, endMarker } of files) {
     const filePath = path.join(cwd, rel);
-    const result = scaffoldFile(filePath, content, marker);
-    results.push({ file: rel, ...result });
+    // Vendor-hook managed-marker guard (mmnto-ai/totem#2601): a custom same-stem `.js`
+    // the consumer owns withholds the managed `.cjs` — the drop is disclosed, never
+    // silent, because a withheld hook otherwise reads as an installed one.
+    //
+    // The withhold is scoped to the FRESH path (no `.cjs` on disk yet), where it is what
+    // prevents the twin from being introduced. Once the `.cjs` EXISTS the twin is already
+    // live: withholding there would suppress drift-repair of a file that fires anyway and
+    // would report "not installed" about an installed hook. That case scaffolds normally
+    // and discloses the coexistence plus the two ways out.
+    const unownedSibling = findUnownedHookSibling(filePath);
+    if (unownedSibling !== undefined && !fs.existsSync(filePath)) {
+      results.push({
+        file: rel,
+        action: 'skipped',
+        summaryActionOverride: `Skipped — custom ${unownedSibling} present — totem hook not installed; remove or rename it to adopt the managed hook`,
+      });
+      continue;
+    }
+    const result = scaffoldFile(filePath, content, marker, endMarker);
+    // Map the scaffold action onto HookInstallerResult: a bounded drift-repair
+    // (`refreshed`) surfaces as `merged` (file mutated) for installer summary parity
+    // with scaffoldClaudeSkill's mapping.
+    const action = result.action === 'refreshed' ? 'merged' : result.action;
+    // The coexistence line is true only when the `.cjs` really is totem's — `exists`
+    // (canonical) or `merged` (drift-repaired). A USER-owned `.cjs` (no marker) takes
+    // scaffoldFile's preserve path: totem installed nothing, so claiming a "managed
+    // .cjs" and steering the user to delete their own file would be false both ways
+    // (scoped leg round 2, D3) — that state gets the truthful not-installed line.
+    const coexistenceOverride =
+      unownedSibling === undefined
+        ? undefined
+        : action === 'exists' || action === 'merged'
+          ? `Custom ${unownedSibling} coexists with the managed ${path.basename(filePath)} — both may fire; remove one (delete the managed .cjs to keep yours, or your .js to keep totem's)`
+          : `Custom ${unownedSibling} and ${path.basename(filePath)} are both present and neither is totem's — totem hook not installed`;
+    results.push({
+      file: rel,
+      action,
+      ...(coexistenceOverride !== undefined ? { summaryActionOverride: coexistenceOverride } : {}),
+      ...(result.err ? { err: result.err } : {}),
+    });
+  }
+
+  // Legacy `.js`→`.cjs` migration (mmnto-ai/totem#2481 BeforeTool, #2488 SessionStart).
+  // Runs on init too, not only the `totem hook install` upgrade path: a consumer
+  // re-running init after upgrading Totem carries the fail-open
+  // `.gemini/hooks/BeforeTool.js` / `.gemini/hooks/SessionStart.js` (and, for
+  // BeforeTool only, possibly a `.gemini/settings.json` command pointing at it).
+  // Dynamic-imported to keep the migration co-located with the upgrade-path
+  // drift-repair machinery.
+  const { migrateGeminiHookRegistration, migrateLegacyGeminiHooks } =
+    await import('./install-hooks.js');
+  for (const { file, action, reason } of await migrateLegacyGeminiHooks(cwd)) {
+    if (action === 'migrated') {
+      results.push({
+        file,
+        action: 'merged',
+        // Named from the migrated artifact, not hardcoded — the legacy roster now
+        // carries more than one pair.
+        summaryActionOverride: `Migrated legacy Gemini ${path.basename(file)} → .cjs`,
+      });
+    } else if (action === 'skipped' && reason === 'unreadable-legacy') {
+      // Unreadable outcomes are the non-migrated ones init discloses: the path
+      // exists and could not be read at all, so the user is the only one who can
+      // resolve it — and "user-owned" must never render for them (#2601).
+      results.push({
+        file,
+        action: 'skipped',
+        summaryActionOverride: `Skipped — legacy ${path.basename(file)} could not be read; left in place (remove or rename it to complete the .cjs migration)`,
+      });
+    } else if (action === 'skipped' && reason === 'unreadable-successor') {
+      results.push({
+        file,
+        action: 'skipped',
+        summaryActionOverride: `Skipped — the .cjs successor of ${path.basename(file)} could not be read; left both files untouched (remove or rename the successor to complete the migration)`,
+      });
+    }
+  }
+  const registration = migrateGeminiHookRegistration(cwd);
+  if (registration.err) {
+    results.push({ file: '.gemini/settings.json', action: 'merged', err: registration.err });
+  } else if (registration.changed) {
+    results.push({
+      file: '.gemini/settings.json',
+      action: 'merged',
+      summaryActionOverride: 'Migrated Gemini BeforeTool registration → .cjs',
+    });
   }
 
   return results;
@@ -193,191 +423,452 @@ async function installGeminiHooks(cwd: string): Promise<HookInstallerResult[]> {
 
 // --- Claude Code hook installer ---
 
-const CLAUDE_SHIELD_GATE = `// [totem] auto-generated — Claude Code shield gate hook
-// Intercepts git push/commit to run \`totem shield\` before proceeding.
-const { execSync } = require('child_process');
+// The settings-merge primitive (ClaudeSettingsSchema, HookCommandSchema,
+// mergeClaudeHooksKey, preToolUseHasMatcher, and the ScaffoldOutcome /
+// ParsedSettings / ClaudeHooksKey types) lives in host-hooks.js — the
+// namespace-neutral install primitive shared by gate-install, init, and
+// later Prop 257 (PR-C, mmnto-ai/totem#2048). The Totem-specific
+// idempotency probes (hasTotemShield, etc.) and the per-lifecycle scaffold
+// wrappers stay here.
 
-const input = process.env.TOOL_INPUT || '';
-if (/git/.test(input) && /(push|commit)/.test(input)) {
-  try {
-    execSync('totem shield', { encoding: 'utf-8', timeout: 60000, stdio: 'inherit' });
-  } catch (err) {
-    process.exit(1);
-  }
-}
-`;
-
-const CLAUDE_PRETOOLUSE_ENTRY = {
-  matcher: 'Bash',
-  hooks: [
-    {
-      type: 'command',
-      command: 'node .totem/hooks/shield-gate.cjs',
-    },
-  ],
-};
-
-// Zod schema for the subset of settings.local.json that we need to validate.
-// Uses .passthrough() to preserve unknown keys during round-trip read/write.
-const HookCommandSchema = z.union([
-  z.string(),
-  z.object({ type: z.string(), command: z.string() }).passthrough(),
-]);
-
-const ClaudeSettingsSchema = z
-  .object({
-    hooks: z
-      .object({
-        PreToolUse: z
-          .array(
-            z
-              .object({
-                matcher: z.string().optional(),
-                hooks: z.array(HookCommandSchema).optional(),
-              })
-              .passthrough(),
-          )
-          .optional(),
-      })
-      .passthrough()
-      .optional(),
-  })
-  .passthrough();
-
-/** Check whether a hook entry already contains a totem shield reference. */
+/** Check whether a hook entry already contains a totem review/shield reference. */
 function hasTotemShield(entry: z.infer<typeof HookCommandSchema>): boolean {
-  if (typeof entry === 'string') return entry.includes('totem shield');
-  return entry.command.includes('totem shield') || entry.command.includes('shield-gate');
+  if (typeof entry === 'string')
+    return entry.includes('totem review') || entry.includes('totem shield');
+  return (
+    entry.command.includes('totem review') ||
+    entry.command.includes('totem shield') ||
+    entry.command.includes('shield-gate')
+  );
+}
+
+/** Check whether a hook entry already contains a PreWriteShield reference. */
+function hasPreWriteShield(entry: z.infer<typeof HookCommandSchema>): boolean {
+  if (typeof entry === 'string') return entry.includes('PreWriteShield');
+  return entry.command.includes('PreWriteShield');
+}
+
+/** Check whether a hook entry already contains a SessionStart.cjs reference. */
+function hasTotemSessionStart(entry: z.infer<typeof HookCommandSchema>): boolean {
+  if (typeof entry === 'string') return entry.includes('SessionStart.cjs');
+  return entry.command.includes('SessionStart.cjs');
+}
+
+function sessionStartHas(
+  parsed: ParsedSettings,
+  probe: (entry: z.infer<typeof HookCommandSchema>) => boolean,
+): boolean {
+  const sessionStart = parsed.hooks?.SessionStart ?? [];
+  return sessionStart.some((h) => Array.isArray(h.hooks) && h.hooks.some(probe));
 }
 
 /**
  * Merge Totem hooks into .claude/settings.local.json without overwriting
- * existing user-defined hooks.
+ * existing user-defined hooks. Installs the Bash matcher for shield-gate.
  */
-export function scaffoldClaudeHooks(filePath: string): {
-  action: 'created' | 'merged' | 'skipped';
-  err?: string;
-} {
-  try {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    const fullConfig = { hooks: { PreToolUse: [CLAUDE_PRETOOLUSE_ENTRY] } };
-
-    if (!fs.existsSync(filePath)) {
-      fs.writeFileSync(filePath, JSON.stringify(fullConfig, null, 2) + '\n', 'utf-8');
-      return { action: 'created' };
-    }
-
-    const raw = fs.readFileSync(filePath, 'utf-8');
-    let rawParsed: unknown;
-    try {
-      rawParsed = JSON.parse(raw);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      return {
-        action: 'skipped',
-        err: `[Totem Error] Could not parse settings.local.json (invalid JSON): ${message}`,
-      };
-    }
-
-    const result = ClaudeSettingsSchema.safeParse(rawParsed);
-    if (!result.success) {
-      const detail = result.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ');
-      return {
-        action: 'skipped',
-        err: `[Totem Error] Could not merge config: settings.local.json has unexpected shape: ${detail}`,
-      };
-    }
-
-    const parsed = result.data;
-    const preToolUse = parsed.hooks?.PreToolUse ?? [];
-
-    if (
-      preToolUse.some(
-        (h) => h.matcher === 'Bash' && Array.isArray(h.hooks) && h.hooks.some(hasTotemShield),
-      )
-    ) {
-      return { action: 'skipped' };
-    }
-
-    const hooks = parsed.hooks ?? {};
-    hooks.PreToolUse = [...preToolUse, CLAUDE_PRETOOLUSE_ENTRY];
-    parsed.hooks = hooks;
-    fs.writeFileSync(filePath, JSON.stringify(parsed, null, 2) + '\n', 'utf-8');
-    return { action: 'merged' };
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    return { action: 'skipped', err: `[Totem Error] ${message}` };
-  }
+export function scaffoldClaudeHooks(filePath: string): ScaffoldOutcome {
+  return mergeClaudeHooksKey(filePath, 'PreToolUse', CLAUDE_PRETOOLUSE_ENTRY, (parsed) =>
+    preToolUseHasMatcher(parsed, 'Bash', hasTotemShield),
+  );
 }
 
-async function installClaudeHooks(cwd: string): Promise<HookInstallerResult[]> {
-  const results: HookInstallerResult[] = [];
-
-  // Scaffold the shield-gate script
-  const scriptRel = '.totem/hooks/shield-gate.cjs';
-  const scriptResult = scaffoldFile(
-    path.join(cwd, scriptRel),
-    CLAUDE_SHIELD_GATE,
-    TOTEM_FILE_MARKER,
+/**
+ * Merge the PreWriteShield hook into .claude/settings.json (committed,
+ * team-level) without overwriting existing user-defined hooks. Installs
+ * the Write|Edit matcher for write-time xrepo-qualify-refs enforcement.
+ *
+ * Distinct from scaffoldClaudeHooks: that targets settings.local.json
+ * (per-developer environment safety); this targets settings.json
+ * (team-level governance, sealed at mmnto-ai/totem-strategy#145).
+ */
+export function scaffoldClaudeWriteShield(filePath: string): ScaffoldOutcome {
+  return mergeClaudeHooksKey(filePath, 'PreToolUse', CLAUDE_PREWRITESHIELD_ENTRY, (parsed) =>
+    preToolUseHasMatcher(parsed, 'Write|Edit', hasPreWriteShield),
   );
-  results.push({ file: scriptRel, ...scriptResult });
+}
 
-  // Scaffold the settings.local.json hook entry
-  const settingsRel = '.claude/settings.local.json';
-  const settingsResult = scaffoldClaudeHooks(path.join(cwd, settingsRel));
-  results.push({ file: settingsRel, ...settingsResult });
+/**
+ * Merge the Claude SessionStart hook entry into .claude/settings.json
+ * (committed, team-level) without overwriting existing user-defined
+ * hooks. Symmetric with the Gemini-side .gemini/hooks/SessionStart.cjs
+ * install (mmnto-ai/totem#1845 slice 1) — orientation IS a team-level
+ * guarantee, so it shares the committed settings.json placement with
+ * Phase B's PreWriteShield.
+ */
+export function scaffoldClaudeSessionStart(filePath: string): ScaffoldOutcome {
+  return mergeClaudeHooksKey(filePath, 'SessionStart', CLAUDE_SESSION_START_ENTRY, (parsed) =>
+    sessionStartHas(parsed, hasTotemSessionStart),
+  );
+}
+
+async function installClaudeHooks(
+  cwd: string,
+  opts?: { forceSkillRefresh?: boolean },
+): Promise<HookInstallerResult[]> {
+  // Bash gate architecture removed (Proposal 207). Write-time enforcement
+  // re-introduced via PreWriteShield hook (mmnto-ai/totem#1846): blocks
+  // bare cross-repo refs in substrate-participating paths before disk write.
+  // Sealed at mmnto-ai/totem-strategy#145. SessionStart hook added in
+  // mmnto-ai/totem#1845 slice 1 for parity with Gemini-side install.
+  const results: HookInstallerResult[] = [];
+  const settingsPath = path.join(cwd, '.claude', 'settings.json');
+
+  // 1. Scaffold the PreWriteShield hook script (committed to .claude/hooks/).
+  //    Threads the managed end marker (mmnto-ai/totem#2410) so a drifted-but-bounded
+  //    artifact self-repairs on re-init; `refreshed` maps to `merged` (file mutated).
+  const preWritePath = path.join(cwd, '.claude', 'hooks', 'PreWriteShield.cjs');
+  const preWriteResult = scaffoldFile(
+    preWritePath,
+    CLAUDE_PREWRITESHIELD,
+    TOTEM_FILE_MARKER,
+    TOTEM_FILE_END,
+  );
+  results.push({
+    file: '.claude/hooks/PreWriteShield.cjs',
+    action: preWriteResult.action === 'refreshed' ? 'merged' : preWriteResult.action,
+    ...(preWriteResult.err ? { err: preWriteResult.err } : {}),
+  });
+
+  // 2. Scaffold the SessionStart hook script (committed to .claude/hooks/).
+  //    Symmetric with .gemini/hooks/SessionStart.cjs — Tenet 16 parity.
+  const sessionStartPath = path.join(cwd, '.claude', 'hooks', 'SessionStart.cjs');
+  const sessionStartResult = scaffoldFile(
+    sessionStartPath,
+    CLAUDE_SESSION_START,
+    TOTEM_FILE_MARKER,
+    TOTEM_FILE_END,
+  );
+  results.push({
+    file: '.claude/hooks/SessionStart.cjs',
+    action: sessionStartResult.action === 'refreshed' ? 'merged' : sessionStartResult.action,
+    ...(sessionStartResult.err ? { err: sessionStartResult.err } : {}),
+  });
+
+  // 3. Merge the PreWriteShield PreToolUse entry into committed
+  //    .claude/settings.json (distinct from settings.local.json which
+  //    holds the per-developer shield-gate from before Proposal 207).
+  const writeShieldEntryResult = scaffoldClaudeWriteShield(settingsPath);
+  results.push({
+    file: '.claude/settings.json',
+    ...writeShieldEntryResult,
+  });
+
+  // 4. Merge the SessionStart entry into committed .claude/settings.json.
+  //    Same file as step 3; the merge helper appends idempotently under
+  //    `hooks.SessionStart` without disturbing `hooks.PreToolUse`.
+  const sessionStartEntryResult = scaffoldClaudeSessionStart(settingsPath);
+  results.push({
+    file: '.claude/settings.json (SessionStart)',
+    ...sessionStartEntryResult,
+  });
+
+  // 5. Distribute session-utility skills (mmnto-ai/totem#1890 Phase C
+  //    slice 3). Marker-based replace: fresh repos get the canonical
+  //    content; refreshes replace the inside-marker section while
+  //    preserving user customizations below the end marker.
+  //
+  //    scaffoldClaudeSkill's native action union ('created' | 'refreshed' |
+  //    'unchanged' | 'preserved') is mapped onto the existing
+  //    HookInstallerResult union for installer summary compatibility:
+  //    refreshed → 'merged' (file mutated), unchanged → 'exists' (no-op),
+  //    preserved → 'skipped' (user content protected).
+  for (const skill of DISTRIBUTED_CLAUDE_SKILLS) {
+    const skillPath = path.join(cwd, '.claude', 'skills', skill.name, 'SKILL.md');
+    const skillRelative = `.claude/skills/${skill.name}/SKILL.md`;
+    const skillResult = scaffoldClaudeSkill(skillPath, skill.content, {
+      force: opts?.forceSkillRefresh === true,
+    });
+
+    // Per W3.5 (mmnto-ai/totem#2008): the per-file warn fires ONLY on the
+    // no-marker suppression path. Marker-bearing refreshes (which ride the
+    // normal `refreshed`/`unchanged` path) emit no warning — keeps the
+    // signal-to-noise discipline tight (locked by invariant 8 in the spec).
+    if (skillResult.forceSuppressed === true) {
+      const { log } = await import('../ui.js');
+      log.warn(
+        'Totem',
+        `Force-overwriting ${skillRelative}: no canonical markers found, user content overwritten`,
+      );
+    }
+
+    const mappedAction: HookInstallerResult['action'] =
+      skillResult.action === 'created'
+        ? 'created'
+        : skillResult.action === 'refreshed'
+          ? 'merged'
+          : skillResult.action === 'unchanged'
+            ? 'exists'
+            : 'skipped';
+    results.push({
+      file: skillRelative,
+      action: mappedAction,
+      ...(skillResult.forceSuppressed === true
+        ? {
+            summaryActionOverride:
+              'Force-overwritten: no canonical markers found, user content overwritten',
+          }
+        : {}),
+      ...(skillResult.err ? { err: skillResult.err } : {}),
+    });
+  }
 
   return results;
 }
 
-const AI_TOOLS: AiToolInfo[] = [
-  {
-    name: 'Claude Code',
-    mcpPath: '.mcp.json',
-    reflexFile: 'CLAUDE.md',
-    serverEntry: { type: 'stdio', command: npxCmd, args: npxArgs },
-    hookInstaller: installClaudeHooks,
-  },
-  {
-    name: 'Gemini CLI',
-    mcpPath: '.gemini/settings.json',
-    reflexFile: '.gemini/gemini.md',
-    serverEntry: { command: npxCmd, args: npxArgs },
-    hookInstaller: installGeminiHooks,
-  },
-  {
-    name: 'Cursor',
-    mcpPath: '.cursor/mcp.json',
-    reflexFile: '.cursorrules',
-    serverEntry: { type: 'stdio', command: npxCmd, args: npxArgs },
-  },
-];
+/**
+ * Install or refresh a Claude Code skill file at the target path using
+ * marker-based replacement. The canonical content lives between
+ * `SKILL_MARKER_START` and `SKILL_MARKER_END`; content AFTER the end marker
+ * is user-customization territory and survives across refreshes (Phase C
+ * slice 3 design doc, mmnto-ai/totem#1890).
+ *
+ * Outcomes:
+ * - `created` — file didn't exist; wrote canonical
+ * - `refreshed` — file existed with markers; replaced inside-marker content,
+ *   preserved everything after the end marker
+ * - `unchanged` — file existed with markers and the merged content was
+ *   byte-identical to the existing content
+ * - `preserved` — file exists without the end marker (user-authored,
+ *   pre-marker scaffold, or malformed); skipped to preserve user content.
+ *   Surfaces a warning hint via `err` so callers can log a migration nudge.
+ */
+export function scaffoldClaudeSkill(
+  filePath: string,
+  canonicalContent: string,
+  options?: { force?: boolean },
+): {
+  action: 'created' | 'refreshed' | 'unchanged' | 'preserved';
+  /** True only when the no-marker guard was suppressed by `options.force`.
+   *  Lets callers emit the destructive-by-consent warning + summary line
+   *  surface (W3.5, mmnto-ai/totem#2008). */
+  forceSuppressed?: boolean;
+  err?: string;
+} {
+  try {
+    if (!fs.existsSync(filePath)) {
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(filePath, canonicalContent, 'utf-8');
+      return { action: 'created' };
+    }
 
-function detectAiTools(cwd: string): AiToolInfo[] {
-  const exists = (p: string) => fs.existsSync(path.join(cwd, p));
-  const detected: AiToolInfo[] = [];
+    const existing = fs.readFileSync(filePath, 'utf-8');
+    const existingEnd = existing.indexOf(SKILL_MARKER_END);
+    const existingStart = existing.indexOf(SKILL_MARKER_START);
 
-  if (exists('CLAUDE.md') || exists('.claude')) {
-    detected.push(AI_TOOLS.find((t) => t.name === 'Claude Code')!);
-  }
-  if (exists('.gemini')) {
-    detected.push(AI_TOOLS.find((t) => t.name === 'Gemini CLI')!);
-  }
-  if (exists('.cursorrules') || exists('.cursor/mcp.json')) {
-    detected.push(AI_TOOLS.find((t) => t.name === 'Cursor')!);
-  }
+    // No-marker guard: file exists without canonical markers — either a user-
+    // authored skill or a malformed totem scaffold. Default behavior is
+    // preserve (return a migration hint via `err`). When `options.force === true`,
+    // the guard is suppressed: overwrite with canonical content and set
+    // `forceSuppressed` so the caller can surface the destructive event.
+    if (existingStart === -1 || existingEnd === -1 || existingStart > existingEnd) {
+      if (options?.force === true) {
+        fs.writeFileSync(filePath, canonicalContent, 'utf-8');
+        return { action: 'refreshed', forceSuppressed: true };
+      }
+      return {
+        action: 'preserved',
+        err: `Skill file exists without canonical markers — preserving. To pick up the canonical refresh, move custom content below \`${SKILL_MARKER_END}\` (see mmnto-ai/totem#1890 migration checklist). Or pass \`--force-skill-refresh\` to overwrite (user content will be lost).`,
+      };
+    }
 
-  return detected;
+    const canonicalEnd = canonicalContent.indexOf(SKILL_MARKER_END);
+    if (canonicalEnd === -1) {
+      // Canonical content is missing its own end marker — shouldn't happen
+      // (the source-of-truth invariant test guards this), but degrade safely.
+      return {
+        action: 'preserved',
+        err: 'Canonical skill content is missing its end marker — preserving existing file.',
+      };
+    }
+
+    const canonicalThroughEnd = canonicalContent.slice(0, canonicalEnd + SKILL_MARKER_END.length);
+    const existingAfterEnd = existing.slice(existingEnd + SKILL_MARKER_END.length);
+    const merged = canonicalThroughEnd + existingAfterEnd;
+
+    if (merged === existing) {
+      return { action: 'unchanged' };
+    }
+
+    fs.writeFileSync(filePath, merged, 'utf-8');
+    return { action: 'refreshed' };
+    // totem-context: intentional cleanup — preserve user's skill file on any IO failure rather than aborting init mid-flight; mirrors scaffoldFile's failure posture
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { action: 'preserved', err: `[Totem Error] ${message}` };
+  }
+}
+
+// Wire up hook installers on the AI_TOOLS entries that need them.
+// The AI_TOOLS array is defined in init-detect.ts without hook installers
+// (to avoid circular deps), so we attach them here.
+const claudeTool = AI_TOOLS.find((t) => t.name === 'Claude Code');
+if (claudeTool) claudeTool.hookInstaller = installClaudeHooks;
+const geminiTool = AI_TOOLS.find((t) => t.name === 'Gemini CLI');
+if (geminiTool) geminiTool.hookInstaller = installGeminiHooks;
+
+/** The npm package every Totem MCP registration invokes, under whatever entry name. */
+const MCP_PACKAGE = '@mmnto/mcp';
+
+/**
+ * Boundary-anchored name probe. A bare `includes('@mmnto/mcp')` also fires on
+ * `@mmnto/mcp-experimental` — a DIFFERENT package whose presence must not suppress the
+ * real registration. The lookahead rejects a following word char, hyphen, or dot
+ * (`@mmnto/mcp.js` is a different package name too); a `/`, an `@`, a quote, a space,
+ * or end-of-string all still match (`@mmnto/mcp/dist/index.js`, `@mmnto/mcp@1.2.3`).
+ * Non-global, so it carries no `lastIndex` state across calls.
+ */
+const MCP_PACKAGE_RE = /@mmnto\/mcp(?![\w.-])/;
+
+/**
+ * Whether a `command`/`args` string names a JS-family SCRIPT FILE worth an identity
+ * walk. A suffix gate, not a separator gate: a separator-shaped non-script arg
+ * (`--cwd ./`) resolves to a DIRECTORY, and `path.dirname` on a directory would start
+ * the walk one level above it — outside the config, potentially outside the repo
+ * (scoped leg round 2, D2). Non-global, so `.test()` carries no `lastIndex` state.
+ */
+const SCRIPT_FILE_RE = /\.(?:cjs|mjs|js)$/i;
+
+function looksLikeScriptPath(value: string): boolean {
+  return SCRIPT_FILE_RE.test(value);
+}
+
+/**
+ * Whether a `command` is a Node-family runtime — the only commands whose FIRST
+ * script-suffixed argument is, by the runtime's own semantics, the ENTRYPOINT.
+ * The path probe is scoped to this shape: probing every `.js` argument of every
+ * command would let an unrelated server's plugin/config argument (a file totem
+ * happens to own) masquerade as a totem registration and silently suppress the
+ * real install (Greptile P2 on #2606). Package-manager launchers (`npx`,
+ * `pnpm dlx`, `cmd /c npx …`) name the package instead — the name probe's job.
+ */
+function isNodeCommand(command: string): boolean {
+  const base = path.basename(command).toLowerCase();
+  return base === 'node' || base === 'node.exe';
+}
+
+/** No-throw file probe: only an existing regular FILE qualifies for the identity walk. */
+function isExistingFile(p: string): boolean {
+  // totem-context: intentional cleanup — an unstat-able path is simply not an attributable registration; dedup must never abort the init scaffold.
+  try {
+    return fs.statSync(p).isFile();
+    // totem-context: intentional cleanup — see directive above the try; dual placement so the rule fires on either the catch-keyword line or the catch-body line.
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The package name owning a resolved script: walk from the script's directory to the
+ * filesystem root and read the nearest `package.json`'s `name`. A `package.json` that
+ * names nothing (the `{"type":"module"}` dual-package shim inside a `dist/`) is not an
+ * identity, so the walk continues past it.
+ */
+function packageNameForScript(scriptPath: string): string | undefined {
+  let dir = path.dirname(scriptPath);
+  for (;;) {
+    const pkgPath = path.join(dir, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      // totem-context: intentional cleanup — an unreadable/invalid package.json is not evidence of a DIFFERENT package, so the walk continues to the next parent; dedup must never abort the init scaffold.
+      try {
+        // `JSON.parse` also yields `null`, arrays, and scalars — checked explicitly
+        // (the wirePreparePackageJson posture) rather than left to throw into the catch.
+        const parsed: unknown = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+        if (parsed !== null && typeof parsed === 'object') {
+          const { name } = parsed as { name?: unknown };
+          if (typeof name === 'string') return name;
+        }
+        // totem-context: intentional cleanup — see directive above the try; dual placement so the rule fires on either the catch-keyword line or the catch-body line.
+      } catch {
+        // fall through to the next parent
+      }
+    }
+    // `path.dirname` is a fixpoint at the filesystem root — that fixpoint ends the walk.
+    const parent = path.dirname(dir);
+    if (parent === dir) return undefined;
+    dir = parent;
+  }
+}
+
+/**
+ * Find an existing registration of the Totem MCP package under ANY entry name
+ * (mmnto-ai/totem#2601). Dedup keys on the registered PACKAGE, not the entry name: a
+ * consumer that registered `@mmnto/mcp` as `totem-dev` / `totem-strategy` (a `--cwd`
+ * pin, a local path pin) must not collect a third duplicate `totem` entry on re-init.
+ *
+ * Two probes, both scoped to `command` and the string members of `args` — the only
+ * fields that can INVOKE anything. There is deliberately no whole-entry serialization
+ * scan: it false-positives on a prose mention in `env`, a field that cannot invoke
+ * anything.
+ *
+ *   1. Name probe — {@link MCP_PACKAGE_RE} on each candidate string.
+ *   2. Path probe — a registration need not spell the package at all. This repo's own
+ *      configs run `node ./packages/mcp/dist/index.js`; for a Node-family command
+ *      ({@link isNodeCommand}), the FIRST script-suffixed arg — the runtime's own
+ *      entrypoint — is resolved against every candidate base and, when it lands on a
+ *      real file, the owning package is read from the nearest `package.json` on the
+ *      written path (lexical — an aliased/symlinked script attributes to its host
+ *      package) via {@link packageNameForScript}.
+ *
+ * `baseDirs` carries the config's own directory AND the project root: hosts launch
+ * the server from the project root, and three of the four host configs live in
+ * subdirectories (`.gemini/`, `.cursor/`, `.junie/mcp/`) while their pins are written
+ * root-relative — the config's directory alone is the right base only for the
+ * root-level `.mcp.json` (scoped leg round 2, D1).
+ *
+ * A path that does not resolve to an existing file under any base is a stale pin, not
+ * a registration we can attribute — it falls through and init appends its own entry.
+ */
+function findMcpPackageRegistration(
+  servers: Record<string, unknown>,
+  baseDirs: string[],
+): string | undefined {
+  for (const [name, entry] of Object.entries(servers)) {
+    if (entry === null || typeof entry !== 'object') continue;
+    const { command, args } = entry as { command?: unknown; args?: unknown };
+    const candidates: string[] = [];
+    if (typeof command === 'string') candidates.push(command);
+    if (Array.isArray(args)) {
+      for (const arg of args) if (typeof arg === 'string') candidates.push(arg);
+    }
+
+    if (candidates.some((candidate) => MCP_PACKAGE_RE.test(candidate))) return name;
+
+    // Path probe: only a Node-family command has a script ENTRYPOINT to attribute,
+    // and only its FIRST script-suffixed arg is that entrypoint (node's own CLI
+    // semantics). Later `.js` args are plugin/config inputs — attributing those
+    // would suppress a real registration over a file the server merely consumes.
+    if (typeof command !== 'string' || !isNodeCommand(command)) continue;
+    const entrypoint = Array.isArray(args)
+      ? args.find((arg): arg is string => typeof arg === 'string' && looksLikeScriptPath(arg))
+      : undefined;
+    if (entrypoint === undefined) continue;
+    for (const baseDir of baseDirs) {
+      const resolved = path.resolve(baseDir, entrypoint);
+      if (!isExistingFile(resolved)) continue;
+      if (packageNameForScript(resolved) === MCP_PACKAGE) return name;
+    }
+  }
+  return undefined;
 }
 
 export function scaffoldMcpConfig(
   filePath: string,
   serverEntry: Record<string, unknown>,
-): { action: 'created' | 'merged' | 'skipped'; err?: string } {
+  opts?: {
+    /** The project root — the second resolution base for relative script pins
+     *  (host configs in subdirectories carry root-relative pins; leg D1). */
+    projectRoot?: string;
+  },
+): {
+  action: 'created' | 'merged' | 'skipped';
+  /** The entry name an existing `@mmnto/mcp` registration was found under, when the
+   *  skip came from the package-level dedup rather than the `totem` key check. */
+  existingName?: string;
+  err?: string;
+} {
   try {
     if (!fs.existsSync(filePath)) {
       const dir = path.dirname(filePath);
@@ -420,6 +911,14 @@ export function scaffoldMcpConfig(
     if ('totem' in servers) {
       return { action: 'skipped' };
     }
+    // Package-level dedup runs after the name check so the `totem`-key skip keeps its
+    // bare shape: `existingName` marks the different-name case the caller discloses.
+    const baseDirs = [path.dirname(filePath)];
+    if (opts?.projectRoot !== undefined) baseDirs.push(opts.projectRoot);
+    const existingName = findMcpPackageRegistration(servers, baseDirs);
+    if (existingName !== undefined) {
+      return { action: 'skipped', existingName };
+    }
 
     servers.totem = serverEntry;
     parsed.mcpServers = servers;
@@ -431,170 +930,79 @@ export function scaffoldMcpConfig(
   }
 }
 
-function detectProject(cwd: string): DetectedProject {
-  const exists = (p: string) => fs.existsSync(path.join(cwd, p));
-  return {
-    hasTypeScript: exists('tsconfig.json'),
-    hasSrc: exists('src'),
-    hasDocs: exists('docs'),
-    hasSpecs: exists('specs'),
-    hasContext: exists('context'),
-    hasSessions: exists('context/sessions'),
-  };
-}
-
-function buildTargets(detected: DetectedProject): IngestTarget[] {
-  const targets: IngestTarget[] = [];
-
-  if (detected.hasTypeScript) {
-    targets.push(
-      { glob: 'src/**/*.ts', type: 'code', strategy: 'typescript-ast' },
-      { glob: 'src/**/*.tsx', type: 'code', strategy: 'typescript-ast' },
-    );
-
-    if (!detected.hasSrc) {
-      // Monorepo layout — scan packages/
-      targets.push(
-        { glob: 'packages/**/*.ts', type: 'code', strategy: 'typescript-ast' },
-        { glob: 'packages/**/*.tsx', type: 'code', strategy: 'typescript-ast' },
-      );
-    }
-  }
-
-  if (detected.hasSessions) {
-    targets.push({
-      glob: 'context/sessions/**/*.md',
-      type: 'session_log',
-      strategy: 'session-log',
-    });
-  }
-
-  if (detected.hasSpecs) {
-    targets.push({
-      glob: 'specs/**/*.md',
-      type: 'spec',
-      strategy: 'markdown-heading',
-    });
-  }
-
-  if (detected.hasDocs) {
-    targets.push({
-      glob: 'docs/**/*.md',
-      type: 'spec',
-      strategy: 'markdown-heading',
-    });
-  }
-
-  if (detected.hasContext) {
-    targets.push({
-      glob: 'context/**/*.md',
-      type: 'spec',
-      strategy: 'markdown-heading',
-    });
-  }
-
-  // Fallback: if nothing detected, add a sensible default
-  if (targets.length === 0) {
-    targets.push({
-      glob: '**/*.md',
-      type: 'spec',
-      strategy: 'markdown-heading',
-    });
-  }
-
-  return targets;
-}
-
-function formatTargets(targets: IngestTarget[]): string {
-  const lines = targets.map((t) => {
-    return `    { glob: '${t.glob}', type: '${t.type}', strategy: '${t.strategy}' },`;
-  });
-  return lines.join('\n');
-}
-
-type EmbeddingTier = 'openai' | 'ollama' | 'none';
-
-export function generateConfig(targets: IngestTarget[], embeddingTier: EmbeddingTier): string {
-  let embeddingBlock: string;
-  switch (embeddingTier) {
-    case 'openai':
-      embeddingBlock = `  embedding: { provider: 'openai', model: 'text-embedding-3-small' },`;
-      break;
-    case 'ollama':
-      embeddingBlock = `  embedding: { provider: 'ollama', model: 'nomic-embed-text', baseUrl: 'http://localhost:11434' },`;
-      break;
-    case 'none':
-      embeddingBlock = `  // embedding: { provider: 'openai', model: 'text-embedding-3-small' },\n  // Lite tier — set OPENAI_API_KEY and re-run \`totem init\` to enable sync/search.`;
-      break;
-  }
-
-  return `import type { TotemConfig } from '@mmnto/totem';
-
-const config: TotemConfig = {
-  targets: [
-${formatTargets(targets)}
-  ],
-
-${embeddingBlock}
-
-  orchestrator: {
-    provider: 'shell',
-    command: 'gemini --model {model} -o json -e none < {file}',
-    defaultModel: 'gemini-3-flash-preview',
-    overrides: {
-      'spec': 'gemini-3.1-pro-preview',
-      'shield': 'gemini-3.1-pro-preview',
-      'triage': 'gemini-3.1-pro-preview',
-    },
-  },
-};
-
-export default config;
-`;
-}
-
-/**
- * Auto-detect the best embedding tier from the environment.
- * Checks for API keys in env and .env, and optionally for a running Ollama instance.
- */
-export function detectEmbeddingTier(cwd: string): EmbeddingTier {
-  // Check env (including already-loaded .env)
-  if (process.env['OPENAI_API_KEY'] && /\S/.test(process.env['OPENAI_API_KEY'])) return 'openai';
-
-  // Check .env file directly (loadEnv may not have run yet)
-  const envPath = path.join(cwd, '.env');
-  if (fs.existsSync(envPath)) {
-    const content = fs.readFileSync(envPath, 'utf-8');
-    if (/^\s*OPENAI_API_KEY\s*=\s*\S+/m.test(content)) return 'openai';
-  }
-
-  return 'none';
-}
-
 /**
  * Install the Universal AI Developer Baseline lessons into the lessons file.
  * Returns 'installed', 'exists' (already present), or 'skipped' (user declined).
- * In non-TTY mode (CI), defaults to installing without prompting.
+ * In non-interactive mode (CI, `--yes`, piped input), defaults to installing without
+ * prompting. `interactive` is threaded from init's single non-interactive predicate
+ * (mmnto-ai/totem#2601) and falls back to the bare TTY probe for standalone callers.
  */
 export async function installBaselineLessons(
-  lessonsPath: string,
-  rl: readline.Interface,
+  baselinePath: string,
+  rl: import('node:readline/promises').Interface,
+  ecosystems?: Ecosystem[],
+  interactive: boolean = process.stdin.isTTY === true,
 ): Promise<'installed' | 'exists' | 'skipped'> {
-  try {
-    const existing = fs.readFileSync(lessonsPath, 'utf-8');
-    if (existing.includes(BASELINE_MARKER)) return 'exists';
+  const { UNIVERSAL_BASELINE_LESSONS, UNIVERSAL_BASELINE_MARKER } =
+    await import('../assets/universal-baseline.js');
+  const { log } = await import('../ui.js');
 
-    // In non-TTY mode (CI, piped input), default to installing
+  try {
+    if (fs.existsSync(baselinePath)) {
+      const existing = fs.readFileSync(baselinePath, 'utf-8');
+      if (
+        existing.includes(UNIVERSAL_BASELINE_MARKER) ||
+        existing.includes('<!-- totem:baseline -->')
+      )
+        return 'exists';
+    }
+
+    // Non-interactive (CI, `--yes`, piped input): take the (Y) default — install.
     let declined = false;
-    if (process.stdin.isTTY) {
-      const answer = await rl.question('Install Universal AI Developer Baseline lessons? (Y/n): ');
+    if (interactive) {
+      const answer = await rl.question('Install baseline lessons? (Y/n): ');
       declined = answer.trim().toLowerCase() === 'n' || answer.trim().toLowerCase() === 'no';
+    } else {
+      log.info('Totem', 'Non-interactive mode — installing baseline lessons.');
     }
 
     if (declined) return 'skipped';
 
-    const suffix = existing.endsWith('\n') ? '' : '\n';
-    fs.appendFileSync(lessonsPath, suffix + UNIVERSAL_LESSONS_MARKDOWN, 'utf-8');
+    const dir = path.dirname(baselinePath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    // Build combined baseline: universal (core + JS) + detected ecosystem packs
+    const { PYTHON_BASELINE, RUST_BASELINE, GO_BASELINE } =
+      await import('../assets/baseline-packs.js');
+    const allLessons = [...UNIVERSAL_BASELINE_LESSONS];
+    const packs: string[] = [];
+    if (ecosystems?.includes('python')) {
+      allLessons.push(...PYTHON_BASELINE);
+      packs.push('Python');
+    }
+    if (ecosystems?.includes('rust')) {
+      allLessons.push(...RUST_BASELINE);
+      packs.push('Rust');
+    }
+    if (ecosystems?.includes('go')) {
+      allLessons.push(...GO_BASELINE);
+      packs.push('Go');
+    }
+    if (packs.length > 0) {
+      log.info('Totem', `Adding ${packs.join(', ')} baseline lessons`);
+    }
+
+    const markdown = [
+      UNIVERSAL_BASELINE_MARKER,
+      '',
+      ...allLessons.map(
+        (l) => `## Lesson — ${l.heading}\n\n**Tags:** ${l.tags.join(', ')}\n\n${l.body}`,
+      ),
+    ].join('\n\n');
+
+    fs.writeFileSync(baselinePath, markdown, 'utf-8');
     return 'installed';
   } catch (err) {
     log.warn(
@@ -605,16 +1013,114 @@ export async function installBaselineLessons(
   }
 }
 
-/** Inject reflex block into an AI context file if not already present. */
-function injectReflexes(filePath: string): 'injected' | 'exists' | 'missing' {
+// ─── Reflex detection & upgrade ──────────────────────────
+
+export type ReflexStatus = 'current' | 'outdated' | 'missing';
+
+/** Detect whether the reflex block in a file is current, outdated, or missing. */
+export function detectReflexStatus(content: string): ReflexStatus {
+  // Check for versioned sentinel first
+  const versionMatch = content.match(REFLEX_VERSION_RE);
+  if (versionMatch) {
+    const version = parseInt(versionMatch[1]!, 10);
+    return version >= REFLEX_VERSION ? 'current' : 'outdated';
+  }
+
+  // Legacy sentinel — injected by older totem versions without version markers
+  if (content.includes(LEGACY_SENTINEL) || content.includes('Totem Memory Reflexes')) {
+    return 'outdated';
+  }
+
+  return 'missing';
+}
+
+/**
+ * Upgrade a reflex block from legacy (v1, no boundaries) or older versioned
+ * blocks to the current version. Returns the updated file content.
+ *
+ * Strategy:
+ * - If start/end boundaries exist, replace between them (clean swap).
+ * - If only the legacy sentinel exists (v1), find the block start and
+ *   look for the next user-owned `## ` heading or EOF as the boundary.
+ * - If the boundary can't be determined cleanly, append the new block
+ *   and set `clean: false` so the caller can warn about manual cleanup.
+ */
+export function upgradeReflexes(content: string): { content: string; clean: boolean } {
+  // Case 1: Has start/end boundaries (versioned block from a previous version)
+  const startIdx = content.indexOf(REFLEX_START);
+  const endIdx = content.indexOf(REFLEX_END);
+
+  if (startIdx !== -1 && endIdx !== -1 && startIdx < endIdx) {
+    // Both seams must be owned by exactly one party for regen to be a
+    // byte-fixpoint. Before-seam: normalize the prefix to end with exactly one
+    // `\n` (AI_PROMPT_BLOCK's own leading `\n` supplies the separating blank
+    // line); a prefix that is nothing but that added newline drops to '' so a
+    // marker-at-byte-0 file cannot grow a leading blank line per regen.
+    let before = content.slice(0, startIdx).replace(/(?:\r?\n)*$/, '\n');
+    if (before === '\n') before = '';
+    let after = content.slice(endIdx + REFLEX_END.length);
+    // After-seam: AI_PROMPT_BLOCK already ends with the end marker's own line
+    // terminator, so the OLD block's terminator must not re-enter through
+    // `after` — that duplication accreted one blank line per regen into the
+    // after-end span that is contractually user content (#1890; byte-verified
+    // v7→v9, #2599). A tail of nothing but ASCII whitespace is totem's own
+    // accretion residue, not user content: normalize it away entirely so
+    // already-damaged files heal instead of freezing their residue.
+    if (/^[ \t\r\n]*$/.test(after)) {
+      after = '';
+    } else if (after.startsWith('\r\n')) {
+      after = after.slice(2);
+    } else if (after.startsWith('\n')) {
+      after = after.slice(1);
+    }
+    return { content: before + AI_PROMPT_BLOCK + after, clean: true };
+  }
+
+  // Case 2: Legacy block (v1) — no boundaries, appended at end of file
+  const legacyIdx = content.indexOf(LEGACY_SENTINEL);
+  if (legacyIdx !== -1) {
+    // Walk backwards to include any leading whitespace before the heading
+    let blockStart = legacyIdx;
+    while (blockStart > 0 && content[blockStart - 1] === '\n') blockStart--;
+
+    // Find the end: the next ## heading that isn't part of the Totem block, or EOF
+    const afterLegacy = content.slice(legacyIdx);
+    // Match a `\n## ` followed by text that is NOT "Totem AI" (user content after the block)
+    const nextH2 = afterLegacy.match(/\r?\n## (?!Totem AI Integration)/);
+    const blockEnd = nextH2?.index !== undefined ? legacyIdx + nextH2.index : content.length;
+
+    const before = content.slice(0, blockStart);
+    const after = content.slice(blockEnd);
+    return { content: before + AI_PROMPT_BLOCK + after, clean: true };
+  }
+
+  // Case 3: Has "Totem Memory Reflexes" text but not the standard heading — can't locate cleanly
+  return { content: content + '\n' + AI_PROMPT_BLOCK, clean: false };
+}
+
+/** Inject or upgrade reflex block in an AI context file. */
+function injectReflexes(filePath: string): 'injected' | 'current' | 'missing' | 'outdated' {
   if (!fs.existsSync(filePath)) return 'missing';
 
   const content = fs.readFileSync(filePath, 'utf-8');
-  if (content.includes('Totem AI Integration') || content.includes('Totem Memory Reflexes')) {
-    return 'exists';
+  const status = detectReflexStatus(content);
+
+  if (status === 'current') return 'current';
+  if (status === 'missing') {
+    fs.appendFileSync(filePath, AI_PROMPT_BLOCK);
+    return 'injected';
   }
-  fs.appendFileSync(filePath, AI_PROMPT_BLOCK);
-  return 'injected';
+
+  // 'outdated' — defer to caller for user confirmation
+  return 'outdated';
+}
+
+/** Apply the reflex upgrade to a file. Returns true if clean, false if manual cleanup needed. */
+function applyReflexUpgrade(filePath: string): boolean {
+  const content = fs.readFileSync(filePath, 'utf-8');
+  const { content: updated, clean } = upgradeReflexes(content);
+  fs.writeFileSync(filePath, updated, 'utf-8');
+  return clean;
 }
 
 interface InitSummaryEntry {
@@ -622,13 +1128,200 @@ interface InitSummaryEntry {
   action: string;
 }
 
-export async function initCommand(): Promise<void> {
+/**
+ * Resolve the AI-tool selection prompt's answer. Anything that is not an explicit
+ * `none` / `select` is the Enter default, `all` — which is also the answer the
+ * non-interactive path takes without raising the prompt (mmnto-ai/totem#2601).
+ */
+export function resolveToolSelection(answer: string): 'all' | 'none' | 'select' {
+  const trimmed = answer.trim().toLowerCase();
+  if (trimmed === 'none') return 'none';
+  if (trimmed === 'select') return 'select';
+  return 'all';
+}
+
+export async function initCommand(options?: {
+  bare?: boolean;
+  pilot?: boolean;
+  strict?: boolean;
+  global?: boolean;
+  /** Force-overwrite distributed skill files lacking canonical markers
+   *  (W3.5, mmnto-ai/totem#2008). Default behavior preserves user-authored
+   *  or pre-marker scaffold files; force-mode suppresses ONLY the no-marker
+   *  guard. Marker-bearing files refresh via the normal path regardless. */
+  forceSkillRefresh?: boolean;
+  /** Install action-gate PreToolUse hooks (PR-C, mmnto-ai/totem#2048): a
+   *  comma-list of gate names (validated against `knownGateEvents()`) or
+   *  the literal `all`. Routes through the SAME `installGates` path the
+   *  `gate install` verb uses — no second copy of the merge logic. */
+  gates?: string;
+  /** Wire `orient.parityManifest` to the installed doctrine pin and exit
+   *  (mmnto-ai/totem#2088, Proposal 292 S1). Non-interactive; honest-absent
+   *  when the `@mmnto/strategy-doctrine` pin is not installed. */
+  doctrine?: boolean;
+  /** Answer every prompt with its default and raise none (mmnto-ai/totem#2601).
+   *  Implied when stdin is not a TTY: a partial guard let a stdin-null init print
+   *  the non-interactive banner and still die at an unguarded prompt with mutations
+   *  already landed. Every non-interactive default is logged. */
+  yes?: boolean;
+  /** Override home directory for testing. */
+  _homeDir?: string;
+}): Promise<void> {
+  // ─── Doctrine pin wiring (mmnto-ai/totem#2088, Proposal 292 S1) ───
+  // Self-contained non-interactive path: point orient.parityManifest at the
+  // installed @mmnto/strategy-doctrine pin so `totem doctor --parity` stops
+  // honest-absent-SKIPping. Mirrors the --global early-return shape.
+  if (options?.doctrine) {
+    const { log } = await import('../ui.js');
+    const { TotemConfigError } = await import('@mmnto/totem');
+    const { DOCTRINE_PIN_PACKAGE, wireDoctrineManifest } = await import('./init-doctrine.js');
+
+    const outcome = await wireDoctrineManifest(process.cwd(), options._homeDir);
+    switch (outcome.kind) {
+      case 'pin-absent':
+        log.warn(
+          'Totem',
+          `Doctrine pin ${DOCTRINE_PIN_PACKAGE} is not installed (looked for ${outcome.manifestPath}).`,
+        );
+        log.info(
+          'Totem',
+          'Add it as a dependency, then re-run `totem init --doctrine`. Until then `totem doctor --parity` stays an honest skip.',
+        );
+        return;
+      case 'no-config':
+        throw new TotemConfigError(
+          'No Totem configuration found in this repo.',
+          'Run `totem init` first, then `totem init --doctrine`.',
+          'CONFIG_MISSING',
+        );
+      case 'global-only':
+        throw new TotemConfigError(
+          'Only a global ~/.totem profile was found — the parity manifest is a per-repo setting.',
+          'Run `totem init` in this repo first, then `totem init --doctrine`.',
+          'CONFIG_MISSING',
+        );
+      case 'already-set':
+        log.info(
+          'Totem',
+          `orient.parityManifest already configured in ${outcome.configPath}. Nothing to do.`,
+        );
+        return;
+      case 'manual': {
+        const where =
+          outcome.reason === 'orient-exists'
+            ? 'You already have an `orient` block — add this line inside it:'
+            : 'Could not safely auto-edit this config — add this manually:';
+        log.warn('Totem', `Could not auto-wire orient.parityManifest in ${outcome.configPath}.`);
+        log.info('Totem', `${where}\n${outcome.snippet}`);
+        return;
+      }
+      case 'written':
+        log.success(
+          'Totem',
+          `Wired orient.parityManifest → ${outcome.manifestPath} in ${outcome.configPath}.`,
+        );
+        log.dim('Totem', 'Run `totem doctor --parity` to sense cohort drift.');
+        return;
+    }
+  }
+
+  // ─── Global profile shortcut ───────────────────────
+  // totem-context: fs and path are static imports at top of file (lines 1-2)
+  if (options?.global) {
+    const os = await import('node:os');
+    const { log } = await import('../ui.js');
+    const { CONFIG_FILES } = await import('../utils.js');
+
+    const globalDir = path.join(options._homeDir ?? os.homedir(), '.totem');
+
+    // Create ~/.totem/ if it doesn't exist
+    if (!fs.existsSync(globalDir)) {
+      fs.mkdirSync(globalDir, { recursive: true });
+    }
+
+    // Check if global config already exists
+    const existingGlobalConfig = CONFIG_FILES.map((f: string) => path.join(globalDir, f)).find(
+      (p: string) => fs.existsSync(p),
+    );
+
+    const compiledRulesPath = path.join(globalDir, 'compiled-rules.json');
+    if (existingGlobalConfig && fs.existsSync(compiledRulesPath)) {
+      log.warn('Totem', `Global profile already exists at ${globalDir}`);
+      log.dim('Totem', `Config: ${existingGlobalConfig}`);
+      return;
+    }
+
+    // Write minimal global config (only if no config exists yet — don't clobber during repair)
+    if (!existingGlobalConfig) {
+      const configPath = path.join(globalDir, 'totem.config.ts');
+      const configContent = `import type { TotemConfig } from '@mmnto/totem';
+
+export default {
+  totemDir: '.',
+  targets: [
+    { glob: '.totem/lessons/*.md', type: 'lesson', strategy: 'markdown-heading' },
+  ],
+} satisfies TotemConfig;
+`;
+      fs.writeFileSync(configPath, configContent, 'utf-8');
+    }
+
+    // Install universal baseline compiled rules (global profile gets all packs —
+    // project-specific init gates on detected ecosystems)
+    try {
+      const {
+        COMPILED_BASELINE_RULES,
+        NEW_TYPESCRIPT_RULES,
+        COMPILED_NODEJS_BASELINE,
+        COMPILED_SHELL_BASELINE,
+        COMPILED_PYTHON_BASELINE,
+        COMPILED_RUST_BASELINE,
+        COMPILED_GO_BASELINE,
+      } = await import('../assets/compiled-baseline.js');
+      const allRules = [
+        ...COMPILED_BASELINE_RULES,
+        ...NEW_TYPESCRIPT_RULES,
+        ...COMPILED_NODEJS_BASELINE,
+        ...COMPILED_SHELL_BASELINE,
+        ...COMPILED_PYTHON_BASELINE,
+        ...COMPILED_RUST_BASELINE,
+        ...COMPILED_GO_BASELINE,
+      ];
+      const payload = { version: 1, rules: allRules };
+      fs.writeFileSync(compiledRulesPath, JSON.stringify(payload, null, 2) + '\n');
+      log.success('Totem', `Global profile created at ${globalDir}`);
+      log.success('Totem', `${allRules.length} baseline rules installed.`);
+      log.info('Totem', 'Run `totem lint` in any directory to apply your personal rules.');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn('Totem', `Could not install baseline rules: ${msg}`);
+    }
+
+    return; // Skip the rest of interactive init
+  }
+
+  // ─── Standard project init ─────────────────────────
+  const { stdin: input, stdout: output } = await import('node:process');
+  const readline = await import('node:readline/promises');
+  const { bold, brand, dim, log, printBanner, success } = await import('../ui.js');
+  const { buildTargets, detectAiTools, detectEmbeddingTier, detectProject } =
+    await import('./init-detect.js');
+  const { installEnforcementHooks, installPostMergeHook } = await import('./install-hooks.js');
+
   const cwd = process.cwd();
-  const configPath = path.join(cwd, 'totem.config.ts');
+  const { CONFIG_FILES } = await import('../utils.js');
   const totemDir = path.join(cwd, '.totem');
-  const configExists = fs.existsSync(configPath);
+
+  // Check if ANY config format already exists
+  const existingConfig = CONFIG_FILES.map((f) => path.join(cwd, f)).find((p) => fs.existsSync(p));
+  const configExists = !!existingConfig;
 
   const rl = readline.createInterface({ input, output });
+  // The ONE non-interactive predicate (mmnto-ai/totem#2601). Every `rl.question` site
+  // below is guarded by it: a prompt raised without a TTY never settles, and init's
+  // mutations land BEFORE the prompts, so a half-run reads as a silent no-op. Each
+  // guarded site logs the default it took.
+  const interactive = process.stdin.isTTY === true && options?.yes !== true;
   const summary: InitSummaryEntry[] = [];
 
   try {
@@ -637,78 +1330,145 @@ export async function initCommand(): Promise<void> {
     if (!configExists) {
       // --- Fresh install: generate config ---
       log.info('Totem', 'Scanning project...');
-      const detected = detectProject(cwd);
 
-      const detections: string[] = [];
-      if (detected.hasTypeScript) detections.push('TypeScript');
-      if (detected.hasSrc) detections.push('src/');
-      if (detected.hasDocs) detections.push('docs/');
-      if (detected.hasSpecs) detections.push('specs/');
-      if (detected.hasContext) detections.push('context/');
-      if (detected.hasSessions) detections.push('session logs');
+      let targets: IngestTarget[] = [];
+      let embeddingTier: EmbeddingTier = detectEmbeddingTier(cwd);
 
-      if (detections.length > 0) {
-        log.info('Totem', `Detected: ${bold(detections.join(', '))}`);
+      if (options?.bare) {
+        log.info('Totem', `Initializing in ${bold('bare mode')} (non-code repository)`);
+        targets = [
+          { glob: '.totem/lessons/*.md', type: 'lesson', strategy: 'markdown-heading' },
+          { glob: '.totem/lessons.md', type: 'lesson', strategy: 'markdown-heading' },
+          { glob: '**/*.md', type: 'spec', strategy: 'markdown-heading' },
+        ];
+        embeddingTier = 'none'; // Force Lite tier for bare repos
       } else {
-        log.dim('Totem', 'No specific project structure detected. Using markdown defaults.');
-      }
+        const detected = detectProject(cwd);
 
-      const targets = buildTargets(detected);
+        const detections: string[] = [];
+        if (detected.hasTypeScript) detections.push('TypeScript');
+        if (detected.hasSrc) detections.push('src/');
+        if (detected.hasDocs) detections.push('docs/');
+        if (detected.hasSpecs) detections.push('specs/');
+        if (detected.hasContext) detections.push('context/');
+        if (detected.hasSessions) detections.push('session logs');
 
-      // Auto-detect embedding tier from environment
-      let embeddingTier = detectEmbeddingTier(cwd);
+        if (detections.length > 0) {
+          log.info('Totem', `Detected: ${bold(detections.join(', '))}`);
+        } else {
+          log.dim('Totem', 'No specific project structure detected. Using markdown defaults.');
+        }
 
-      if (embeddingTier === 'openai') {
-        log.info(
-          'Totem',
-          `Detected ${bold('OPENAI_API_KEY')} in environment. Using OpenAI embeddings.`,
-        );
-      } else {
-        // No key detected — prompt the user
-        const answer = await rl.question(
-          'Enter your OpenAI API key, type "ollama" for a local model, or press Enter for Lite tier: ',
-        );
+        targets = buildTargets(detected);
 
-        const input = answer.trim().replace(/[\r\n]/g, '');
-        if (input.toLowerCase() === 'ollama') {
-          embeddingTier = 'ollama';
-          log.info('Totem', 'Configured for Ollama. Make sure it is running locally.');
-        } else if (input) {
-          if (!/^sk-[a-zA-Z0-9_-]+$/.test(input)) {
-            log.warn(
-              'Totem',
-              'API key does not look like a valid OpenAI key (expected sk-...). Starting in Lite tier.',
-            );
-          } else {
-            const envPath = path.join(cwd, '.env');
-            const envLine = `OPENAI_API_KEY="${input}"\n`;
+        // Surface the Ollama floor expectation BEFORE embedding-tier
+        // branching, so cloud-key auto-detection doesn't silently bury
+        // Ollama as a no-quota fallback option (mmnto-ai/totem#1851).
+        const ollamaFloor = await probeOllamaFloor();
+        log.info('Totem', ollamaFloor.message);
 
-            if (fs.existsSync(envPath)) {
-              const existing = fs.readFileSync(envPath, 'utf-8');
-              if (!/^\s*OPENAI_API_KEY\s*=/m.test(existing)) {
-                const prefix = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
-                fs.appendFileSync(envPath, prefix + envLine);
-              }
+        if (embeddingTier === 'openai') {
+          log.info(
+            'Totem',
+            `Detected ${bold('OPENAI_API_KEY')} in environment. Using OpenAI embeddings.`,
+          );
+        } else if (embeddingTier === 'gemini') {
+          log.info(
+            'Totem',
+            `Detected ${bold('GEMINI_API_KEY')} in environment. Using Gemini embeddings (single-key DX).`,
+          );
+        } else if (!interactive) {
+          // Non-interactive: take the Enter default (Lite tier). The other two answers
+          // MUTATE (an .env write, an Ollama pin) and must not fire unattended.
+          log.info(
+            'Totem',
+            'Non-interactive mode — no embedding key entered; starting in Lite tier.',
+          );
+        } else {
+          // No key detected — prompt the user
+          const answer = await rl.question(
+            'Enter your OpenAI API key, type "ollama" for a local model, or press Enter for Lite tier: ',
+          );
+
+          const input = answer.trim().replace(/[\r\n]/g, '');
+          if (input.toLowerCase() === 'ollama') {
+            embeddingTier = 'ollama';
+            log.info('Totem', 'Configured for Ollama. Make sure it is running locally.');
+          } else if (input) {
+            if (!/^sk-[a-zA-Z0-9_-]+$/.test(input)) {
+              log.warn(
+                'Totem',
+                'API key does not look like a valid OpenAI key (expected sk-...). Starting in Lite tier.',
+              );
             } else {
-              fs.writeFileSync(envPath, envLine);
-            }
+              const envPath = path.join(cwd, '.env');
+              const envLine = `OPENAI_API_KEY="${input}"\n`;
 
-            embeddingTier = 'openai';
-            summary.push({ file: '.env', action: 'Saved OpenAI API key' });
+              if (fs.existsSync(envPath)) {
+                const existing = fs.readFileSync(envPath, 'utf-8');
+                if (!/^\s*OPENAI_API_KEY\s*=/m.test(existing)) {
+                  const prefix = existing.length > 0 && !existing.endsWith('\n') ? '\n' : '';
+                  fs.appendFileSync(envPath, prefix + envLine);
+                }
+              } else {
+                fs.writeFileSync(envPath, envLine);
+              }
+
+              embeddingTier = 'openai';
+              summary.push({ file: '.env', action: 'Saved OpenAI API key' });
+            }
           }
         }
       }
 
       if (embeddingTier === 'none') {
         log.info('Totem', `Starting in ${bold('Lite')} tier (add-lesson, bridge, eject only).`);
-        log.dim(
-          'Totem',
-          'Set OPENAI_API_KEY and re-run `totem init` to unlock sync/search/shield.',
-        );
+        if (!options?.bare) {
+          log.dim(
+            'Totem',
+            'Set OPENAI_API_KEY and re-run `totem init` to unlock sync/search/shield.',
+          );
+        }
       }
 
-      const configContent = generateConfig(targets, embeddingTier);
-      fs.writeFileSync(configPath, configContent, 'utf-8');
+      const { generateConfigForFormat } = await import('./init-templates.js');
+      const detected = detectProject(cwd);
+      const { content: configContent, filename: configFilename } = await generateConfigForFormat(
+        detected.preferredConfigFormat,
+        targets,
+        embeddingTier,
+        cwd,
+      );
+      const configPath = path.join(cwd, configFilename);
+
+      // Inject pilot: true into the generated config when --pilot is set
+      let finalConfigContent = configContent;
+      if (options?.pilot) {
+        if (configFilename.endsWith('.ts')) {
+          // Insert `pilot: true,` before the closing `};`
+          finalConfigContent = finalConfigContent.replace(/\n};\s*$/, '\n\n  pilot: true,\n};\n');
+        } else if (configFilename.endsWith('.yaml') || configFilename.endsWith('.yml')) {
+          finalConfigContent = finalConfigContent.trimEnd() + '\npilot: true\n';
+        } else if (configFilename.endsWith('.toml')) {
+          finalConfigContent = finalConfigContent.trimEnd() + '\npilot = true\n';
+        }
+      }
+
+      // Inject hooks.tier into the generated config when --strict is set
+      if (options?.strict) {
+        if (configFilename.endsWith('.ts')) {
+          finalConfigContent = finalConfigContent.replace(
+            /\n};\s*$/,
+            "\n\n  hooks: { tier: 'strict' },\n};\n",
+          );
+        } else if (configFilename.endsWith('.yaml') || configFilename.endsWith('.yml')) {
+          finalConfigContent = finalConfigContent.trimEnd() + '\nhooks:\n  tier: strict\n';
+        } else if (configFilename.endsWith('.toml')) {
+          finalConfigContent = finalConfigContent.trimEnd() + '\n\n[hooks]\ntier = "strict"\n';
+        }
+      }
+
+      fs.writeFileSync(configPath, finalConfigContent, 'utf-8');
       const tierLabel =
         embeddingTier === 'none'
           ? 'Lite'
@@ -716,11 +1476,12 @@ export async function initCommand(): Promise<void> {
             ? 'Standard'
             : 'Standard (Ollama)';
       summary.push({
-        file: 'totem.config.ts',
+        file: configFilename,
         action: `Created with auto-detected targets (${tierLabel} tier)`,
       });
     } else {
-      log.dim('Totem', 'totem.config.ts already exists. Checking reflexes and hooks...');
+      const configName = existingConfig ? path.basename(existingConfig) : 'config';
+      log.dim('Totem', `${configName} already exists. Checking reflexes and hooks...`);
     }
 
     // --- Always run: .totem/ directory ---
@@ -728,138 +1489,494 @@ export async function initCommand(): Promise<void> {
       fs.mkdirSync(totemDir, { recursive: true });
     }
 
-    const lessonsPath = path.join(totemDir, 'lessons.md');
-    const lessonsExisted = fs.existsSync(lessonsPath);
-    if (!lessonsExisted) {
-      fs.writeFileSync(
-        lessonsPath,
-        `# Totem Lessons\n\nLessons learned from PR reviews and Shield checks.\nThis file is version-controlled and reviewed in PR diffs.\n\n---\n`,
-        'utf-8',
+    // --- Pilot mode initialization ---
+    if (options?.pilot) {
+      const { readPilotState } = await import('../utils/pilot.js');
+      readPilotState(totemDir); // initializes pilot-state.json if missing
+      log.info(
+        'Totem',
+        'Pilot mode enabled (14 days / 50 pushes). Hooks will warn instead of block.',
       );
-      summary.push({ file: '.totem/lessons.md', action: 'Created lessons file' });
+      summary.push({ file: '.totem/pilot-state.json', action: 'Initialized pilot state' });
     }
 
-    // --- Universal Lessons baseline ---
-    const baselineResult = await installBaselineLessons(lessonsPath, rl);
+    const lessonsDir = path.join(totemDir, 'lessons');
+    if (!fs.existsSync(lessonsDir)) {
+      fs.mkdirSync(lessonsDir, { recursive: true });
+      // .gitkeep for git tracking of empty directory
+      const gitkeepPath = path.join(lessonsDir, '.gitkeep');
+      if (!fs.existsSync(gitkeepPath)) {
+        fs.writeFileSync(gitkeepPath, '', 'utf-8');
+      }
+      summary.push({ file: '.totem/lessons/', action: 'Created lessons directory' });
+    }
+
+    // --- Baseline lessons (core + detected ecosystem packs) ---
+    const baselinePath = path.join(lessonsDir, 'baseline.md');
+    const detectedEcosystems = detectProject(cwd).ecosystems;
+    const baselineResult = await installBaselineLessons(
+      baselinePath,
+      rl,
+      detectedEcosystems,
+      interactive,
+    );
     if (baselineResult === 'installed') {
-      summary.push({ file: '.totem/lessons.md', action: 'Installed Universal Baseline lessons' });
+      const extraPacks = detectedEcosystems.filter((e) => e !== 'javascript');
+      const packLabel = extraPacks.length > 0 ? ` + ${extraPacks.join(', ')}` : '';
+      summary.push({
+        file: '.totem/lessons/baseline.md',
+        action: `Installed baseline lessons (core${packLabel})`,
+      });
+      // Ecosystems with pre-compiled rules — no need to prompt for compile
+      const compiledEcosystems = new Set(['javascript', 'python', 'rust', 'go']);
+      const uncompiledPacks = detectedEcosystems.filter((e) => !compiledEcosystems.has(e));
+      if (uncompiledPacks.length > 0) {
+        log.dim(
+          'Totem',
+          `${uncompiledPacks.join(', ')} lessons require compilation. Run \`totem compile\` to generate lint rules.`,
+        );
+      }
     }
 
-    // --- Unified AI tool selection ---
-    const detectedTools = detectAiTools(cwd);
-
-    if (detectedTools.length > 0) {
-      const toolNames = detectedTools.map((t) => t.name).join(', ');
-      log.info('Totem', `Detected AI tools: ${bold(toolNames)}`);
-      const toolAnswer = await rl.question(
-        'Which tools should Totem configure? [all/none/select] (default: all): ',
-      );
-
-      let selectedTools: AiToolInfo[];
-      const trimmed = toolAnswer.trim().toLowerCase();
-
-      if (trimmed === 'none') {
-        selectedTools = [];
-      } else if (trimmed === 'select') {
-        selectedTools = [];
-        for (const tool of detectedTools) {
-          const pick = await rl.question(`  Configure ${tool.name}? (Y/n): `);
-          if (pick.trim().toLowerCase() !== 'n' && pick.trim().toLowerCase() !== 'no') {
-            selectedTools.push(tool);
-          }
+    // --- Pre-compiled baseline rules (zero-LLM protection from Day 1) ---
+    let baselineRuleCount = 0;
+    const compiledRulesPath = path.join(totemDir, 'compiled-rules.json');
+    if (!fs.existsSync(compiledRulesPath)) {
+      try {
+        const {
+          COMPILED_BASELINE_RULES,
+          NEW_TYPESCRIPT_RULES,
+          COMPILED_NODEJS_BASELINE,
+          COMPILED_SHELL_BASELINE,
+          COMPILED_PYTHON_BASELINE,
+          COMPILED_RUST_BASELINE,
+          COMPILED_GO_BASELINE,
+        } = await import('../assets/compiled-baseline.js');
+        const allRules = [
+          ...COMPILED_BASELINE_RULES,
+          ...COMPILED_SHELL_BASELINE, // Always included — totem hooks are shell scripts
+        ];
+        if (detectedEcosystems.includes('javascript')) {
+          allRules.push(...NEW_TYPESCRIPT_RULES, ...COMPILED_NODEJS_BASELINE);
         }
-      } else {
-        // 'all' or Enter (default)
-        selectedTools = detectedTools;
+        if (detectedEcosystems.includes('python')) allRules.push(...COMPILED_PYTHON_BASELINE);
+        if (detectedEcosystems.includes('rust')) allRules.push(...COMPILED_RUST_BASELINE);
+        if (detectedEcosystems.includes('go')) allRules.push(...COMPILED_GO_BASELINE);
+        baselineRuleCount = allRules.length;
+        const payload = { version: 1, rules: allRules };
+        fs.writeFileSync(compiledRulesPath, JSON.stringify(payload, null, 2) + '\n');
+        summary.push({
+          file: '.totem/compiled-rules.json',
+          action: `Installed ${baselineRuleCount} pre-compiled baseline rules`,
+        });
+      } catch (err) {
+        log.dim(
+          'Totem',
+          `Could not install pre-compiled rules: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
+    } else {
+      // File already exists — read the rule count for the post-init message
+      try {
+        const existing = JSON.parse(fs.readFileSync(compiledRulesPath, 'utf-8'));
+        baselineRuleCount = Array.isArray(existing?.rules) ? existing.rules.length : 0;
+      } catch {
+        // Parse failure — leave count as 0
+      }
+    }
 
-      // --- MCP scaffolding for selected tools ---
-      for (const tool of selectedTools) {
-        const filePath = path.join(cwd, tool.mcpPath);
-        const result = scaffoldMcpConfig(filePath, tool.serverEntry);
+    if (options?.bare) {
+      log.info('Totem', 'Skipping AI tool and hook installation for bare mode.');
+    } else {
+      // --- Unified AI tool selection ---
+      const detectedTools = detectAiTools(cwd);
 
-        if (result.err) {
-          log.error('Totem', result.err);
-          console.error(
-            `To fix this, add the following manually to your ${tool.mcpPath} under "mcpServers":\n`,
+      if (detectedTools.length > 0) {
+        const toolNames = detectedTools.map((t) => t.name).join(', ');
+        log.info('Totem', `Detected AI tools: ${bold(toolNames)}`);
+        let selectedTools: AiToolInfo[];
+        if (!interactive) {
+          // Non-interactive: the Enter default is 'all'. The per-tool `select` loop is
+          // unreachable from here — it is entered only by an interactive 'select'.
+          selectedTools = detectedTools;
+          log.info(
+            'Totem',
+            `Non-interactive mode — configuring all detected tools (${toolNames}).`,
           );
-          console.error(`  "totem": ${JSON.stringify(tool.serverEntry, null, 2)}\n`);
-        } else if (result.action === 'created') {
-          summary.push({ file: tool.mcpPath, action: `Created with Totem MCP server` });
-        } else if (result.action === 'merged') {
-          summary.push({ file: tool.mcpPath, action: `Added totem to mcpServers` });
-        }
-      }
+        } else {
+          const toolAnswer = await rl.question(
+            'Which tools should Totem configure? [all/none/select] (default: all): ',
+          );
 
-      // --- Reflex injection for selected tools ---
-      for (const tool of selectedTools) {
-        if (!tool.reflexFile) continue;
-        const filePath = path.join(cwd, tool.reflexFile);
-        try {
-          const result = injectReflexes(filePath);
-          if (result === 'injected') {
-            summary.push({ file: tool.reflexFile, action: 'Injected memory reflexes' });
+          const selection = resolveToolSelection(toolAnswer);
+          if (selection === 'none') {
+            selectedTools = [];
+          } else if (selection === 'select') {
+            selectedTools = [];
+            for (const tool of detectedTools) {
+              const pick = await rl.question(`  Configure ${tool.name}? (Y/n): `);
+              if (pick.trim().toLowerCase() !== 'n' && pick.trim().toLowerCase() !== 'no') {
+                selectedTools.push(tool);
+              }
+            }
+          } else {
+            selectedTools = detectedTools;
           }
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          log.error('Totem', `Failed to inject reflexes into ${tool.reflexFile}: ${message}`);
         }
-      }
 
-      // --- Hook installation for selected tools ---
-      for (const tool of selectedTools) {
-        if (!tool.hookInstaller) continue;
-        const results = await tool.hookInstaller(cwd);
-        for (const result of results) {
+        // --- MCP scaffolding for selected tools ---
+        for (const tool of selectedTools) {
+          if (!tool.mcpPath || !tool.serverEntry) continue;
+          const filePath = path.join(cwd, tool.mcpPath);
+          const result = scaffoldMcpConfig(filePath, tool.serverEntry, { projectRoot: cwd });
+
           if (result.err) {
-            log.error('Totem', `Hook scaffolding failed for ${result.file}: ${result.err}`);
+            log.error('Totem Error', result.err); // totem-ignore — result.err is internal scaffolding error, not LLM output
+            console.error(
+              `To fix this, add the following manually to your ${tool.mcpPath} under "mcpServers":\n`,
+            );
+            console.error(`  "totem": ${JSON.stringify(tool.serverEntry, null, 2)}\n`);
           } else if (result.action === 'created') {
-            summary.push({ file: result.file, action: `Scaffolded ${tool.name} hook` });
+            summary.push({ file: tool.mcpPath, action: `Created with Totem MCP server` });
           } else if (result.action === 'merged') {
+            summary.push({ file: tool.mcpPath, action: `Added totem to mcpServers` });
+          } else if (result.existingName !== undefined) {
+            // Package-level dedup hit (mmnto-ai/totem#2601): no append, but the skip is
+            // disclosed rather than silent — the user's registration is under a name
+            // they chose, and a silent no-op reads as init having done nothing.
             summary.push({
-              file: result.file,
-              action: `Merged ${tool.name} hook into existing config`,
+              file: tool.mcpPath,
+              action: `Totem MCP already registered as \`${result.existingName}\` — no duplicate added`,
             });
           }
         }
+
+        // --- Reflex injection & upgrade for selected tools ---
+        const outdatedFiles: Array<{ tool: AiToolInfo; filePath: string }> = [];
+
+        for (const tool of selectedTools) {
+          if (!tool.reflexFile) continue;
+          const filePath = path.join(cwd, tool.reflexFile);
+          try {
+            const result = injectReflexes(filePath);
+            if (result === 'injected') {
+              summary.push({ file: tool.reflexFile, action: 'Injected memory reflexes (v2)' });
+            } else if (result === 'outdated') {
+              outdatedFiles.push({ tool, filePath });
+            }
+          } catch (err) {
+            const message = err instanceof Error ? err.message : String(err);
+            log.error(
+              'Totem Error',
+              `Failed to inject reflexes into ${tool.reflexFile}: ${message}`,
+            );
+          }
+        }
+
+        // Prompt once for all outdated reflex files
+        if (outdatedFiles.length > 0) {
+          const fileList = outdatedFiles.map((f) => f.tool.reflexFile).join(', ');
+          log.warn('Totem', `Outdated reflexes found in: ${bold(fileList)}`);
+
+          let shouldUpgrade = false;
+          if (interactive) {
+            const answer = await rl.question(`Upgrade reflexes to v${REFLEX_VERSION}? (Y/n): `);
+            shouldUpgrade =
+              answer.trim().toLowerCase() !== 'n' && answer.trim().toLowerCase() !== 'no';
+          } else {
+            // Non-interactive (CI/scripted/`--yes`): take the (Y) default, matching
+            // baseline lessons behavior.
+            shouldUpgrade = true;
+            log.info('Totem', 'Non-interactive mode — auto-upgrading reflexes.');
+          }
+
+          if (shouldUpgrade) {
+            for (const { tool, filePath } of outdatedFiles) {
+              try {
+                const clean = applyReflexUpgrade(filePath);
+                if (clean) {
+                  summary.push({
+                    file: tool.reflexFile!,
+                    action: `Upgraded reflexes to v${REFLEX_VERSION}`,
+                  });
+                } else {
+                  summary.push({
+                    file: tool.reflexFile!,
+                    action: `Appended v${REFLEX_VERSION} reflexes (manual cleanup needed — remove old block)`,
+                  });
+                  log.warn(
+                    'Totem',
+                    `Could not cleanly replace old reflexes in ${tool.reflexFile}. New block appended — please remove the old one manually.`,
+                  );
+                }
+              } catch (err) {
+                const message = err instanceof Error ? err.message : String(err);
+                log.error(
+                  'Totem Error',
+                  `Failed to upgrade reflexes in ${tool.reflexFile}: ${message}`,
+                );
+              }
+            }
+          } else {
+            for (const { tool } of outdatedFiles) {
+              summary.push({
+                file: tool.reflexFile!,
+                action: 'Outdated reflexes — upgrade declined',
+              });
+            }
+          }
+        }
+
+        // --- Hook installation for selected tools ---
+        for (const tool of selectedTools) {
+          if (!tool.hookInstaller) continue;
+          const results = await tool.hookInstaller(cwd, {
+            forceSkillRefresh: options?.forceSkillRefresh === true,
+          });
+          for (const result of results) {
+            if (result.err) {
+              log.error('Totem Error', `Hook scaffolding failed for ${result.file}: ${result.err}`); // totem-ignore — internal hook installer error
+            } else if (result.action === 'created') {
+              summary.push({
+                file: result.file,
+                action: result.summaryActionOverride ?? `Scaffolded ${tool.name} hook`,
+              });
+            } else if (result.action === 'merged') {
+              summary.push({
+                file: result.file,
+                action:
+                  result.summaryActionOverride ?? `Merged ${tool.name} hook into existing config`,
+              });
+            } else if (
+              (result.action === 'skipped' || result.action === 'exists') &&
+              result.summaryActionOverride
+            ) {
+              // A no-op an installer chose to DISCLOSE (mmnto-ai/totem#2601 vendor-hook
+              // guard). Bare `skipped`/`exists` stay silent; an override means the user
+              // must know why the file was left alone. `exists` carries one too: a
+              // custom `.js` coexisting with an already-canonical managed `.cjs` is the
+              // same live double-fire hazard as the drift-repaired case, and the fact
+              // that nothing needed rewriting must not silence it.
+              summary.push({ file: result.file, action: result.summaryActionOverride });
+            }
+          }
+        }
       }
-    }
 
-    // --- Always run: enforcement hooks (pre-commit + pre-push) ---
-    const enforcement = await installEnforcementHooks(cwd, rl);
-    if (enforcement.preCommit === 'installed' || enforcement.preCommit === 'appended') {
-      summary.push({
-        file: '.git/hooks/pre-commit',
-        action: `${enforcement.preCommit === 'installed' ? 'Installed' : 'Appended'} main-branch protection`,
-      });
-    } else if (enforcement.preCommit === 'skipped-non-shell') {
-      summary.push({
-        file: '.git/hooks/pre-commit',
-        action: 'Skipped — non-shell hook detected (manual integration needed)',
-      });
-    }
-    if (enforcement.prePush === 'installed' || enforcement.prePush === 'appended') {
-      summary.push({
-        file: '.git/hooks/pre-push',
-        action: `${enforcement.prePush === 'installed' ? 'Installed' : 'Appended'} deterministic shield gate`,
-      });
-    } else if (enforcement.prePush === 'skipped-non-shell') {
-      summary.push({
-        file: '.git/hooks/pre-push',
-        action: 'Skipped — non-shell hook detected (manual integration needed)',
-      });
-    }
+      // --- Always run: init-distributed prepare wrapper (mmnto-ai/totem#2410 PR-B) ---
+      // Scaffold .totem/prepare.cjs (managed, marker + end-marker bounded — a roster
+      // member so `totem hook install` drift-repairs it) and wire the consumer's
+      // package.json `prepare` to invoke it, so every `pnpm install` self-repairs the
+      // managed hooks. A DIFFERENT existing `prepare` is never overwritten (Prop 289):
+      // init declines and prints the canonical line to add manually.
+      const preparePath = path.join(cwd, ...PREPARE_SCRIPT_REL.split('/'));
+      const prepareScaffold = scaffoldFile(
+        preparePath,
+        PREPARE_WRAPPER,
+        TOTEM_FILE_MARKER,
+        TOTEM_FILE_END,
+      );
+      if (prepareScaffold.err) {
+        log.error('Totem Error', `Prepare wrapper scaffolding failed: ${prepareScaffold.err}`); // totem-ignore — internal scaffold error, not LLM output
+      } else if (prepareScaffold.action === 'created') {
+        summary.push({
+          file: PREPARE_SCRIPT_REL,
+          action: 'Scaffolded init-distributed prepare wrapper',
+        });
+      } else if (prepareScaffold.action === 'refreshed') {
+        summary.push({ file: PREPARE_SCRIPT_REL, action: 'Drift-repaired prepare wrapper' });
+      }
 
-    // --- Always run: post-merge git hook ---
-    await installPostMergeHook(cwd, rl);
+      const prepareWiring = wirePreparePackageJson(path.join(cwd, 'package.json'));
+      if (prepareWiring.action === 'wired') {
+        summary.push({
+          file: 'package.json',
+          action: `Wired \`prepare\` → ${PREPARE_SCRIPT_COMMAND}`,
+        });
+      } else if (prepareWiring.action === 'declined') {
+        log.warn(
+          'Totem',
+          `package.json already defines a different \`prepare\` script — leaving it unchanged. ` +
+            `To run the Totem hook installer on install, add "prepare": "${PREPARE_SCRIPT_COMMAND}" ` +
+            `(or chain it into your existing prepare script).`,
+        );
+      } else if (
+        (prepareWiring.action === 'unparseable' || prepareWiring.action === 'write-failed') &&
+        prepareWiring.err
+      ) {
+        log.warn('Totem', prepareWiring.err);
+      }
+      // 'exists' (already canonical) and 'missing' (no package.json) are silent no-ops.
 
-    // --- Always run: .gitignore ---
-    const gitignorePath = path.join(cwd, '.gitignore');
-    if (fs.existsSync(gitignorePath)) {
-      const gitignore = fs.readFileSync(gitignorePath, 'utf-8');
-      if (!gitignore.includes('.lancedb')) {
-        fs.appendFileSync(gitignorePath, '\n# Totem\n.lancedb/\n');
-        summary.push({ file: '.gitignore', action: 'Added .lancedb/ exclusion' });
+      // --- Always run: enforcement hooks (pre-commit + pre-push) ---
+      const hookTier = options?.strict ? 'strict' : undefined;
+      const enforcement = await installEnforcementHooks(cwd, rl, {
+        tier: hookTier,
+        interactive,
+      });
+      if (enforcement.preCommit === 'installed' || enforcement.preCommit === 'appended') {
+        summary.push({
+          file: '.git/hooks/pre-commit',
+          action: `${enforcement.preCommit === 'installed' ? 'Installed' : 'Appended'} main-branch protection`,
+        });
+      } else if (enforcement.preCommit === 'skipped-non-shell') {
+        summary.push({
+          file: '.git/hooks/pre-commit',
+          action: 'Skipped — non-shell hook detected (manual integration needed)',
+        });
+      }
+      if (enforcement.prePush === 'installed' || enforcement.prePush === 'appended') {
+        summary.push({
+          file: '.git/hooks/pre-push',
+          action: `${enforcement.prePush === 'installed' ? 'Installed' : 'Appended'} deterministic shield gate`,
+        });
+      } else if (enforcement.prePush === 'skipped-non-shell') {
+        summary.push({
+          file: '.git/hooks/pre-push',
+          action: 'Skipped — non-shell hook detected (manual integration needed)',
+        });
+      }
+
+      // --- Always run: post-merge git hook ---
+      await installPostMergeHook(cwd, rl, { interactive });
+
+      // --- Always run: .gitignore ---
+      const gitignorePath = path.join(cwd, '.gitignore');
+      if (fs.existsSync(gitignorePath)) {
+        const gitignore = fs.readFileSync(gitignorePath, 'utf-8');
+        if (!gitignore.includes('.lancedb')) {
+          fs.appendFileSync(gitignorePath, '\n# Totem\n.lancedb/\n');
+          summary.push({ file: '.gitignore', action: 'Added .lancedb/ exclusion' });
+        }
+        // Ensure secrets.json is gitignored (safety net — add-secret also does this)
+        const refreshed = fs.readFileSync(gitignorePath, 'utf-8');
+        const lines = refreshed.split(/\r?\n/);
+        if (!lines.some((line) => line.trim() === '.totem/secrets.json')) {
+          const separator = refreshed.endsWith('\n') ? '' : '\n';
+          fs.writeFileSync(gitignorePath, `${refreshed}${separator}.totem/secrets.json\n`, 'utf-8');
+          summary.push({ file: '.gitignore', action: 'Added .totem/secrets.json exclusion' });
+        }
+      } else {
+        // No .gitignore exists yet — create one with .lancedb/ and secrets entry
+        fs.writeFileSync(gitignorePath, '# Totem\n.lancedb/\n.totem/secrets.json\n', 'utf-8');
+        summary.push({
+          file: '.gitignore',
+          action: 'Created with .lancedb/ and .totem/secrets.json exclusions',
+        });
+      }
+
+      // --- Auto-ingest cursor rules (ADR-048) ---
+      const { scanCursorInstructions } = await import('@mmnto/totem');
+      const cursorInstructions = scanCursorInstructions(cwd);
+      if (cursorInstructions.length > 0) {
+        // The one non-interactive default that is NOT the Enter default: compiling is
+        // an LLM-driven rewrite of compiled-rules.json, so it stays opt-in and the
+        // manual command is disclosed instead (mmnto-ai/totem#2601).
+        let shouldCompile = false;
+        if (interactive) {
+          const answer = await rl.question(
+            `\nFound ${cursorInstructions.length} existing AI rule(s) (.cursorrules / .mdc). Compile into deterministic invariants? (Y/n): `,
+          );
+          shouldCompile =
+            answer.trim().toLowerCase() !== 'n' && answer.trim().toLowerCase() !== 'no';
+        } else {
+          log.info(
+            'Totem',
+            `Non-interactive mode — found ${cursorInstructions.length} existing AI rule(s) (.cursorrules / .mdc); not compiling. Run \`totem compile --from-cursor\` to compile them.`,
+          );
+        }
+        if (shouldCompile) {
+          try {
+            const { compileCommand } = await import('./compile.js');
+            await compileCommand({ fromCursor: true });
+            summary.push({
+              file: '.totem/compiled-rules.json',
+              action: `Compiled ${cursorInstructions.length} cursor rule(s) into invariants`,
+            });
+          } catch (err) {
+            const detail = err instanceof Error ? err.message : String(err);
+            log.warn('Totem', `Could not compile cursor rules: ${detail}`);
+          }
+        }
+      }
+    } // end of bare mode else block
+
+    // --- Always run: action-gate install (--gates=, PR-C mmnto-ai/totem#2048) ---
+    // Thin sugar that is INTENTIONALLY outside the bare-mode branch: gate
+    // opt-in is an independent, explicit flag (it works in bare repos too).
+    // Parses the comma-list (or `all`), validates each member against
+    // knownGateEvents() (fail loud on unknown), and routes through the SAME
+    // installGates() path the `gate install` verb uses — no second copy of
+    // the merge logic.
+    if (options?.gates) {
+      const { resolveGateEvents } = await import('./gate.js');
+      const { installGates } = await import('./gate-install.js');
+      const { TotemError, knownGateEvents } = await import('@mmnto/totem');
+      const requested = options.gates.trim();
+      let gateEvents: string[];
+      if (requested.toLowerCase() === 'all') {
+        gateEvents = await resolveGateEvents({ all: true });
+      } else {
+        const names = requested
+          .split(',')
+          .map((n) => n.trim())
+          .filter((n) => n.length > 0);
+        // Empty after parse/trim/filter (e.g. `--gates=,` or whitespace-only):
+        // fail loud rather than scaffolding an orphan wrapper with no entry.
+        // Restores parity with the verb's resolveGateEvents no-selection
+        // fail-loud (no default-install).
+        if (names.length === 0) {
+          throw new TotemError(
+            'GATE_INVALID',
+            'No gate selected in --gates=.',
+            `Pass --gates=all or one of: ${knownGateEvents().join(', ')}.`,
+          );
+        }
+        gateEvents = [];
+        for (const name of names) {
+          // resolveGateEvents validates a single name against the registry
+          // and throws (fail-loud) on unknown — no default-install.
+          const [validated] = await resolveGateEvents({ name });
+          // resolveGateEvents returns a non-empty array or throws, so this
+          // never fires today — but guard explicitly (no fragile `!`): fail
+          // loud rather than push `undefined` if it ever returns empty.
+          if (!validated) {
+            throw new TotemError(
+              'GATE_INVALID',
+              `Gate "${name}" did not resolve.`,
+              'This is an internal error — the gate registry returned no event for a validated name.',
+            );
+          }
+          gateEvents.push(validated);
+        }
+      }
+
+      // Tier is derived from the existing init options (pilot vs strict) and
+      // BAKED into the installed command at install time (the wrapper reads it
+      // ONLY from argv — no env override). Default install bakes --strict.
+      const gateTier = options?.pilot ? 'pilot' : 'strict';
+      const gateResults = installGates(cwd, gateEvents, gateTier);
+      for (const result of gateResults) {
+        if (result.err) {
+          log.error('Totem Error', `Gate install failed for ${result.file}: ${result.err}`);
+        } else if (result.action === 'created') {
+          summary.push({
+            file: result.file,
+            action: result.event ? `Scaffolded gate "${result.event}"` : 'Scaffolded gate wrapper',
+          });
+        } else if (result.action === 'merged') {
+          summary.push({
+            file: result.file,
+            action: `Installed gate "${result.event}" into existing config`,
+          });
+        } else if (result.action === 'updated') {
+          // Tier switch on a re-init — the one existing entry was rewritten in
+          // place (NOT the misleading "already present — no change" no-op).
+          summary.push({
+            file: result.file,
+            action: `Updated gate "${result.event}" tier to ${gateTier}`,
+          });
+        }
       }
     }
 
@@ -872,7 +1989,13 @@ export async function initCommand(): Promise<void> {
       console.error(brand('--------------------------'));
     }
 
-    log.success('Totem', 'Init complete. Run `totem sync` to index your project.');
+    log.success(
+      'Totem',
+      options?.bare
+        ? `Init complete.${baselineRuleCount ? ` ${baselineRuleCount} baseline rules are active.` : ''}\n` +
+            '[Totem] Try it: write an empty `catch(e) {}` block and run `npx totem lint` — watch what happens.'
+        : 'Init complete. Run `totem sync` to index your project.',
+    );
   } finally {
     rl.close();
   }

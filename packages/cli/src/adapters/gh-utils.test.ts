@@ -1,15 +1,27 @@
-import { execFileSync } from 'node:child_process';
-
 import { describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 
-import { ghFetchAndParse, handleGhError } from './gh-utils.js';
+import { safeExec } from '@mmnto/totem';
 
-vi.mock('node:child_process', () => ({
-  execFileSync: vi.fn(),
-}));
+import { ghExec, ghFetchAndParse, handleGhError } from './gh-utils.js';
 
-const mockedExec = vi.mocked(execFileSync);
+// Mock `safeExec` at the `@mmnto/totem` boundary rather than at its
+// internal `cross-spawn.sync` call site. mmnto/totem#1329 replaced
+// `execFileSync` with `cross-spawn.sync` inside safeExec, and the
+// previous test strategy (mocking `node:child_process.execFileSync`)
+// stopped intercepting safeExec's new internal primitive. Mocking the
+// package boundary is also more appropriately scoped — gh-utils tests
+// should verify gh-utils's call signature, not safeExec's passthrough
+// layer.
+vi.mock('@mmnto/totem', async () => {
+  const actual = await vi.importActual<typeof import('@mmnto/totem')>('@mmnto/totem');
+  return {
+    ...actual,
+    safeExec: vi.fn(),
+  };
+});
+
+const mockedExec = vi.mocked(safeExec);
 
 // ─── handleGhError ──────────────────────────────────────
 
@@ -39,6 +51,14 @@ describe('handleGhError', () => {
     expect(() => handleGhError(err, 'test')).toThrow('[Totem Error] GitHub CLI (gh) is required');
   });
 
+  it('detects ENOENT from safeExec error chain (cause wrapping)', () => {
+    const cause = new Error('spawn gh ENOENT');
+    const wrapper = new Error('Command failed: gh repo view', { cause });
+    expect(() => handleGhError(wrapper, 'test')).toThrow(
+      '[Totem Error] GitHub CLI (gh) is required',
+    );
+  });
+
   it('wraps unknown errors with context', () => {
     const err = new Error('connection refused');
     expect(() => handleGhError(err, 'open PRs')).toThrow(
@@ -63,6 +83,22 @@ describe('handleGhError', () => {
   });
 });
 
+// ─── ghExec ─────────────────────────────────────────────
+
+describe('ghExec', () => {
+  it('uses shared exec options with GH_PROMPT_DISABLED', () => {
+    mockedExec.mockReturnValue('');
+    ghExec(['issue', 'comment', '1', '-b', 'test'], '/cwd');
+    expect(mockedExec).toHaveBeenCalledWith(
+      'gh',
+      ['issue', 'comment', '1', '-b', 'test'],
+      expect.objectContaining({
+        env: expect.objectContaining({ GH_PROMPT_DISABLED: '1' }),
+      }),
+    );
+  });
+});
+
 // ─── ghFetchAndParse ────────────────────────────────────
 
 const TestSchema = z.object({ id: z.number(), name: z.string() });
@@ -74,13 +110,13 @@ describe('ghFetchAndParse', () => {
     expect(result).toEqual({ id: 1, name: 'test' });
   });
 
-  it('passes correct args to execFileSync', () => {
+  it('passes correct args to safeExec', () => {
     mockedExec.mockReturnValue(JSON.stringify({ id: 1, name: 'test' }));
     ghFetchAndParse(['pr', 'list', '--state', 'open'], TestSchema, 'test', '/cwd');
     expect(mockedExec).toHaveBeenCalledWith(
       'gh',
       ['pr', 'list', '--state', 'open'],
-      expect.objectContaining({ cwd: '/cwd', encoding: 'utf-8' }),
+      expect.objectContaining({ cwd: '/cwd' }),
     );
   });
 
@@ -112,7 +148,17 @@ describe('ghFetchAndParse', () => {
       throw new Error('timeout exceeded');
     });
     expect(() => ghFetchAndParse(['test'], TestSchema, 'PR #5', '/cwd')).toThrow(
-      '[Totem Error] Failed to fetch PR #5: timeout exceeded',
+      /\[Totem Error\] Failed to fetch PR #5:.*timeout exceeded/,
+    );
+  });
+
+  it('sets GH_PROMPT_DISABLED to prevent interactive auth hangs', () => {
+    mockedExec.mockReturnValue(JSON.stringify({ id: 1, name: 'test' }));
+    ghFetchAndParse(['issue', 'view', '1'], TestSchema, 'issue #1', '/cwd');
+    expect(mockedExec).toHaveBeenCalledWith(
+      'gh',
+      ['issue', 'view', '1'],
+      expect.objectContaining({ env: expect.objectContaining({ GH_PROMPT_DISABLED: '1' }) }),
     );
   });
 });

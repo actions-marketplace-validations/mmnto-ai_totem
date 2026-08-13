@@ -1,14 +1,20 @@
-import { execFileSync } from 'node:child_process';
-
 import { describe, expect, it, vi } from 'vitest';
+
+import { safeExec } from '@mmnto/totem';
 
 import { GitHubCliAdapter } from './github-cli.js';
 
-vi.mock('node:child_process', () => ({
-  execFileSync: vi.fn(),
-}));
+// Mock safeExec at the @mmnto/totem boundary (mmnto/totem#1329).
+// See gh-utils.test.ts for the full rationale.
+vi.mock('@mmnto/totem', async () => {
+  const actual = await vi.importActual<typeof import('@mmnto/totem')>('@mmnto/totem');
+  return {
+    ...actual,
+    safeExec: vi.fn(),
+  };
+});
 
-const mockedExec = vi.mocked(execFileSync);
+const mockedExec = vi.mocked(safeExec);
 
 describe('GitHubCliAdapter', () => {
   const adapter = new GitHubCliAdapter('/test/cwd');
@@ -93,18 +99,47 @@ describe('GitHubCliAdapter', () => {
 
     it('throws on invalid JSON', () => {
       mockedExec.mockReturnValue('not json');
-      expect(() => adapter.fetchOpenIssues()).toThrow(
-        '[Totem Error] GitHub CLI returned invalid JSON for open issues. Run `gh auth status` to check your authentication.',
-      );
+      expect(() => adapter.fetchOpenIssues()).toThrow('GitHub CLI returned invalid JSON');
     });
 
     it('throws install message when gh is not found', () => {
       mockedExec.mockImplementation(() => {
         throw new Error('ENOENT');
       });
-      expect(() => adapter.fetchOpenIssues()).toThrow(
-        '[Totem Error] GitHub CLI (gh) is required. Install: https://cli.github.com',
+      expect(() => adapter.fetchOpenIssues()).toThrow('GitHub CLI (gh) is required');
+    });
+  });
+
+  describe('fetchOpenIssuesWithBody', () => {
+    it('returns mapped issue items including body', () => {
+      mockedExec.mockReturnValue(
+        JSON.stringify([
+          {
+            number: 10,
+            title: 'Epic',
+            body: 'parent stuff',
+            labels: [{ name: 'type: epic' }],
+          },
+          { number: 11, title: 'Child', body: '**Parent:** #10', labels: [] },
+        ]),
       );
+      const result = adapter.fetchOpenIssuesWithBody();
+      expect(result).toEqual([
+        { number: 10, title: 'Epic', body: 'parent stuff', labels: ['type: epic'] },
+        { number: 11, title: 'Child', body: '**Parent:** #10', labels: [] },
+      ]);
+    });
+
+    it('normalizes null body to empty string', () => {
+      mockedExec.mockReturnValue(
+        JSON.stringify([{ number: 1, title: 'No body', body: null, labels: [] }]),
+      );
+      expect(adapter.fetchOpenIssuesWithBody()[0]!.body).toBe('');
+    });
+
+    it('returns empty array when no open issues', () => {
+      mockedExec.mockReturnValue('[]');
+      expect(adapter.fetchOpenIssuesWithBody()).toEqual([]);
     });
   });
 });

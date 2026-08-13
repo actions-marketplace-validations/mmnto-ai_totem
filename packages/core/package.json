@@ -1,14 +1,37 @@
 {
   "name": "@mmnto/totem",
-  "version": "0.27.0",
-  "description": "Persistent memory and context layer for AI agents",
+  "version": "1.116.0",
+  "description": "Core engine for Totem, the local-first toolkit that keeps AI-agent work queryable, enforceable, and derivable as plain files in your codebase",
   "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./config": {
+      "types": "./dist/config.d.ts",
+      "import": "./dist/config.js"
+    },
+    "./lessons": {
+      "types": "./dist/lessons.d.ts",
+      "import": "./dist/lessons.js"
+    },
+    "./artifacts": {
+      "types": "./dist/artifacts.d.ts",
+      "import": "./dist/artifacts.js"
+    },
+    "./packs": {
+      "types": "./dist/packs.d.ts",
+      "import": "./dist/packs.js"
+    },
+    "./fs-atomic": {
+      "types": "./dist/fs-atomic.d.ts",
+      "import": "./dist/fs-atomic.js"
     }
   },
   "scripts": {
@@ -19,13 +42,16 @@
     "test": "vitest run"
   },
   "dependencies": {
-    "@lancedb/lancedb": "^0.13.0",
+    "@ast-grep/napi": "^0.42.0",
+    "@lancedb/lancedb": "^0.26.2",
     "apache-arrow": "17.0.0",
+    "cross-spawn": "^7.0.6",
     "glob": "^11.0.0",
     "openai": "^4.77.0",
     "remark-frontmatter": "^5.0.0",
     "remark-parse": "^11.0.0",
     "safe-regex2": "^5.0.0",
+    "semver": "^7.7.0",
     "tree-sitter-javascript": "^0.25.0",
     "tree-sitter-typescript": "^0.23.2",
     "typescript": "^5.7.0",
@@ -34,8 +60,19 @@
     "yaml": "^2.4.0",
     "zod": "^3.24.0"
   },
+  "peerDependencies": {
+    "@google/genai": ">=2.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@google/genai": {
+      "optional": true
+    }
+  },
   "devDependencies": {
+    "@ast-grep/wasm": "^0.42.1",
+    "@types/cross-spawn": "^6.0.6",
     "@types/mdast": "^4.0.0",
+    "@types/semver": "^7.5.0",
     "vitest": "^3.0.0"
   },
   "files": [
@@ -53,6 +90,7 @@
     "url": "https://github.com/mmnto-ai/totem/issues"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "provenance": true
   }
 }

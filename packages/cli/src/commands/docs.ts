@@ -1,21 +1,18 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-
 import type { DocTarget, SagaViolation } from '@mmnto/totem';
-import { validateDocUpdate } from '@mmnto/totem';
 
-import { GitHubCliAdapter } from '../adapters/github-cli.js';
-import { getGitLogSince, getLatestTag, isFileDirty } from '../git.js';
-import { log } from '../ui.js';
-import {
-  getSystemPrompt,
-  loadConfig,
-  loadEnv,
-  resolveConfigPath,
-  runOrchestrator,
-  wrapXml,
-  writeOutput,
-} from '../utils.js';
+// ─── Helpers ─────────────────────────────────────────────
+
+/**
+ * Resolve whether a doc target should receive user-facing post-processing
+ * (issue ref stripping, manual content injection, live metrics).
+ * Explicit `userFacing` flag wins; otherwise falls back to readme.md detection.
+ */
+export function resolveIsUserFacing(doc: DocTarget): boolean {
+  if (typeof doc.userFacing === 'boolean') return doc.userFacing;
+  // Inline basename logic to avoid top-level `path` import
+  const name = doc.path.replace(/\\/g, '/').split('/').pop() ?? '';
+  return name.toLowerCase() === 'readme.md';
+}
 
 // ─── Constants ──────────────────────────────────────────
 
@@ -39,7 +36,9 @@ Given a documentation file, its purpose, and recent project changes (git log, cl
 - **Preserve Structure:** Maintain the existing document's structure, tone, and formatting conventions unless changes require restructuring.
 - **Evidence-Based:** Only update information that is supported by the provided git log, closed issues, or active work context. Do NOT invent features or status changes.
 - **Phase Numbering:** If the document references phases, use ONLY the phase numbering from the provided active_work.md context. Do NOT change or renumber phases.
-- **Conservative Updates:** When in doubt, keep the existing text. Only change what the evidence supports.
+- **Staleness Protocol:** The provided active_work context is the Ground Truth for what is currently in progress. If the existing document references tickets, milestones, or features as "upcoming", "planned", or "in progress" but they DO NOT appear in the active_work context, treat them as completed or removed. Aggressively rewrite forward-looking sections (roadmaps, active work, upcoming features) to match the Ground Truth. Preserve historical sections (changelogs, completed milestones) as-is.
+- **Empty Context Safety:** If the active_work context is not provided, do not delete roadmap sections. Instead, preserve existing content and add a note that the information may be stale.
+- **Manual Content:** If \`<manual_content>\` blocks are provided, include them VERBATIM in the appropriate section of the document. Do NOT rewrite, summarize, or omit any part of manual content. These are hand-written by the maintainer and must survive regeneration.
 - **Checkbox Integrity:** NEVER change the checked/unchecked state of markdown checkboxes (\`[x]\` / \`[ ]\`) unless the commit history explicitly contains a revert, deprecation, or re-opening of the referenced item. Priority rankings in active_work.md are NOT evidence of completion status.
 - **XML Wrapper (MANDATORY):** Wrap your ENTIRE output inside \`<updated_document>\` and \`</updated_document>\` tags. No text before or after the tags. No markdown code fences. Example:
 
@@ -50,11 +49,28 @@ Updated content here...
 </updated_document>
 \`\`\`
 
+## Pinned Content (DO NOT change)
+- **README hook**: The opening italic is: "AI coding agents are brilliant goldfish. Totem gives them a memory." Do not remove or rephrase this line.
+- **README value prop**: The core pitch ends with: "Write what you learned in plain English. Totem compiles it into a rule. That mistake physically cannot happen again." Do not weaken this language.
+- **Flywheel diagram**: The mermaid diagram showing Observe → Learn → Enforce must remain. Do not remove or replace it.
+- **Performance claim**: The rule count changes with each compile. Read the current count from the LIVE METRICS section if available, otherwise keep the existing number.
+- **Commitment section**: The open-source commitment block near the bottom is hand-maintained. Do not rewrite or remove it — preserve verbatim.
+
+## Command Glossary (DO NOT confuse these)
+- **\`totem lint\`**: Runs compiled AST/regex rules against a diff. Zero LLM. Fast (~2s). No API keys needed. Used in pre-push hooks and CI. Lives in the Lite configuration tier.
+- **\`totem review\`**: Supplementary AI review lanes over the diff — advisory sensors, not a merge gate. Queries LanceDB for context, sends diff + knowledge to an LLM. Slow (~18s). Requires API keys. Run before opening PRs, alongside (never instead of) the team's own review. Lives in the Full configuration tier.
+- These are DIFFERENT commands with DIFFERENT purposes. Never describe \`review\` as "deterministic" or \`lint\` as "AI-powered."
+
+## Writing Style (MANDATORY)
+- **No Marketing Language:** NEVER use marketing-centric terms: "comprehensive", "robust", "seamless", "cutting-edge", "state-of-the-art", "revolutionary", "guarantee", "guarantees". Use objective, factual descriptions instead. Say what the feature does, not how impressive it is.
+
 ## Formatting Rules
 - **Sub-Bullet Threshold:** When a feature list exceeds 3 items, use nested sub-bullets instead of comma-separated inline lists. Group related items into named categories (e.g., "Security:", "DX:", "Orchestration:").
 - **Completed Phase Summary:** Phases marked \`[x]\` should be summarized in 1-2 sentences max. Do NOT expand completed phases with every PR number — use categorized sub-bullets for the key capability areas only.
 - **Line Length:** No single bullet point should exceed two short sentences. If it does, break it into sub-bullets or summarize. Readability is more important than completeness.
-- **PR References:** Reference PR numbers sparingly — only for the most significant items (1-3 per sub-bullet). Do NOT list every PR number for a capability area.
+- **No Issue/PR References:** NEVER include GitHub issue or PR references (e.g., \`#714\`, \`(#801)\`, \`(#714, #801)\`) in user-facing documentation. These are internal tracking artifacts. Describe features by what they do, not by which ticket shipped them.
+- **No Internal Jargon:** Do not use internal terms like "Pipeline 1", "Pipeline 2", "ADR-058", or "Proposal 186" in user-facing copy. Use plain language that a new user would understand.
+- **No Maintenance Comments:** Do not include comments about how documentation is maintained, generated, or structured. The output is the final document, not a template.
 `;
 
 // ─── Release context gathering ──────────────────────────
@@ -65,7 +81,11 @@ interface ReleaseContext {
   closedIssues: string;
 }
 
-function gatherReleaseContext(cwd: string): ReleaseContext {
+async function gatherReleaseContext(cwd: string): Promise<ReleaseContext> {
+  const { GitHubCliAdapter } = await import('../adapters/github-cli.js');
+  const { getGitLogSince, getLatestTag } = await import('../git.js');
+  const { log } = await import('../ui.js');
+
   const tag = getLatestTag(cwd);
   const gitLog = getGitLogSince(cwd, tag ?? undefined);
 
@@ -87,13 +107,19 @@ function gatherReleaseContext(cwd: string): ReleaseContext {
 
 // ─── Prompt assembly ────────────────────────────────────
 
-function assemblePrompt(
+export async function assemblePrompt(
   doc: DocTarget,
   currentContent: string,
   releaseContext: ReleaseContext,
   activeWork: string,
   systemPrompt: string,
-): string {
+  cwd: string,
+  totemDir: string,
+): Promise<string> {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { wrapXml } = await import('../utils.js');
+
   const sections: string[] = [systemPrompt];
 
   // Document metadata
@@ -133,8 +159,85 @@ function assemblePrompt(
 
   // Active work context
   if (activeWork) {
-    sections.push('\n=== ACTIVE WORK (SOURCE OF TRUTH FOR PHASES & PRIORITIES) ===');
+    sections.push(
+      '\n=== ACTIVE WORK (GROUND TRUTH — items NOT listed here are completed/removed) ===',
+    );
     sections.push(wrapXml('active_work', activeWork));
+  } else {
+    sections.push('\n=== ACTIVE WORK ===');
+    sections.push(
+      wrapXml(
+        'context_note',
+        'No active work context provided. If the document has a roadmap or "upcoming" section, preserve the existing content but add a note that the information may be stale.',
+      ),
+    );
+  }
+
+  // Manual content — only inject into user-facing docs, not internal docs
+  const isUserFacing = resolveIsUserFacing(doc);
+  if (isUserFacing) {
+    try {
+      const manualPath = path.resolve('docs', 'manual');
+      if (fs.existsSync(manualPath)) {
+        const manualFiles = fs.readdirSync(manualPath).filter((f) => f.endsWith('.md'));
+        for (const file of manualFiles) {
+          const content = fs.readFileSync(path.join(manualPath, file), 'utf-8');
+          sections.push('\n=== MANUAL CONTENT (INCLUDE VERBATIM — DO NOT REWRITE) ===');
+          sections.push(`Source: docs/manual/${file}`);
+          sections.push(
+            'IMPORTANT: The following content is manually maintained. Include it in the appropriate ' +
+              'section of the document WITHOUT rewriting, summarizing, or omitting any part of it.',
+          );
+          sections.push(wrapXml('manual_content', content));
+        }
+      }
+    } catch {
+      // Manual dir doesn't exist or can't be read — skip silently
+    }
+  }
+
+  // Dynamic metrics — inject live counts so the LLM uses accurate numbers
+  if (isUserFacing) {
+    const metrics: string[] = [];
+    try {
+      const rulesPath = path.join(cwd, totemDir, 'compiled-rules.json');
+      if (fs.existsSync(rulesPath)) {
+        const rulesData = JSON.parse(fs.readFileSync(rulesPath, 'utf-8'));
+        metrics.push(`Total compiled rules: ${rulesData.rules?.length ?? 'unknown'}`);
+      }
+    } catch {
+      // compiled-rules.json unreadable
+    }
+    try {
+      const baselinePath = path.join(
+        cwd,
+        'packages',
+        'cli',
+        'src',
+        'assets',
+        'compiled-baseline.ts',
+      );
+      if (fs.existsSync(baselinePath)) {
+        const baselineContent = fs.readFileSync(baselinePath, 'utf-8');
+        const count = (baselineContent.match(/lessonHash\s*:/g) || []).length;
+        metrics.push(`Baseline rules shipped with totem init: ${count}`);
+      }
+    } catch {
+      // baseline file unreadable
+    }
+    try {
+      const lessonsDir = path.join(cwd, totemDir, 'lessons');
+      if (fs.existsSync(lessonsDir)) {
+        const count = fs.readdirSync(lessonsDir).filter((f) => f.endsWith('.md')).length;
+        metrics.push(`Total lessons in knowledge base: ${count}`);
+      }
+    } catch {
+      // lessons dir unreadable
+    }
+    if (metrics.length > 0) {
+      sections.push('\n=== LIVE METRICS (USE THESE EXACT NUMBERS — DO NOT GUESS) ===');
+      sections.push(metrics.join('\n'));
+    }
   }
 
   return sections.join('\n');
@@ -153,9 +256,77 @@ export function extractUpdatedDocument(response: string): string | null {
   return match ? match[1]! : null;
 }
 
+/**
+ * Strip GitHub issue/PR references from user-facing docs.
+ * Handles: (#123), (#123, #456), (fixes #123), standalone #123 in prose.
+ */
+export function stripIssueRefs(content: string): string {
+  return (
+    content
+      // Remove parenthesized refs: "(#123)", "(#123, #456)", "(fixes #123)"
+      .replace(/\s*\((?:(?:fixes|closes|resolves|refs?)\s+)?#\d+(?:\s*,\s*#\d+)*\)/gi, '')
+      // Remove standalone refs in prose: "security hardening #801" → "security hardening"
+      .replace(/\s+#(\d{3,})\b/g, (match, num) => {
+        // Preserve anchors like "#my-heading" and short numbers
+        return parseInt(num, 10) >= 100 ? '' : match;
+      })
+      // Clean up double spaces left behind
+      .replace(/ {2,}/g, ' ')
+      // Clean up trailing spaces on lines
+      .replace(/ +$/gm, '')
+  );
+}
+
+/**
+ * Replace marketing-centric terms with factual alternatives in generated docs.
+ * Deterministic post-processing — does not rely on LLM compliance.
+ */
+/** Map of marketing terms to their factual replacements (lowercase). */
+const MARKETING_MAP: Record<string, string> = {
+  comprehensive: 'thorough',
+  robust: 'reliable',
+  seamlessly: 'smoothly',
+  seamless: 'smooth',
+  'cutting-edge': 'modern',
+  'state-of-the-art': 'current',
+  revolutionary: 'significant',
+  guarantees: 'ensures',
+  guarantee: 'ensure',
+};
+
+const MARKETING_RE = new RegExp(`\\b(${Object.keys(MARKETING_MAP).join('|')})\\b`, 'gi');
+
+/** Preserve the original capitalization pattern when replacing. */
+function casePreservingReplace(original: string, replacement: string): string {
+  if (original === original.toUpperCase()) return replacement.toUpperCase();
+  if (original.length > 0 && original[0] === original[0]?.toUpperCase()) {
+    return (replacement[0]?.toUpperCase() ?? '') + replacement.slice(1);
+  }
+  return replacement;
+}
+
+export function stripMarketingTerms(content: string): string {
+  // Split on protected spans: manual_content blocks, fenced code, inline code, URLs/link targets
+  const parts = content.split(
+    /(<manual_content\b[^>]*>[\s\S]*?<\/manual_content>|```[\s\S]*?```|`[^`]+`|https?:\/\/[^\s)]+|\]\([^)]+\))/g,
+  );
+  return parts
+    .map((part, i) => {
+      // Odd-indexed parts are protected spans — leave them alone
+      if (i % 2 === 1) return part;
+      return part.replace(MARKETING_RE, (match) => {
+        const replacement = MARKETING_MAP[match.toLowerCase()];
+        return replacement ? casePreservingReplace(match, replacement) : match;
+      });
+    })
+    .join('');
+}
+
 // ─── Diff display ───────────────────────────────────────
 
-function showDiff(filePath: string, original: string, updated: string): boolean {
+async function showDiff(filePath: string, original: string, updated: string): Promise<boolean> {
+  const { log } = await import('../ui.js');
+
   if (original === updated) {
     log.dim(TAG, `No changes for ${filePath}.`);
     return false;
@@ -192,9 +363,19 @@ export interface DocsOptions {
   only?: string;
   dryRun?: boolean;
   yes?: boolean;
+  /** Override TTY detection for testing. Defaults to process.stdin.isTTY. */
+  isTTY?: boolean;
 }
 
 export async function docsCommand(inputs: string[], options: DocsOptions): Promise<void> {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { TotemConfigError, validateDocUpdate } = await import('@mmnto/totem');
+  const { isFileDirty } = await import('../git.js');
+  const { log } = await import('../ui.js');
+  const { getSystemPrompt, loadConfig, loadEnv, resolveConfigPath, runOrchestrator, writeOutput } =
+    await import('../utils.js');
+
   const cwd = process.cwd();
   const configPath = resolveConfigPath(cwd);
   loadEnv(cwd);
@@ -202,15 +383,11 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
 
   // Validate docs are configured
   if (!config.docs || config.docs.length === 0) {
-    const err = new Error(
-      `[Totem Error] No docs configured.\n` +
-        `Add a 'docs' array to totem.config.ts. Example:\n` +
-        `  docs: [\n` +
-        `    { path: 'README.md', description: 'Public-facing README', trigger: 'post-release' },\n` +
-        `  ]`,
+    throw new TotemConfigError(
+      'No docs configured.',
+      "Add a 'docs' array to totem.config.ts. Example:\n  docs: [\n    { path: 'README.md', description: 'Public-facing README', trigger: 'post-release' },\n  ]",
+      'CONFIG_MISSING',
     );
-    err.name = 'NoDocsConfiguredError';
-    throw err;
   }
 
   // Resolve targets from positional args, --only, or all docs
@@ -218,9 +395,10 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
 
   // Fail-fast: conflicting targeting flags
   if (inputs.length > 0 && options.only) {
-    throw new Error(
-      `[Totem Error] Cannot combine positional doc paths with --only flag.\n` +
-        `Use one or the other: \`totem docs README.md\` OR \`totem docs --only readme\`.`,
+    throw new TotemConfigError(
+      'Cannot combine positional doc paths with --only flag.',
+      'Use one or the other: `totem docs README.md` OR `totem docs --only readme`.',
+      'CONFIG_INVALID',
     );
   }
 
@@ -242,9 +420,10 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
     }
 
     if (invalid.length > 0) {
-      throw new Error(
-        `[Totem Error] Unknown doc path(s): ${invalid.join(', ')}\n` +
-          `Available: ${config.docs.map((d) => d.path).join(', ')}`,
+      throw new TotemConfigError(
+        `Unknown doc path(s): ${invalid.join(', ')}`,
+        `Available: ${config.docs.map((d) => d.path).join(', ')}`,
+        'CONFIG_INVALID',
       );
     }
     targets = Array.from(resolved);
@@ -257,9 +436,10 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
       return onlyNames.some((name) => basename.includes(name) || fullPath.includes(name));
     });
     if (targets.length === 0) {
-      throw new Error(
-        `[Totem Error] --only '${options.only}' matched no configured docs.\n` +
-          `Available: ${config.docs.map((d) => d.path).join(', ')}`,
+      throw new TotemConfigError(
+        `--only '${options.only}' matched no configured docs.`,
+        `Available: ${config.docs.map((d) => d.path).join(', ')}`,
+        'CONFIG_INVALID',
       );
     }
   }
@@ -269,31 +449,48 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
   // Check for dirty files (data loss protection)
   const dirtyFiles = targets.filter((d) => isFileDirty(cwd, d.path));
   if (dirtyFiles.length > 0 && !options.dryRun) {
-    throw new Error(
-      `[Totem Error] The following doc(s) have uncommitted changes:\n` +
-        dirtyFiles.map((d) => `  - ${d.path}`).join('\n') +
-        `\nCommit or stash changes before running \`totem docs\` to prevent data loss.`,
+    throw new TotemConfigError(
+      `The following doc(s) have uncommitted changes:\n` +
+        dirtyFiles.map((d) => `  - ${d.path}`).join('\n'),
+      'Commit or stash changes before running `totem docs` to prevent data loss.',
+      'CONFIG_INVALID',
     );
   }
 
   // Gather release context (shared across all docs)
   log.info(TAG, 'Gathering release context...');
-  const releaseContext = gatherReleaseContext(cwd);
+  const releaseContext = await gatherReleaseContext(cwd);
   if (releaseContext.tag) {
     log.dim(TAG, `Last release: ${releaseContext.tag}`);
   }
 
-  // Load active_work.md for phase/priority context
+  // Load active_work context from the first docs entry whose path contains "active_work"
   let activeWork = '';
-  const activeWorkPath = path.join(cwd, 'docs', 'active_work.md');
-  try {
-    activeWork = fs.readFileSync(activeWorkPath, 'utf-8');
-  } catch {
-    log.dim(TAG, 'No docs/active_work.md found — proceeding without active work context.');
+  const activeWorkDoc = config.docs?.find((d) => d.path.includes('active_work'));
+  if (activeWorkDoc) {
+    const activeWorkPath = path.join(cwd, activeWorkDoc.path);
+    try {
+      activeWork = fs.readFileSync(activeWorkPath, 'utf-8');
+    } catch {
+      log.dim(TAG, `${activeWorkDoc.path} not found — proceeding without active work context.`);
+    }
   }
 
   // Resolve system prompt (allow .totem/prompts/docs.md override)
   const systemPrompt = getSystemPrompt('docs', DOCS_SYSTEM_PROMPT, cwd, config.totemDir);
+
+  // Hoist interactive prompt import above loop (#847)
+  const isTTY = options.isTTY ?? (process.stdin.isTTY && process.stdout.isTTY) ?? false;
+  const clack = !options.yes && isTTY ? await import('@clack/prompts') : null;
+
+  // Non-interactive safety check (#847)
+  if (!options.yes && !isTTY) {
+    throw new TotemConfigError(
+      'Refusing to write LLM-generated docs in non-interactive mode.',
+      'Use --yes to bypass confirmation, or run in an interactive terminal.',
+      'CONFIG_INVALID',
+    );
+  }
 
   // Process each doc sequentially (separate orchestrator call per doc)
   let updated = 0;
@@ -313,7 +510,15 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
     log.info(TAG, `Processing ${doc.path}...`);
 
     // Assemble prompt for this doc
-    const prompt = assemblePrompt(doc, currentContent, releaseContext, activeWork, systemPrompt);
+    const prompt = await assemblePrompt(
+      doc,
+      currentContent,
+      releaseContext,
+      activeWork,
+      systemPrompt,
+      cwd,
+      config.totemDir,
+    );
     log.dim(TAG, `Prompt: ${(prompt.length / 1024).toFixed(0)}KB`);
 
     let content: string | undefined;
@@ -342,9 +547,12 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
       continue;
     }
 
-    // Check if anything changed
-    const trimmedContent = extracted.trimEnd() + '\n';
-    const hasChanges = showDiff(doc.path, currentContent, trimmedContent);
+    // Post-process: deterministic sanitization of LLM output
+    const isUserFacingDoc = resolveIsUserFacing(doc);
+    const withoutRefs = isUserFacingDoc ? stripIssueRefs(extracted) : extracted;
+    const cleaned = stripMarketingTerms(withoutRefs);
+    const trimmedContent = cleaned.trimEnd() + '\n';
+    const hasChanges = await showDiff(doc.path, currentContent, trimmedContent);
     if (!hasChanges) continue;
 
     // Saga checkpoint — validate before writing (#351)
@@ -378,6 +586,15 @@ export async function docsCommand(inputs: string[], options: DocsOptions): Promi
         log.success(TAG, `[dry-run] Preview written to ${options.out}`);
       }
       continue;
+    }
+
+    // Interactive confirmation gate (#847)
+    if (!options.yes && clack) {
+      const accepted = await clack.confirm({ message: `Write changes to ${doc.path}?` });
+      if (clack.isCancel(accepted) || !accepted) {
+        log.dim(TAG, `Skipped ${doc.path} — user declined.`);
+        continue;
+      }
     }
 
     // Write the updated content

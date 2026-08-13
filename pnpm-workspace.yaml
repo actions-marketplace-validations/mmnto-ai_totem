@@ -1,2 +1,21 @@
 packages:
   - 'packages/*'
+
+engineStrict: true
+
+strictDepBuilds: true
+allowBuilds:
+  '@ast-grep/lang-rust': true
+  '@google/genai': true
+  'es5-ext': true
+  'esbuild': true
+  'protobufjs': true
+  'tree-sitter-javascript': true
+  'tree-sitter-typescript': true
+
+# Minutes (pnpm 11.2.2 multiplies this raw — a duration string like `1d` yields
+# NaN → Invalid Date → "Invalid time value" crash on any resolving install).
+minimumReleaseAge: 1440
+# Cohort packages publish-then-install in the same CI window by design.
+minimumReleaseAgeExclude:
+  - '@mmnto/*'

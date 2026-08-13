@@ -1,0 +1,275 @@
+import { describe, expect, it } from 'vitest';
+
+import {
+  DescribeProjectInputSchema,
+  DescribeProjectOutputSchema,
+  GitStateSchema,
+  MilestoneStateSchema,
+  RECENT_PRS_COUNT,
+  RichProjectStateSchema,
+  RuleCountsSchema,
+  StrategyPointerSchema,
+  UNCOMMITTED_FILES_CAP,
+} from './describe-project.js';
+
+describe('DescribeProjectInputSchema', () => {
+  it('accepts empty input and defaults includeRichState to false', () => {
+    const parsed = DescribeProjectInputSchema.parse({});
+    expect(parsed.includeRichState).toBe(false);
+  });
+
+  it('accepts explicit includeRichState false', () => {
+    const parsed = DescribeProjectInputSchema.parse({ includeRichState: false });
+    expect(parsed.includeRichState).toBe(false);
+  });
+
+  it('accepts explicit includeRichState true', () => {
+    const parsed = DescribeProjectInputSchema.parse({ includeRichState: true });
+    expect(parsed.includeRichState).toBe(true);
+  });
+
+  it('rejects non-boolean includeRichState', () => {
+    expect(() => DescribeProjectInputSchema.parse({ includeRichState: 'yes' })).toThrow();
+  });
+});
+
+describe('DescribeProjectOutputSchema backward compatibility', () => {
+  const legacyShape = {
+    project: 'test',
+    tier: 'standard' as const,
+    rules: 10,
+    lessons: 5,
+    targets: ['**/*.ts (code/typescript-ast)'],
+    partitions: { core: ['packages/core/'] },
+    hooks: ['pre-push'],
+  };
+
+  it('accepts legacy shape without richState', () => {
+    const parsed = DescribeProjectOutputSchema.parse(legacyShape);
+    expect(parsed.richState).toBeUndefined();
+  });
+
+  it('accepts legacy shape with richState populated', () => {
+    const rich = {
+      strategyPointer: {
+        resolved: true as const,
+        sha: 'abc1234',
+        latestJournal: '2026-04-16-session.md',
+      },
+      gitState: { branch: 'main', uncommittedFiles: [], truncated: false },
+      packageVersions: { '@mmnto/cli': '1.14.10' },
+      ruleCounts: { active: 10, archived: 2, nonCompilable: 3 },
+      lessonCount: 5,
+      testCount: null,
+      milestone: { name: '1.15.0', gateTickets: ['#1479'], bestEffort: true as const },
+      recentPrs: [{ title: 'feat: foo (#1)', date: '2026-04-16T00:00:00Z', squashSha: 'abcd123' }],
+      indexState: { lastSyncAt: null, staleness: null },
+    };
+    const parsed = DescribeProjectOutputSchema.parse({ ...legacyShape, richState: rich });
+    expect(parsed.richState?.ruleCounts.active).toBe(10);
+  });
+
+  it('rejects malformed richState', () => {
+    expect(() =>
+      DescribeProjectOutputSchema.parse({
+        ...legacyShape,
+        richState: { strategyPointer: 'not an object' },
+      }),
+    ).toThrow();
+  });
+});
+
+describe('GitStateSchema', () => {
+  it('accepts null branch (outside git repo)', () => {
+    const parsed = GitStateSchema.parse({ branch: null, uncommittedFiles: [], truncated: false });
+    expect(parsed.branch).toBeNull();
+  });
+
+  it('accepts branch + files + truncation marker', () => {
+    const parsed = GitStateSchema.parse({
+      branch: 'main',
+      uncommittedFiles: ['a.ts', 'b.ts'],
+      truncated: true,
+    });
+    expect(parsed.truncated).toBe(true);
+  });
+});
+
+describe('RuleCountsSchema', () => {
+  it('rejects negative counts', () => {
+    expect(() => RuleCountsSchema.parse({ active: -1, archived: 0, nonCompilable: 0 })).toThrow();
+  });
+
+  it('rejects non-integer counts', () => {
+    expect(() => RuleCountsSchema.parse({ active: 1.5, archived: 0, nonCompilable: 0 })).toThrow();
+  });
+});
+
+describe('MilestoneStateSchema', () => {
+  it('requires bestEffort literal true', () => {
+    expect(() =>
+      MilestoneStateSchema.parse({ name: null, gateTickets: [], bestEffort: false }),
+    ).toThrow();
+  });
+
+  it('accepts null name with empty gateTickets', () => {
+    const parsed = MilestoneStateSchema.parse({
+      name: null,
+      gateTickets: [],
+      bestEffort: true,
+    });
+    expect(parsed.name).toBeNull();
+  });
+});
+
+describe('StrategyPointerSchema (mmnto-ai/totem#1710)', () => {
+  it('accepts the resolved branch with both git fields null', () => {
+    const parsed = StrategyPointerSchema.parse({
+      resolved: true,
+      sha: null,
+      latestJournal: null,
+    });
+    if (parsed.resolved) {
+      expect(parsed.sha).toBeNull();
+      expect(parsed.latestJournal).toBeNull();
+    } else {
+      expect.fail('expected resolved branch');
+    }
+  });
+
+  it('accepts the resolved branch with non-null git fields', () => {
+    const parsed = StrategyPointerSchema.parse({
+      resolved: true,
+      sha: 'd387716',
+      latestJournal: 'claude-0006-pattern-history-overlay-1.17.1.md',
+    });
+    if (parsed.resolved) {
+      expect(parsed.sha).toBe('d387716');
+      expect(parsed.latestJournal).toBe('claude-0006-pattern-history-overlay-1.17.1.md');
+    }
+  });
+
+  it('accepts the unresolved branch with a reason string', () => {
+    const parsed = StrategyPointerSchema.parse({
+      resolved: false,
+      reason: 'No strategy root resolvable: cwd is outside a git repository.',
+    });
+    if (!parsed.resolved) {
+      expect(parsed.reason).toMatch(/strategy/);
+    } else {
+      expect.fail('expected unresolved branch');
+    }
+  });
+
+  it('rejects malformed mixes (resolved=true without sha)', () => {
+    const result = StrategyPointerSchema.safeParse({
+      resolved: true,
+      latestJournal: null,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects malformed mixes (resolved=false with sha)', () => {
+    const result = StrategyPointerSchema.safeParse({
+      resolved: false,
+      sha: 'abc1234',
+      latestJournal: null,
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects extra keys on the resolved branch (R3 — strict mode)', () => {
+    // Without .strict(), Zod silently strips unknown keys. .strict() makes
+    // the discriminated union catch a producer-side bug where the wrong
+    // branch fields leak into a payload (e.g., a `reason` accidentally
+    // emitted alongside a successful resolution).
+    const result = StrategyPointerSchema.safeParse({
+      resolved: true,
+      sha: 'abc1234',
+      latestJournal: null,
+      reason: 'should not appear',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects extra keys on the unresolved branch (R3 — strict mode)', () => {
+    const result = StrategyPointerSchema.safeParse({
+      resolved: false,
+      reason: 'No strategy root resolvable.',
+      latestJournal: 'should-not-appear.md',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('RichProjectStateSchema', () => {
+  it('allows testCount: null explicitly', () => {
+    const parsed = RichProjectStateSchema.parse({
+      strategyPointer: { resolved: true, sha: null, latestJournal: null },
+      gitState: { branch: null, uncommittedFiles: [], truncated: false },
+      packageVersions: {},
+      ruleCounts: { active: 0, archived: 0, nonCompilable: 0 },
+      lessonCount: 0,
+      testCount: null,
+      milestone: { name: null, gateTickets: [], bestEffort: true },
+      recentPrs: [],
+      indexState: { lastSyncAt: null, staleness: null },
+    });
+    expect(parsed.testCount).toBeNull();
+  });
+
+  it('embeds the unresolved strategy-pointer branch (#1710)', () => {
+    const parsed = RichProjectStateSchema.parse({
+      strategyPointer: { resolved: false, reason: 'no sibling, no submodule' },
+      gitState: { branch: 'main', uncommittedFiles: [], truncated: false },
+      packageVersions: {},
+      ruleCounts: { active: 0, archived: 0, nonCompilable: 0 },
+      lessonCount: 0,
+      testCount: null,
+      milestone: { name: null, gateTickets: [], bestEffort: true },
+      recentPrs: [],
+      indexState: { lastSyncAt: null, staleness: null },
+    });
+    if (!parsed.strategyPointer.resolved) {
+      expect(parsed.strategyPointer.reason).toBe('no sibling, no submodule');
+    }
+  });
+
+  it('requires indexState (mmnto-ai/totem#2029) and accepts populated values', () => {
+    const parsed = RichProjectStateSchema.parse({
+      strategyPointer: { resolved: true, sha: null, latestJournal: null },
+      gitState: { branch: null, uncommittedFiles: [], truncated: false },
+      packageVersions: {},
+      ruleCounts: { active: 0, archived: 0, nonCompilable: 0 },
+      lessonCount: 0,
+      testCount: null,
+      milestone: { name: null, gateTickets: [], bestEffort: true },
+      recentPrs: [],
+      indexState: { lastSyncAt: '2026-05-25T17:44:58.714Z', staleness: '3 hours ago' },
+    });
+    expect(parsed.indexState.lastSyncAt).toBe('2026-05-25T17:44:58.714Z');
+    expect(parsed.indexState.staleness).toBe('3 hours ago');
+  });
+
+  it('rejects rich-state payloads missing indexState', () => {
+    const result = RichProjectStateSchema.safeParse({
+      strategyPointer: { resolved: true, sha: null, latestJournal: null },
+      gitState: { branch: null, uncommittedFiles: [], truncated: false },
+      packageVersions: {},
+      ruleCounts: { active: 0, archived: 0, nonCompilable: 0 },
+      lessonCount: 0,
+      testCount: null,
+      milestone: { name: null, gateTickets: [], bestEffort: true },
+      recentPrs: [],
+      // indexState intentionally omitted
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+describe('constants', () => {
+  it('caps match the design doc', () => {
+    expect(UNCOMMITTED_FILES_CAP).toBe(50);
+    expect(RECENT_PRS_COUNT).toBe(5);
+  });
+});

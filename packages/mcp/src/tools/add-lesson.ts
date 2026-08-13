@@ -5,33 +5,68 @@ import * as path from 'node:path';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 
-import { generateLessonHeading, sanitize } from '@mmnto/totem';
+import {
+  acquireLock,
+  generateLessonHeading,
+  hasFullSyncCheckpoint,
+  LessonRoleSchema,
+  sanitize,
+  writeLessonFileAsync,
+} from '@mmnto/totem';
 
 import { getContext, reconnectStore } from '../context.js';
+import { detectPackageManager } from '../utils.js';
 import { formatXmlResponse } from '../xml-format.js';
 
+// ---------------------------------------------------------------------------
+// Rate limiting (#844) — simple in-memory session counter
+// ---------------------------------------------------------------------------
+const MAX_LESSONS_PER_SESSION = 25;
+// Bounded lock-acquisition budget (#2564 leg MAJOR-R1): 4 retries ≈ 7.5s
+// worst-case backoff before falling back to the lockless write.
+const MAX_LESSON_LOCK_RETRIES = 4;
+let sessionLessonCount = 0;
+
+/** Exported for testing — reset the rate-limit counter between test runs. */
+export function _resetRateLimit(): void {
+  sessionLessonCount = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Input validation schema (#844)
+// ---------------------------------------------------------------------------
+const AddLessonInputSchema = z.object({
+  lesson: z.string().min(1, 'Lesson body must be a non-empty string'),
+  context_tags: z.array(z.string().min(1)).min(1, 'At least one context tag is required'),
+  applies_to: z.array(LessonRoleSchema).min(1).optional(),
+});
+
+// ---------------------------------------------------------------------------
+// Heading sanitization (#844) — strip XML-like angle brackets
+// ---------------------------------------------------------------------------
+function sanitizeHeading(heading: string): string {
+  return heading.replace(/[<>]/g, '');
+}
+
 /**
- * Detect the correct package-manager command for running `totem sync`.
+ * Build the correct package-manager command for running `totem sync`.
  */
 function detectSyncCommand(projectRoot: string): { cmd: string; args: string[] } {
-  if (fs.existsSync(path.join(projectRoot, 'pnpm-lock.yaml'))) {
-    return { cmd: 'pnpm', args: ['exec', 'totem', 'sync', '--incremental'] };
-  }
-  if (fs.existsSync(path.join(projectRoot, 'yarn.lock'))) {
-    return { cmd: 'yarn', args: ['totem', 'sync', '--incremental'] };
-  }
+  const pm = detectPackageManager(projectRoot);
+  if (pm === 'pnpm') return { cmd: 'pnpm', args: ['exec', 'totem', 'sync', '--incremental'] };
+  if (pm === 'yarn') return { cmd: 'yarn', args: ['totem', 'sync', '--incremental'] };
   return { cmd: 'npx', args: ['totem', 'sync', '--incremental'] };
 }
 
 const SYNC_TIMEOUT_MS = 60_000;
 const MAX_OUTPUT_BYTES = 10_000;
 
-/** Debounce guard — prevents concurrent sync processes. */
-let syncPending = false;
+/** Debounce guard — concurrent callers share the same sync promise. */
+let activeSyncPromise: Promise<{ success: boolean; output: string }> | null = null;
 
 /**
- * Kill a child process tree. With `shell: true`, child.kill() only kills the
- * shell — we need to kill the process group to prevent orphaned children.
+ * Kill a child process tree. With `detached: true`, child.kill() only kills the
+ * lead process — we need to kill the process group to prevent orphaned children.
  */
 function killTree(child: ReturnType<typeof spawn>): void {
   if (child.pid == null) return;
@@ -63,8 +98,9 @@ function runSync(projectRoot: string): Promise<{ success: boolean; output: strin
       cwd: projectRoot,
       detached: process.platform !== 'win32', // enables process group kill on Unix
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: true,
       windowsHide: true,
+      env: { ...process.env },
+      shell: process.platform === 'win32', // resolve .cmd shims on Windows (#1023)
     });
 
     const capture = (data: Buffer) => {
@@ -105,62 +141,227 @@ export function registerAddLesson(server: McpServer): void {
     'add_lesson',
     {
       description:
-        'Persist a lesson learned to .totem/lessons.md. An incremental re-index runs automatically and the result is returned.',
+        'Persist a lesson learned to .totem/lessons/. An incremental re-index runs automatically and the result is returned — unless a full re-index is already in progress, in which case the sync is deferred (the response says so) and the lesson indexes on the next sync.',
       inputSchema: {
         lesson: z.string().describe('The lesson text to persist'),
         context_tags: z
           .array(z.string())
           .describe('Tags for categorization (e.g. ["caching", "nextjs", "trap"])'),
+        applies_to: z
+          .array(LessonRoleSchema)
+          .min(1, 'At least one applies_to role is required when provided')
+          .optional()
+          .describe(
+            'Optional role-of-code applicability per strategy item 020. ' +
+              'One or more of: mutator, boundary, aggregator, hot-path, boundary-test, ' +
+              'infrastructure, presentation, any. Omit to default to ["any"].',
+          ),
       },
       annotations: {
         readOnlyHint: false,
       },
     },
-    async ({ lesson, context_tags }) => {
+    async ({ lesson, context_tags, applies_to }) => {
+      // --- Rate limiting (#844) ---
+      if (sessionLessonCount >= MAX_LESSONS_PER_SESSION) {
+        return {
+          content: [
+            {
+              type: 'text' as const,
+              text: `Rate limit exceeded: maximum ${MAX_LESSONS_PER_SESSION} lessons per session`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // --- Schema validation (#844) ---
+      const parsed = AddLessonInputSchema.safeParse({ lesson, context_tags, applies_to });
+      if (!parsed.success) {
+        const issues = parsed.error.issues.map((i) => i.message).join('; ');
+        return {
+          content: [{ type: 'text' as const, text: `Validation error: ${issues}` }],
+          isError: true,
+        };
+      }
+
       try {
         const { projectRoot, config } = await getContext();
 
         const totemDir = path.join(projectRoot, config.totemDir);
         await fs.promises.mkdir(totemDir, { recursive: true });
 
-        const lessonsPath = path.join(totemDir, 'lessons.md');
-        const safeLesson = sanitize(lesson);
+        const lessonsDir = path.join(totemDir, 'lessons');
+        const validLesson = parsed.data.lesson;
+        const validTags = parsed.data.context_tags;
+        const safeLesson = sanitize(validLesson);
         const safeTags =
-          context_tags.length > 0
-            ? context_tags.map((t) => sanitize(t).replace(/\n/g, ' ')).join(', ')
-            : 'manual';
-        const heading = generateLessonHeading(safeLesson);
+          validTags
+            .map((t) => sanitize(t).replace(/[\n,]/g, ' ').trim())
+            .filter(Boolean)
+            .join(', ') || 'untagged';
+
+        // --- Double-heading guard (#1284) ---
+        // If the caller supplies a pre-formatted lesson whose body already
+        // starts with a canonical `## Lesson — Foo` heading, extract the
+        // heading and strip it from the body. Without this, `generateLessonHeading`
+        // would derive a title from the "Lesson — Foo" text and produce
+        // `## Lesson — Lesson — Foo`, and the original heading would remain
+        // inside the body — yielding two `## Lesson — ...` lines in one file
+        // that the parser then counts as two separate lessons.
+        // The separator class matches em-dash (\u2014), en-dash (\u2013), and
+        // hyphen, consistent with the parser's LESSON_HEADING_RE in #1278.
+        // The terminator allows either trailing newlines OR end-of-string so
+        // a single-line input like `## Lesson — Foo` (no body, no trailing
+        // newline) still gets normalized instead of slipping through.
+        // Leading `\s*` absorbs blank lines or whitespace before the heading
+        // (LLM callers sometimes emit pre-formatted lessons with a leading
+        // newline). Case sensitivity intentionally matches the parser's
+        // canonical form in core/drift-detector.ts — if we accepted lowercase
+        // here we would strip a line the parser would still treat as body
+        // text, breaking round-trip semantics.
+        // `matchAll` + iterator instead of `match` to satisfy the project-wide
+        // lint rule about iterating all regex matches — the `^` anchor ensures
+        // at most one match here regardless.
+        const LESSON_HEADING_RE = /^\s*## Lesson[\s\u2014\u2013-]+(.+?)(?:\s*\n+|\s*$)/g;
+        const headingMatch = safeLesson.matchAll(LESSON_HEADING_RE).next().value;
+        let rawHeading: string;
+        let bodyContent: string;
+        if (headingMatch) {
+          rawHeading = headingMatch[1]!;
+          bodyContent = safeLesson.slice(headingMatch[0].length).trim();
+        } else {
+          rawHeading = generateLessonHeading(safeLesson);
+          bodyContent = safeLesson.trim();
+        }
+        const heading = sanitizeHeading(rawHeading);
+
+        // --- Source provenance (#844) ---
+        const provenance = `\n**Source:** mcp (added at ${new Date().toISOString()})`;
+
+        // Serialize applies-to in canonical kebab-case wire form (item 020).
+        // Snake-case at the MCP boundary, kebab-case in the lesson markdown.
+        const appliesToLine = parsed.data.applies_to
+          ? `**Applies-to:** ${parsed.data.applies_to.join(', ')}\n\n`
+          : '';
 
         const entry =
-          `\n## Lesson — ${heading}\n\n` + `**Tags:** ${safeTags}\n\n` + `${safeLesson.trim()}\n`;
+          `## Lesson — ${heading}\n\n` +
+          `**Tags:** ${safeTags}\n\n` +
+          appliesToLine +
+          `${bodyContent}\n` +
+          provenance;
 
-        await fs.promises.appendFile(lessonsPath, entry, 'utf-8');
-
-        // Await sync so the LLM gets definitive success/failure confirmation.
-        // Debounce: skip if a sync is already in flight.
-        let syncMessage: string;
-        if (syncPending) {
-          syncMessage =
-            'A sync is already in progress — this lesson will be indexed when it completes.';
+        // #2564 (leg MAJOR-2): a live full re-index holds the sync lock
+        // unstealably for corpus-sized wall-clock, so contending on it here
+        // is a deterministic multi-minute block ending in SYNC_FAILED — the
+        // lesson would be LOST. Under a live epoch, write WITHOUT the lock:
+        // the filename is content-hash unique and the epoch holder only
+        // READS this directory; indexing defers to the epoch either way
+        // (#2562 deferral below).
+        // Leg MAJOR-R1: the checkpoint marker is a proxy — a long paced
+        // INCREMENTAL hold never writes one, and the fresh-full prelude holds
+        // the lock before writing it. So the marker check is only the fast
+        // path; the acquisition itself is BOUNDED (~7.5s worst case), and a
+        // timeout falls back to the same lockless write. A timeout USUALLY
+        // means a live long sync, but not provably (leg MINOR-S1: an
+        // undeletable corrupt lock or sustained short-hold churn also
+        // exhausts the budget) — the fallback is safe regardless: no lock
+        // holder mutates this directory, and the next sync indexes the file.
+        let fileName: string;
+        let lockTimedOut = false;
+        if (hasFullSyncCheckpoint(totemDir)) {
+          const writtenPath = await writeLessonFileAsync(lessonsDir, entry);
+          fileName = path.basename(writtenPath);
+          sessionLessonCount++;
         } else {
-          syncPending = true;
+          let releaseLock: (() => void) | null = null;
           try {
-            const { success, output } = await runSync(projectRoot);
-
-            // Reconnect so the next search_knowledge call sees new data.
+            releaseLock = await acquireLock(totemDir, undefined, {
+              maxRetries: MAX_LESSON_LOCK_RETRIES,
+            });
+          } catch (err) {
+            if ((err as { code?: string }).code !== 'SYNC_FAILED') throw err;
+            lockTimedOut = true;
+          }
+          if (releaseLock) {
+            // Acquired: write under the lock, release before spawning sync
+            // (the spawned sync process takes its own lock via runSync/withLock)
             try {
-              await reconnectStore();
-            } catch {
-              // Non-fatal — store will reconnect on next search
+              const writtenPath = await writeLessonFileAsync(lessonsDir, entry);
+              fileName = path.basename(writtenPath);
+              sessionLessonCount++;
+            } finally {
+              releaseLock();
             }
-
-            syncMessage = success
-              ? `Sync completed successfully. ${output.trim()}`
-              : `Sync failed: ${output.trim()}`;
-          } finally {
-            syncPending = false;
+          } else {
+            const writtenPath = await writeLessonFileAsync(lessonsDir, entry);
+            fileName = path.basename(writtenPath);
+            sessionLessonCount++;
           }
         }
+
+        // Whatever exhausted the budget also blocks a convenience sync (it
+        // would contend on the same lock and die by its kill-timer) — defer.
+        // The message claims neither a cause nor that the running sync will
+        // index this file (its file list predates our write — leg NIT-S1):
+        // the next sync picks it up via the untracked-files union.
+        if (lockTimedOut) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: formatXmlResponse(
+                  'lesson_added',
+                  `Lesson saved to ${config.totemDir}/lessons/${fileName}. Sync deferred: the sync lock could not be acquired within the bounded budget (usually another running sync) — the lesson will be indexed on the next \`totem sync\`.`,
+                ),
+              },
+            ],
+          };
+        }
+
+        // #2562 (falsification round 3, MAJOR 1): while a full re-index epoch
+        // is in progress, ANY sync is promoted to the paced full resume — a
+        // corpus-sized job this tool's 60s kill-timer can never wait out. The
+        // lesson is already written; skip the convenience sync and let the
+        // running epoch (or the next `totem sync`) index it, instead of
+        // deterministically reporting a spurious timeout failure. Re-derived
+        // here (not reused from the lock bypass above) so an epoch that began
+        // while we held the lock still defers, and one that completed while
+        // we wrote locklessly falls through to a now-uncontended sync.
+        if (hasFullSyncCheckpoint(totemDir)) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: formatXmlResponse(
+                  'lesson_added',
+                  `Lesson saved to ${config.totemDir}/lessons/${fileName}. Sync deferred: a full re-index is in progress — the lesson will be indexed when it completes (or on the next \`totem sync\`).`,
+                ),
+              },
+            ],
+          };
+        }
+
+        const isJoining = activeSyncPromise !== null;
+        if (!activeSyncPromise) {
+          activeSyncPromise = runSync(projectRoot).finally(() => {
+            activeSyncPromise = null;
+          });
+        }
+        const { success, output } = await activeSyncPromise;
+
+        if (!isJoining) {
+          try {
+            await reconnectStore();
+          } catch {
+            // Non-fatal — store will reconnect on next search
+          }
+        }
+
+        const syncMessage = success
+          ? `Sync completed successfully. ${output.trim()}`
+          : `Sync failed: ${output.trim()}`;
 
         return {
           content: [
@@ -168,7 +369,7 @@ export function registerAddLesson(server: McpServer): void {
               type: 'text' as const,
               text: formatXmlResponse(
                 'lesson_added',
-                `Lesson saved to ${config.totemDir}/lessons.md. ${syncMessage}`,
+                `Lesson saved to ${config.totemDir}/lessons/${fileName}. ${syncMessage}`,
               ),
             },
           ],

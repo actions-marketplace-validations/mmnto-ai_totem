@@ -1,10 +1,12 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import type { LessonFrontmatter } from './types.js';
+
 // ─── Types ─────────────────────────────────────────────
 
 export interface ParsedLesson {
-  /** Heading text after "## Lesson — " */
+  /** Heading text after "## Lesson [—|–|-] " (em-dash, en-dash, or hyphen) */
   heading: string;
   /** Extracted tags from the **Tags:** line */
   tags: string[];
@@ -14,6 +16,10 @@ export interface ParsedLesson {
   raw: string;
   /** 0-based index in the parsed lessons array */
   index: number;
+  /** Source file path this lesson was read from (for prune operations) */
+  sourcePath?: string;
+  /** Structured metadata from YAML frontmatter or legacy field mapping (ADR-070) */
+  frontmatter?: LessonFrontmatter;
 }
 
 export interface DriftResult {
@@ -33,6 +39,8 @@ const FILE_EXTENSIONS = new Set([
   '.jsx',
   '.mjs',
   '.cjs',
+  '.mts',
+  '.cts',
   '.json',
   '.md',
   '.mdx',
@@ -65,24 +73,46 @@ const FILE_EXTENSIONS = new Set([
 
 // ─── Lesson parser ─────────────────────────────────────
 
-const LESSON_HEADING_RE = /^## Lesson — /m;
+/**
+ * Heading delimiter regex — accepts em-dash (—), en-dash (–), or hyphen (-) (#1263).
+ *
+ * Em-dash is the canonical totem convention, but users typing by hand often use a
+ * regular hyphen, and macOS auto-formats `--` to en-dash. Pre-#1263 this regex was
+ * em-dash-only and silently dropped any lesson file using a different separator.
+ *
+ * Uses a character class (NOT a capture group) — `String.prototype.split()` injects
+ * captured matches into the result array, which would break the parts[i] index math.
+ */
+const LESSON_HEADING_RE = /^## Lesson [—–-] /m;
+
+/** Global, capturing variant of LESSON_HEADING_RE for parallel separator extraction. */
+const LESSON_HEADING_SEP_RE = /^## Lesson ([—–-]) /gm;
 
 /**
  * Parse a lessons.md file into individual lesson entries.
- * Splits on `## Lesson —` headings and extracts tags + body.
+ * Splits on `## Lesson [—|–|-]` headings and extracts tags + body.
+ *
+ * The `lesson.raw` field preserves the user's actual separator byte-for-byte from
+ * disk — content-hash drift detection depends on this invariant. Write-side
+ * normalization to canonical em-dash happens separately in `rewriteLessonsFile`.
  */
 export function parseLessonsFile(content: string): ParsedLesson[] {
   const lessons: ParsedLesson[] = [];
 
-  // Split on lesson headings, keeping the delimiter
+  // Split on lesson headings (delimiter consumed)
   const parts = content.split(LESSON_HEADING_RE);
+
+  // Extract the actual separator used in each heading via a parallel matchAll.
+  // Length === parts.length - 1 in well-formed input; the `?? '—'` fallback below
+  // defends against any unexpected divergence by defaulting to canonical em-dash.
+  const separators = [...content.matchAll(LESSON_HEADING_SEP_RE)].map((m) => m[1]!);
 
   // parts[0] is the file header (before the first lesson)
   for (let i = 1; i < parts.length; i++) {
     const part = parts[i]!;
     const lines = part.split('\n');
 
-    // First line is the heading (rest of the ## Lesson — line)
+    // First line is the heading text (rest of the `## Lesson <sep> ` line)
     const heading = (lines[0] ?? '').trim();
 
     // Find tags line: **Tags:** ...
@@ -106,7 +136,9 @@ export function parseLessonsFile(content: string): ParsedLesson[] {
     }
 
     const body = lines.slice(bodyStartIdx).join('\n').trim();
-    const raw = `## Lesson — ${part}`;
+    // Preserve the actual separator from disk (byte-for-byte) for content-hash stability.
+    const sep = separators[i - 1] ?? '—';
+    const raw = `## Lesson ${sep} ${part}`;
 
     lessons.push({ heading, tags, body, raw, index: i - 1 });
   }
@@ -123,11 +155,12 @@ export function parseLessonsFile(content: string): ParsedLesson[] {
 export function extractFileReferences(body: string): string[] {
   const refs = new Set<string>();
 
-  // Split by code fences and only process content outside them (even-indexed parts)
-  const segments = body.split('```');
+  // Strip fenced code blocks (including unclosed trailing fences) so we only
+  // process content outside them
+  const stripped = body.replace(/(```|~~~)[\s\S]*?(?:\1|$)/g, '');
+  const segments = [stripped];
 
-  for (let i = 0; i < segments.length; i += 2) {
-    const segment = segments[i]!;
+  for (const segment of segments) {
     const inlineCodeRe = /(?<!`)`([^`\n]+)`(?!`)/g;
     let match: RegExpExecArray | null;
 
@@ -148,6 +181,14 @@ export function extractFileReferences(body: string): string[] {
 
       // Exclude shell commands with flags
       if (candidate.includes(' -') || candidate.includes(' --')) continue;
+
+      // Exclude shell command + path forms like `git rm <path>` or `rm <path>`.
+      // Without this, lessons that document destructive commands (e.g. the
+      // .totem/lessons.md protection rule) would have their Example Hit /
+      // Miss values misparsed as paths.
+      if (/^(?:git\s+rm|rm|cp|mv|cat|less|head|tail|tee|chmod|chown|touch)\s/.test(candidate)) {
+        continue;
+      }
 
       // Must have a recognized file extension
       const ext = path.extname(candidate).toLowerCase();

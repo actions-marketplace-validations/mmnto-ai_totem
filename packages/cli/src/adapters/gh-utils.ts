@@ -1,11 +1,28 @@
-import { execFileSync } from 'node:child_process';
+// totem-context: All functions are synchronous — safeExec is sync, handleGhError returns never. Do not flag missing await.
 
 import { z } from 'zod';
 
-import { GH_TIMEOUT_MS, IS_WIN } from '../utils.js';
+import {
+  describeSafeExecError,
+  safeExec,
+  TotemConfigError,
+  TotemError,
+  TotemParseError,
+} from '@mmnto/totem';
+
+import { GH_TIMEOUT_MS } from '../utils.js';
 
 const GH_MAX_BUFFER = 10 * 1024 * 1024; // 10MB — handles paginated API responses
 const GH_PAGINATED_TIMEOUT_MS = 60_000; // 60s — paginated endpoints can be slow
+
+/** Shared exec options for all `gh` CLI calls. */
+function ghExecOptions(cwd: string, timeout: number) {
+  return {
+    cwd,
+    timeout,
+    env: { ...process.env, GH_PROMPT_DISABLED: '1' },
+  };
+}
 
 /**
  * Shared error handler for all GitHub CLI interactions.
@@ -17,16 +34,52 @@ export function handleGhError(err: unknown, context: string): never {
     throw err;
   }
   if (err instanceof z.ZodError) {
-    throw new Error(`[Totem Error] Failed to parse GitHub ${context}`);
+    throw new TotemParseError(
+      `Failed to parse GitHub ${context}`,
+      'Check that the GitHub API response format has not changed and your gh CLI is up to date.',
+      err,
+    );
   }
-  const msg = err instanceof Error ? err.message : String(err);
+  // safeExec wraps child-process errors: message includes stderr, cause is the original.
+  // describeSafeExecError unrolls the cause chain so detection (ENOENT, rate-limit) works
+  // regardless of where the relevant text lives in the chain.
+  const wrapperMsg = err instanceof Error ? err.message : String(err);
+  const msg = describeSafeExecError(err);
   if (msg.includes('ENOENT')) {
-    throw new Error(`[Totem Error] GitHub CLI (gh) is required. Install: https://cli.github.com`);
+    throw new TotemConfigError(
+      'GitHub CLI (gh) is required but was not found.',
+      'Install the GitHub CLI: https://cli.github.com',
+      'CONFIG_MISSING',
+      err,
+    );
   }
   if (/\b(403|429)\b/.test(msg) || /rate.limit/i.test(msg)) {
-    throw new Error(`[Totem Error] GitHub API rate limit exceeded. Try again later.`);
+    throw new TotemError(
+      'SHIELD_FAILED',
+      'GitHub API rate limit exceeded.',
+      'Wait a few minutes and try again, or authenticate with `gh auth login` for a higher rate limit.',
+      err,
+    );
   }
-  throw new Error(`[Totem Error] Failed to fetch ${context}: ${msg}`);
+  throw new TotemError(
+    'SHIELD_FAILED',
+    `Failed to fetch ${context}: ${wrapperMsg}`,
+    'Run `gh auth status` to verify authentication, then retry.',
+    err,
+  );
+}
+
+/**
+ * Execute a `gh` CLI command that does not return JSON (mutations like close, comment, edit).
+ * Throws on failure with a friendly error message.
+ */
+export function ghExec(args: string[], cwd: string): void {
+  try {
+    safeExec('gh', args, ghExecOptions(cwd, GH_TIMEOUT_MS));
+  } catch (err) {
+    const context = args.slice(0, 3).join(' ');
+    handleGhError(err, context);
+  }
 }
 
 /**
@@ -40,11 +93,9 @@ export function ghFetchAndParse<T>(
 ): T {
   const isPaginated = args.includes('--paginate');
   try {
-    const raw = execFileSync('gh', args, {
-      cwd,
-      encoding: 'utf-8',
-      timeout: isPaginated ? GH_PAGINATED_TIMEOUT_MS : GH_TIMEOUT_MS,
-      shell: IS_WIN,
+    const timeout = isPaginated ? GH_PAGINATED_TIMEOUT_MS : GH_TIMEOUT_MS;
+    const raw = safeExec('gh', args, {
+      ...ghExecOptions(cwd, timeout),
       maxBuffer: GH_MAX_BUFFER,
     });
 
@@ -52,8 +103,9 @@ export function ghFetchAndParse<T>(
     try {
       parsed = JSON.parse(raw);
     } catch {
-      throw new Error(
-        `[Totem Error] GitHub CLI returned invalid JSON for ${context}. Run \`gh auth status\` to check your authentication.`,
+      throw new TotemParseError(
+        `GitHub CLI returned invalid JSON for ${context}.`,
+        'Run `gh auth status` to check your authentication.',
       );
     }
 

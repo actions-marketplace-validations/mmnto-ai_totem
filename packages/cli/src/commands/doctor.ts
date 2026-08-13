@@ -1,0 +1,2252 @@
+import { spawnSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import pc from 'picocolors';
+
+import type { EstateExecFn, TotemRegistry } from '@mmnto/totem';
+
+import { resolveGitRoot } from '../git.js';
+import { CONFIG_FILES } from '../utils.js';
+
+// ─── Types ──────────────────────────────────────────────
+
+export type CheckStatus = 'pass' | 'warn' | 'fail' | 'skip';
+
+export interface DiagnosticResult {
+  name: string;
+  status: CheckStatus;
+  message: string;
+  remediation?: string;
+  /**
+   * Sensor-class row: its ADVISORY statuses never gate, under any `--strict`
+   * tier (ruled scope, mmnto-ai/totem#2580). The exemption is a property of the
+   * row rather than of the tier, so a sensor cannot acquire teeth by someone
+   * widening the tier later — and it deliberately does NOT cover `fail`, which
+   * always gates (see `doctorGateFailed`).
+   */
+  gateExempt?: true;
+}
+
+// ─── Strict-gate tiers (mmnto-ai/totem#2385) ────────────
+
+/**
+ * Gating tiers for `totem doctor --strict [tier]`:
+ * - `fail` (bare `--strict`): exit non-zero on fail-class diagnostics only —
+ *   the pre-#2385 boolean contract.
+ * - `warn`: exit non-zero on warn- OR fail-class diagnostics — the
+ *   machine-checkable all-wiring oracle for CI / agent consumers.
+ *
+ * `skip` never gates in either tier: it marks checks that are intentionally
+ * inapplicable (e.g. unconfigured optional wiring), not gaps.
+ */
+export type StrictTier = 'fail' | 'warn';
+
+export const STRICT_TIERS: readonly StrictTier[] = ['fail', 'warn'];
+
+/**
+ * Resolve the raw commander `--strict [tier]` value into a StrictTier.
+ * `true` (bare flag) maps to `'fail'`. Returns `undefined` when strict mode
+ * is off. Throws on an unknown tier (fail-loud, Tenet 4 — a silently ignored
+ * tier would let a consumer believe it gated on more than it did).
+ * Async solely so the error class rides the dynamic-import convention (no
+ * static `@mmnto/totem` import in command handlers — CLI startup latency).
+ */
+export async function resolveStrictTier(
+  strict: boolean | string | undefined,
+): Promise<StrictTier | undefined> {
+  if (strict === undefined || strict === false) return undefined;
+  if (strict === true || strict === 'fail') return 'fail';
+  if (strict === 'warn') return 'warn';
+  const { TotemConfigError } = await import('@mmnto/totem');
+  throw new TotemConfigError(
+    `Unknown --strict tier "${strict}".`,
+    `Valid tiers: ${STRICT_TIERS.join(', ')} (bare --strict selects the fail tier).`,
+    'CONFIG_INVALID',
+  );
+}
+
+/**
+ * The gate predicate the CLI edge applies to `doctorCommand` results. Kept
+ * pure and exported so the edge stays thin and the semantics stay unit-tested
+ * (the exit-code decision itself lives at the CLI edge — see DoctorOptions).
+ *
+ * The exemption is scoped to ADVISORY statuses. A `fail` gates regardless of
+ * `gateExempt`: a fail-class diagnostic is a wiring failure, and no row may be
+ * allowed to hide one. Sensor rows never emit `fail` in the first place, so the
+ * narrowing costs them nothing and closes the hole where a mislabelled row
+ * could suppress a real gate.
+ */
+export function doctorGateFailed(results: readonly DiagnosticResult[], tier: StrictTier): boolean {
+  return results.some(
+    (r) => r.status === 'fail' || (tier === 'warn' && r.status === 'warn' && r.gateExempt !== true),
+  );
+}
+
+// ─── Secret leak patterns ───────────────────────────────
+
+const SECRET_PATTERNS: RegExp[] = [
+  /sk-[a-zA-Z0-9_-]{20,}/,
+  /sk-ant-[a-zA-Z0-9_-]{20,}/,
+  /ghp_[a-zA-Z0-9]{36}/,
+  /ghu_[a-zA-Z0-9]{36}/,
+  /AIza[a-zA-Z0-9_-]{35}/,
+];
+
+const PLACEHOLDER_PATTERNS: RegExp[] = [
+  /<YOUR_KEY>/i,
+  /your_token_here/i,
+  /sk-your-key-here/i,
+  /<your[_-].*?>/i,
+  /your[_-]api[_-]key/i,
+  /replace[_-]with[_-]/i,
+  /placeholder/i,
+  /xxx+/i,
+];
+
+// ─── Individual checks ──────────────────────────────────
+
+export function checkConfig(cwd: string): DiagnosticResult {
+  for (const file of CONFIG_FILES) {
+    const candidate = path.join(cwd, file);
+    if (fs.existsSync(candidate)) {
+      return {
+        name: 'Config',
+        status: 'pass',
+        message: `${file} found`,
+      };
+    }
+  }
+  return {
+    name: 'Config',
+    status: 'fail',
+    message: 'No config file found',
+    remediation: 'totem init',
+  };
+}
+
+export function checkCompiledRules(cwd: string, totemDir = '.totem'): DiagnosticResult {
+  const rulesPath = path.join(cwd, totemDir, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) {
+    return {
+      name: 'Compiled Rules',
+      status: 'warn',
+      message: 'compiled-rules.json missing',
+      remediation: 'totem compile',
+    };
+  }
+
+  try {
+    const content = fs.readFileSync(rulesPath, 'utf-8');
+    const parsed = JSON.parse(content) as { rules?: unknown[] };
+    // Handle both { version, rules } wrapper and bare array formats
+    const rules = Array.isArray(parsed?.rules)
+      ? parsed.rules
+      : Array.isArray(parsed)
+        ? (parsed as unknown[])
+        : [];
+    return {
+      name: 'Compiled Rules',
+      status: 'pass',
+      message: `${rules.length} rules loaded`,
+    };
+  } catch {
+    return {
+      name: 'Compiled Rules',
+      status: 'warn',
+      message: 'compiled-rules.json unreadable',
+      remediation: 'totem compile',
+    };
+  }
+}
+
+export function checkGitHooks(cwd: string): DiagnosticResult {
+  const gitRoot = resolveGitRoot(cwd);
+  if (!gitRoot) {
+    return {
+      name: 'Git Hooks',
+      status: 'skip',
+      message: 'Not a git repository',
+    };
+  }
+
+  let hooksDir: string;
+  try {
+    const resolved = spawnSync('git', ['rev-parse', '--git-path', 'hooks'], {
+      cwd: gitRoot,
+      encoding: 'utf-8',
+    });
+    hooksDir =
+      resolved.status === 0 && resolved.stdout.trim()
+        ? path.resolve(gitRoot, resolved.stdout.trim())
+        : path.join(gitRoot, '.git', 'hooks');
+  } catch {
+    hooksDir = path.join(gitRoot, '.git', 'hooks');
+  }
+  const markers: { file: string; marker: string }[] = [
+    { file: 'pre-commit', marker: '[totem] pre-commit hook' },
+    { file: 'pre-push', marker: '[totem] pre-push hook' },
+    { file: 'post-merge', marker: '[totem] post-merge hook' },
+    { file: 'post-checkout', marker: '[totem] post-checkout hook' },
+  ];
+
+  let installed = 0;
+  const missing: string[] = [];
+
+  for (const { file, marker } of markers) {
+    const hookPath = path.join(hooksDir, file);
+    if (fs.existsSync(hookPath)) {
+      try {
+        const content = fs.readFileSync(hookPath, 'utf-8');
+        if (content.includes(marker)) {
+          installed++;
+          continue;
+        }
+      } catch {
+        // Fall through to missing
+      }
+    }
+    missing.push(file);
+  }
+
+  if (missing.length === 0) {
+    return {
+      name: 'Git Hooks',
+      status: 'pass',
+      message: `All ${markers.length} hooks installed`,
+    };
+  }
+
+  return {
+    name: 'Git Hooks',
+    status: 'warn',
+    message: `${installed}/${markers.length} hooks installed (missing: ${missing.join(', ')})`,
+    remediation: 'totem hooks',
+  };
+}
+
+/**
+ * Sense the init-distributed prepare wrapper (mmnto-ai/totem#2410 PR-B): whether
+ * `.totem/prepare.cjs` is present + marker-headed + canonical AND the consumer's
+ * `package.json` `prepare` invokes it. A SENSOR, never a gate — every non-pass state
+ * is `warn`/`skip` (doctor `--strict` gates only on `fail`), so this can never block CI.
+ *
+ * Remedies follow the PR-A/PR-B semantics:
+ *   - absent / wired-but-file-missing → `totem init` (adoption / scaffolding).
+ *   - present, marker-headed, but DRIFTED from canonical → `totem hook install`
+ *     (bare — the wrapper is a bounded roster member, so bare self-repair suffices).
+ *   - present + canonical but `prepare` not wired → `totem init`.
+ *
+ * Honest-absent (Tenet 14), so it stays quiet where absence is legitimate:
+ *   - no `package.json` → `skip`.
+ *   - wrapper absent AND a DIFFERENT user-managed `prepare` exists (the owner-repo
+ *     exception — totem itself runs `tools/install-hooks.js`) → `skip`, never a nudge.
+ *   - a user-owned `.totem/prepare.cjs` with no totem marker → `skip` (left as-is).
+ */
+export async function checkPrepareWrapper(cwd: string): Promise<DiagnosticResult> {
+  const name = 'Prepare Wrapper';
+  const {
+    PREPARE_WRAPPER,
+    PREPARE_SCRIPT_REL,
+    PREPARE_SCRIPT_COMMAND,
+    TOTEM_FILE_MARKER,
+    TOTEM_FILE_END,
+    isBoundedOwnedFile,
+    markerOpensFile,
+  } = await import('./init-templates.js');
+
+  const wrapperPath = path.join(cwd, ...PREPARE_SCRIPT_REL.split('/'));
+  const pkgPath = path.join(cwd, 'package.json');
+
+  // Read the package.json `prepare` state (best-effort — an unreadable/invalid
+  // manifest is honest-absent for wiring, not a crash).
+  const hasPkg = fs.existsSync(pkgPath);
+  let prepareValue: unknown;
+  if (hasPkg) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
+        scripts?: Record<string, unknown>;
+      };
+      prepareValue = parsed.scripts?.prepare;
+      // totem-context: intentional cleanup — best-effort sensor read; a doctor check degrades honestly (Tenet 13, unreadable/invalid package.json → treated as unwired) rather than crashing the diagnostic pipeline, mirroring checkGitHooks / readConfigFile.
+    } catch {
+      prepareValue = undefined;
+    }
+  }
+  const wiredCanonical =
+    typeof prepareValue === 'string' && prepareValue.trim() === PREPARE_SCRIPT_COMMAND;
+  const prepareDifferent = prepareValue !== undefined && !wiredCanonical;
+
+  // Wrapper file state. A file that EXISTS but cannot be read is a distinct signal
+  // from a missing / user-owned file — capture the read error so the present-wrapper
+  // branch can surface it (mmnto-ai/totem#2416 F2) instead of misreading it as "no marker".
+  const wrapperPresent = fs.existsSync(wrapperPath);
+  let wrapperContent: string | undefined;
+  let wrapperReadError: string | undefined;
+  if (wrapperPresent) {
+    try {
+      wrapperContent = fs.readFileSync(wrapperPath, 'utf-8');
+      // totem-context: intentional cleanup — best-effort sensor read; an unreadable wrapper file surfaces as a `warn` (below) rather than crashing the diagnostic pipeline (Tenet 13), mirroring checkGitHooks.
+    } catch (err) {
+      wrapperReadError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  // ── absent wrapper ──
+  if (!wrapperPresent) {
+    if (!hasPkg) {
+      return { name, status: 'skip', message: 'no package.json — nothing to wire' };
+    }
+    if (wiredCanonical) {
+      return {
+        name,
+        status: 'warn',
+        message: `package.json \`prepare\` points at ${PREPARE_SCRIPT_REL} but the wrapper file is missing`,
+        remediation: 'totem init',
+      };
+    }
+    if (prepareDifferent) {
+      // Owner-repo exception / user-managed prepare — absence is legitimate here.
+      return {
+        name,
+        status: 'skip',
+        message: 'prepare is a user-managed script (not the Totem wrapper) — left as-is',
+      };
+    }
+    return {
+      name,
+      status: 'warn',
+      message: 'init-distributed prepare wrapper not installed',
+      remediation: 'totem init',
+    };
+  }
+
+  // ── present wrapper ──
+  // Present-but-unreadable → warn with the read-failure detail (never a silent skip
+  // that misreports the file as user-owned; mmnto-ai/totem#2416 F2).
+  if (wrapperContent === undefined) {
+    return {
+      name,
+      status: 'warn',
+      message: `could not read ${PREPARE_SCRIPT_REL} (${wrapperReadError ?? 'unknown error'}) — the wired prepare lifecycle may be broken`,
+    };
+  }
+  if (!markerOpensFile(wrapperContent, TOTEM_FILE_MARKER)) {
+    return {
+      name,
+      status: 'skip',
+      message: `user-owned ${PREPARE_SCRIPT_REL} (no Totem marker) — left as-is`,
+    };
+  }
+  if (wrapperContent !== PREPARE_WRAPPER) {
+    // A marker-headed drifted wrapper: bare `totem hook install` only bounded-repairs a
+    // BOUNDED totem-owned file (PR-A semantics). An unbounded one (no end marker / trailing
+    // user content) needs `--force` (mmnto-ai/totem#2416 F3).
+    const bounded = isBoundedOwnedFile(wrapperContent, TOTEM_FILE_MARKER, TOTEM_FILE_END);
+    return {
+      name,
+      status: 'warn',
+      message: `${PREPARE_SCRIPT_REL} has drifted from canonical`,
+      remediation: bounded ? 'totem hook install' : 'totem hook install --force',
+    };
+  }
+  if (!wiredCanonical) {
+    // The canonical wrapper is present but the prepare lifecycle does not invoke it.
+    // If a DIFFERENT `prepare` already exists, `totem init` deliberately declines to touch
+    // it (Prop 289), so `totem init` cannot resolve this — name the manual line instead
+    // (mmnto-ai/totem#2416 F4). With no prepare at all, `totem init` wires it.
+    return {
+      name,
+      status: 'warn',
+      message: `prepare wrapper present but package.json \`prepare\` is not wired to \`${PREPARE_SCRIPT_COMMAND}\``,
+      remediation: prepareDifferent
+        ? `add or chain \`${PREPARE_SCRIPT_COMMAND}\` into your package.json \`prepare\` script`
+        : 'totem init',
+    };
+  }
+  return {
+    name,
+    status: 'pass',
+    message: `installed and wired (\`prepare\` → ${PREPARE_SCRIPT_COMMAND})`,
+  };
+}
+
+/** Check if a config file content has an embedding provider configured. */
+function hasEmbeddingProvider(content: string): boolean {
+  return /provider:\s*['"]?(openai|gemini|ollama)['"]?/.test(content);
+}
+
+/** Find and read the first totem config file. Returns [path, content] or null. */
+function readConfigFile(cwd: string): [string, string] | null {
+  for (const file of CONFIG_FILES) {
+    const candidate = path.join(cwd, file);
+    if (fs.existsSync(candidate)) {
+      try {
+        return [candidate, fs.readFileSync(candidate, 'utf-8')];
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+export function checkEmbeddingConfig(cwd: string): DiagnosticResult {
+  const configResult = readConfigFile(cwd);
+  if (!configResult) {
+    return {
+      name: 'Embedding',
+      status: 'skip',
+      message: 'No config (skipped)',
+    };
+  }
+
+  const [, content] = configResult;
+
+  if (!hasEmbeddingProvider(content)) {
+    return {
+      name: 'Embedding',
+      status: 'warn',
+      message: 'No embedding configured (Lite tier)',
+    };
+  }
+
+  try {
+    // Detect which provider and check for API keys
+    const isOpenAI = /provider:\s*['"]?openai['"]?/.test(content);
+    const isGemini = /provider:\s*['"]?gemini['"]?/.test(content);
+    const isOllama = /provider:\s*['"]?ollama['"]?/.test(content);
+
+    // Read .env for key checks
+    let envContent = '';
+    try {
+      const envPath = path.join(cwd, '.env');
+      if (fs.existsSync(envPath)) envContent = fs.readFileSync(envPath, 'utf-8');
+    } catch {
+      // .env unreadable — proceed with env vars only
+    }
+
+    const hasEnvKey = (key: string) =>
+      !!(process.env[key] && /\S/.test(process.env[key]!)) ||
+      new RegExp(`^\\s*${key}\\s*=\\s*\\S+`, 'm').test(envContent);
+
+    if (isOpenAI) {
+      if (hasEnvKey('OPENAI_API_KEY')) {
+        return {
+          name: 'Embedding',
+          status: 'pass',
+          message: 'openai (text-embedding-3-small)',
+        };
+      }
+      // Missing env key is an operator-setup state, not a repo defect. The
+      // repo's config is correct; the local environment is incomplete.
+      // Parallels `checkOllama` warn-on-unreachable. Empirical: under
+      // `doctor --strict` (mmnto-ai/totem#1908), this was misclassified as a
+      // gating fail in CI where the key is intentionally absent.
+      return {
+        name: 'Embedding',
+        status: 'warn',
+        message: 'OpenAI configured but OPENAI_API_KEY missing',
+        remediation: 'Set OPENAI_API_KEY in your .env file',
+      };
+    }
+
+    if (isGemini) {
+      if (hasEnvKey('GEMINI_API_KEY') || hasEnvKey('GOOGLE_API_KEY')) {
+        return {
+          name: 'Embedding',
+          status: 'pass',
+          message: 'gemini (gemini-embedding-2-preview)',
+        };
+      }
+      // See OpenAI branch above for classification rationale.
+      return {
+        name: 'Embedding',
+        status: 'warn',
+        message: 'Gemini configured but API key missing',
+        remediation: 'Set GEMINI_API_KEY or GOOGLE_API_KEY in your .env file',
+      };
+    }
+
+    if (isOllama) {
+      return {
+        name: 'Embedding',
+        status: 'pass',
+        message: 'ollama (nomic-embed-text)',
+      };
+    }
+
+    return {
+      name: 'Embedding',
+      status: 'warn',
+      message: 'No embedding configured (Lite tier)',
+    };
+  } catch {
+    return {
+      name: 'Embedding',
+      status: 'skip',
+      message: 'Could not read config',
+    };
+  }
+}
+
+/**
+ * Probe whether the Ollama daemon is reachable. Surfaces the floor-embedder
+ * expectation diagnostically (mmnto-ai/totem#1851) so consumers don't perceive
+ * the well-formed `LazyEmbedder` `TotemConfigError` as a crash and reach for
+ * a vendor-coupling workaround. Always probes regardless of configured
+ * provider — Ollama IS the floor per Tenet 16.
+ *
+ * Reads `embedding.baseUrl` from config when `provider: 'ollama'` is
+ * configured with a custom URL; otherwise probes the default
+ * (`http://localhost:11434`). The configured-but-unreachable case for
+ * `provider: 'ollama'` produces the same `warn` here as it does for any
+ * other provider; the false-`pass` in `checkEmbeddingConfig` for that
+ * exact scenario is tracked separately and intentionally left untouched
+ * to keep this PR additive.
+ */
+export async function checkOllama(config?: {
+  embedding?: { provider?: string; baseUrl?: string };
+}): Promise<DiagnosticResult> {
+  const { isOllamaAvailable } = await import('@mmnto/totem');
+
+  const configuredBaseUrl =
+    config?.embedding?.provider === 'ollama' ? config?.embedding?.baseUrl : undefined;
+  const probedUrl = configuredBaseUrl ?? 'http://localhost:11434';
+
+  const available = await isOllamaAvailable(configuredBaseUrl);
+
+  if (available) {
+    return {
+      name: 'Ollama',
+      status: 'pass',
+      message: `reachable at ${probedUrl}`,
+    };
+  }
+
+  return {
+    name: 'Ollama',
+    status: 'warn',
+    message: `not reachable at ${probedUrl} (floor not satisfied)`,
+    remediation:
+      'Totem uses Ollama as the local embedder floor (no API key, no quota). ' +
+      "Install: https://ollama.com — then 'ollama pull nomic-embed-text'. " +
+      'Or configure a cloud embedder in totem.config.ts.',
+  };
+}
+
+export function checkIndex(cwd: string, lanceDir = '.lancedb'): DiagnosticResult {
+  const configResult = readConfigFile(cwd);
+  if (!configResult || !hasEmbeddingProvider(configResult[1])) {
+    return {
+      name: 'Index',
+      status: 'skip',
+      message: 'Lite tier (no embedding)',
+    };
+  }
+
+  const lanceDbPath = path.join(cwd, lanceDir);
+  if (!fs.existsSync(lanceDbPath)) {
+    return {
+      name: 'Index',
+      status: 'warn',
+      message: `${lanceDir}/ missing`,
+      remediation: 'totem sync',
+    };
+  }
+
+  try {
+    const entries = fs.readdirSync(lanceDbPath);
+    if (entries.length === 0) {
+      return {
+        name: 'Index',
+        status: 'warn',
+        message: `${lanceDir}/ is empty`,
+        remediation: 'totem sync',
+      };
+    }
+  } catch {
+    return {
+      name: 'Index',
+      status: 'warn',
+      message: `${lanceDir}/ unreadable`,
+      remediation: 'totem sync',
+    };
+  }
+
+  return {
+    name: 'Index',
+    status: 'pass',
+    message: `${lanceDir}/ exists`,
+  };
+}
+
+export function checkLinkedIndexes(cwd: string): DiagnosticResult {
+  const configResult = readConfigFile(cwd);
+  if (!configResult) {
+    return {
+      name: 'Linked Indexes',
+      status: 'skip',
+      message: 'No config (skipped)',
+    };
+  }
+
+  const [, content] = configResult;
+
+  if (!/linkedIndexes:\s*\[/.test(content)) {
+    return {
+      name: 'Linked Indexes',
+      status: 'skip',
+      message: '0 configured',
+    };
+  }
+
+  if (!hasEmbeddingProvider(content)) {
+    return {
+      name: 'Linked Indexes',
+      status: 'skip',
+      message: 'Lite tier (no embedding)',
+    };
+  }
+
+  // Extract linked paths from the config array
+  const arrayMatch = /linkedIndexes:\s*\[([\s\S]*?)\]/.exec(content);
+  const linkedPaths: string[] = [];
+  if (arrayMatch) {
+    const arrayContent = arrayMatch[1];
+    let m: RegExpExecArray | null;
+    const strRe = /['"]([^'"]+)['"]/g;
+    while ((m = strRe.exec(arrayContent)) !== null) {
+      linkedPaths.push(m[1]);
+    }
+  }
+
+  if (linkedPaths.length === 0) {
+    return {
+      name: 'Linked Indexes',
+      status: 'skip',
+      message: '0 configured',
+    };
+  }
+
+  const issues: string[] = [];
+  const seenNames = new Set<string>();
+  let reachable = 0;
+
+  for (const linkedPath of linkedPaths) {
+    const resolvedPath = path.resolve(cwd, linkedPath);
+    const linkName = path.basename(resolvedPath).replace(/^\./, '');
+    let entryOk = true;
+
+    if (seenNames.has(linkName)) {
+      issues.push(`name collision on '${linkName}'`);
+      entryOk = false;
+    } else {
+      seenNames.add(linkName);
+    }
+
+    if (!fs.existsSync(resolvedPath)) {
+      issues.push(`'${linkName}' path does not exist (${resolvedPath})`);
+      continue;
+    }
+
+    const lanceDbPath = path.join(resolvedPath, '.lancedb');
+    if (!fs.existsSync(lanceDbPath)) {
+      issues.push(`'${linkName}' has no .lancedb index (run totem sync in ${resolvedPath})`);
+      entryOk = false;
+    }
+
+    const linkedConfig = readConfigFile(resolvedPath);
+    if (!linkedConfig) {
+      issues.push(`'${linkName}' has no totem config`);
+      entryOk = false;
+    } else {
+      const [, linkedContent] = linkedConfig;
+      if (!hasEmbeddingProvider(linkedContent)) {
+        issues.push(`'${linkName}' has no embedding provider (dimension mismatch risk)`);
+        entryOk = false;
+      }
+    }
+
+    if (entryOk) {
+      reachable++;
+    }
+  }
+
+  const n = linkedPaths.length;
+
+  if (issues.length === 0) {
+    return {
+      name: 'Linked Indexes',
+      status: 'pass',
+      message: `${n} configured, ${reachable} reachable`,
+    };
+  }
+
+  return {
+    name: 'Linked Indexes',
+    status: 'warn',
+    message: `${n} configured, ${reachable} reachable, ${issues.length} issue(s)`,
+    remediation: issues.join('; '),
+  };
+}
+
+/**
+ * Strategy-root resolver diagnostic (mmnto-ai/totem#1710).
+ *
+ * Runs `resolveStrategyRoot` and reports which precedence layer matched.
+ * Advisory only: `warn` (not `fail`) on unresolved so a freshly-cloned
+ * project without a strategy repo doesn't fail the doctor pass.
+ *
+ * Affected consumer surfaces if unresolved: MCP `describe_project`
+ * rich-state pointer, `totem proposal new` / `totem adr new`, federated
+ * search via the auto-injected strategy linkedIndex, the bench scripts
+ * under `scripts/`.
+ *
+ * Async + dynamic import to keep `@mmnto/totem` off the CLI cold-start
+ * graph (matches `checkSecretLeaks` and the rest of the diagnostics that
+ * need core).
+ */
+export async function checkStrategyRoot(
+  cwd: string,
+  config?: { strategyRoot?: string },
+): Promise<DiagnosticResult> {
+  const { resolveStrategyRoot, sanitizeForTerminal } = await import('@mmnto/totem');
+  const status = resolveStrategyRoot(cwd, { config });
+  // `status.path` and `status.reason` are derived from env/config-controlled
+  // inputs (`TOTEM_STRATEGY_ROOT`, `STRATEGY_ROOT`, `TotemConfig.strategyRoot`).
+  // A hostile env var with embedded ANSI/CR bytes would otherwise rewind the
+  // cursor or spoof colors when `totem doctor` renders the diagnostic
+  // (mmnto-ai/totem#1710 R4 / CR R4 Major). R6 (CR R6 Major):
+  // `sanitizeForTerminal` intentionally preserves `\n`/`\t` for
+  // multi-line content, but these single-line diagnostic strings must
+  // ALSO collapse those bytes — otherwise a value like
+  // `TOTEM_STRATEGY_ROOT=$'\n\n[fake] OK'` could forge an extra log
+  // line. `flatten` runs after the ANSI/CR strip.
+  const flatten = (s: string): string =>
+    s
+      .replace(/[\t\n]+/g, ' ')
+      .replace(/ {2,}/g, ' ')
+      .trim();
+  if (status.resolved) {
+    const rel = flatten(sanitizeForTerminal(path.relative(cwd, status.path) || '.'));
+    return {
+      name: 'Strategy Root',
+      status: 'pass',
+      message: `${status.source} → ${rel}`,
+    };
+  }
+
+  return {
+    name: 'Strategy Root',
+    status: 'warn',
+    message: 'unresolved',
+    remediation: `${flatten(sanitizeForTerminal(status.reason))} Affected: describe_project pointer, proposal/adr scaffolding, federated strategy search, bench scripts.`,
+  };
+}
+
+export async function checkSecretLeaks(
+  cwd: string,
+  totemDir = '.totem',
+): Promise<DiagnosticResult> {
+  const filesToScan: string[] = [];
+
+  // Collect files to scan
+  const candidates = ['AGENTS.md', 'CLAUDE.md', 'GEMINI.md', '.cursorrules'];
+  for (const file of candidates) {
+    const fullPath = path.join(cwd, file);
+    if (fs.existsSync(fullPath)) {
+      filesToScan.push(fullPath);
+    }
+  }
+
+  // Scan .totem/lessons/*.md
+  const lessonsDir = path.join(cwd, totemDir, 'lessons');
+  if (fs.existsSync(lessonsDir)) {
+    try {
+      const entries = fs.readdirSync(lessonsDir);
+      for (const entry of entries) {
+        if (entry.endsWith('.md')) {
+          filesToScan.push(path.join(lessonsDir, entry));
+        }
+      }
+    } catch {
+      // lessons dir unreadable — skip
+    }
+  }
+
+  if (filesToScan.length === 0) {
+    return {
+      name: 'Secret Scan',
+      status: 'pass',
+      message: 'No files to scan',
+    };
+  }
+
+  // Load user-defined custom secrets (dynamic import to avoid top-level @mmnto/totem dep)
+  const { loadCustomSecrets, compileCustomSecrets } = await import('@mmnto/totem');
+  const customSecrets = loadCustomSecrets(cwd, totemDir);
+  const customPatterns = compileCustomSecrets(customSecrets);
+
+  const allPatterns = [...SECRET_PATTERNS, ...customPatterns];
+  const leaks: string[] = [];
+
+  for (const filePath of filesToScan) {
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      for (const pattern of allPatterns) {
+        const matches = content.match(new RegExp(pattern.source, 'g'));
+        if (matches) {
+          for (const match of matches) {
+            // Check if this looks like a placeholder
+            const isPlaceholder = PLACEHOLDER_PATTERNS.some((pp) => pp.test(match));
+            if (!isPlaceholder) {
+              const rel = path.relative(cwd, filePath);
+              leaks.push(`${rel}: ${match.slice(0, 8)}...`);
+            }
+          }
+        }
+      }
+    } catch {
+      // File unreadable — skip
+    }
+  }
+
+  if (leaks.length > 0) {
+    return {
+      name: 'Secret Scan',
+      status: 'fail',
+      message: `${leaks.length} potential leaked key(s) found`,
+      remediation: 'Rotate keys immediately and remove from tracked files',
+    };
+  }
+
+  return {
+    name: 'Secret Scan',
+    status: 'pass',
+    message: 'No leaked keys detected',
+  };
+}
+
+export function checkSecretsFileTracked(cwd: string, totemDir = '.totem'): DiagnosticResult {
+  const secretsPath = path.join(totemDir, 'secrets.json');
+  try {
+    const result = spawnSync('git', ['ls-files', '--recurse-submodules', secretsPath], {
+      cwd,
+      encoding: 'utf-8',
+    });
+    if (result.error) throw result.error;
+    const output = (result.stdout ?? '').trim();
+    if (output.length > 0) {
+      return {
+        name: 'Secrets File Security',
+        status: 'fail',
+        message: `${secretsPath} is tracked by git — secrets may be exposed`,
+        remediation: `Run: git rm --cached ${secretsPath}`,
+      };
+    }
+  } catch {
+    // git not available or not a repo — skip
+  }
+  return {
+    name: 'Secrets File Security',
+    status: 'pass',
+    message: 'secrets.json is not tracked by git',
+  };
+}
+
+// ─── AGENTS.md canonical-redirect check (Proposal 272 § 6.7 / mmnto-ai/totem#1905) ───
+
+/**
+ * Maximum byte size for a `CLAUDE.md` that's purely a thin redirect to
+ * `AGENTS.md`. Anchored to Proposal 272 § 6.7. Empirical headroom:
+ * the largest post-migration cohort redirect is 558 bytes.
+ */
+export const CLAUDE_MD_REDIRECT_MAX_BYTES = 600;
+
+/**
+ * Minimal shape signature for a `CLAUDE.md` redirect to `AGENTS.md`
+ * per ADR-038. The canonical phrase plus the link target is load-bearing;
+ * surrounding wording is intentionally unconstrained so future template
+ * tweaks survive without breaking every consumer.
+ */
+export const AGENTS_MD_REDIRECT_PATTERN =
+  /canonical agent instructions[^.]*\[`AGENTS\.md`\]\(AGENTS\.md\)/i;
+
+export function checkAgentsMdCanonical(cwd: string): DiagnosticResult {
+  const hasPackageJson = fs.existsSync(path.join(cwd, 'package.json'));
+  const hasGitDir = fs.existsSync(path.join(cwd, '.git')); // totem-context: predicate is "is THIS cwd a project root" (Proposal 272 § 6.7); existsSync correctly handles both .git/ dir and .git file (worktrees). resolveGitRoot would traverse UP and report a parent repo, which is the wrong semantic.
+
+  if (!hasPackageJson && !hasGitDir) {
+    return {
+      name: 'AGENTS.md Canonical',
+      status: 'skip',
+      message: 'not a project root',
+    };
+  }
+
+  const claudeMdPath = path.join(cwd, 'CLAUDE.md');
+  if (!fs.existsSync(claudeMdPath)) {
+    return {
+      name: 'AGENTS.md Canonical',
+      status: 'pass',
+      message: 'no CLAUDE.md (no enforcement)',
+    };
+  }
+
+  let content: string;
+  try {
+    content = fs.readFileSync(claudeMdPath, 'utf-8'); // totem-context: intentional cleanup — best-effort sync read of a tiny on-disk file (~1KB max for the canonical redirect). The doctor pipeline is sync; the check intentionally reads unstaged on-disk state (the whole point is to surface disk-vs-canonical drift). A permission / IO error surfaces as `warn`, matching the `checkCompiledRules` / `checkConfig` convention.
+  } catch {
+    return {
+      name: 'AGENTS.md Canonical',
+      status: 'warn',
+      message: 'CLAUDE.md unreadable',
+    };
+  }
+
+  const bytes = Buffer.byteLength(content, 'utf-8');
+  const matchesRedirect = AGENTS_MD_REDIRECT_PATTERN.test(content); // totem-context: non-global regex on markdown document content (not shell/command input); the .test()-related lessons target command-validation contexts. The pattern is anchored by its load-bearing literal substrings ("canonical agent instructions" + the AGENTS.md link), so ^ would be wrong here.
+
+  // Whenever CLAUDE.md claims to be a redirect, AGENTS.md MUST exist —
+  // independent of size. Without this, a small CLAUDE.md copied from the
+  // template (but with no AGENTS.md authored) would silently pass.
+  if (matchesRedirect && !fs.existsSync(path.join(cwd, 'AGENTS.md'))) {
+    return {
+      name: 'AGENTS.md Canonical',
+      status: 'fail',
+      message: 'CLAUDE.md redirects to AGENTS.md but AGENTS.md does not exist',
+      remediation: 'Create AGENTS.md per ADR-038',
+    };
+  }
+
+  // Below the size threshold, CLAUDE.md is too small to carry meaningful
+  // load-bearing content. Proposal 272 § 6.7 picks 600 bytes as the gate.
+  if (bytes <= CLAUDE_MD_REDIRECT_MAX_BYTES) {
+    return {
+      name: 'AGENTS.md Canonical',
+      status: 'pass',
+      message: matchesRedirect
+        ? `CLAUDE.md is a redirect (${bytes} bytes)`
+        : `CLAUDE.md is under the redirect threshold (${bytes} bytes)`,
+    };
+  }
+
+  if (!matchesRedirect) {
+    return {
+      name: 'AGENTS.md Canonical',
+      status: 'fail',
+      message: `CLAUDE.md is ${bytes} bytes and not a redirect to AGENTS.md (ADR-038)`,
+      remediation: 'Lift content to AGENTS.md and replace CLAUDE.md with the redirect template',
+    };
+  }
+
+  return {
+    name: 'AGENTS.md Canonical',
+    status: 'pass',
+    message: `CLAUDE.md is a verbose redirect (${bytes} bytes)`,
+  };
+}
+
+// ─── Upgrade candidate check (mmnto/totem#1131) ────────────────────
+
+/**
+ * Pure helper: scan compiled rules + metrics and return structured upgrade candidates.
+ * Used by both `checkUpgradeCandidates` (read-only diagnostic) and `runSelfHealing`
+ * (auto-recompile phase). Returns null if rules/metrics cannot be loaded.
+ *
+ * IMPORTANT: Uses `contextCounts` (per-context match buckets), NOT `triggerCount`
+ * (the rolled-up total). `triggerCount` includes ALL matches, not just code matches.
+ */
+export async function findUpgradeCandidates(
+  cwd: string,
+  totemDir = '.totem',
+): Promise<UpgradeCandidate[] | null> {
+  const totemDirAbs = path.join(cwd, totemDir);
+  const rulesPath = path.join(totemDirAbs, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) return null;
+
+  try {
+    // Dynamic import to avoid top-level @mmnto/totem dep (mirrors GC phase)
+    const { loadCompiledRulesFile, loadRuleMetrics } = await import('@mmnto/totem');
+    const rulesFile = loadCompiledRulesFile(rulesPath);
+    const metricsFile = loadRuleMetrics(totemDirAbs);
+
+    const candidates: UpgradeCandidate[] = [];
+    for (const rule of rulesFile.rules) {
+      // Only regex rules carry trustworthy non-code telemetry. `ast-grep` rules
+      // are already structural; the legacy `ast` (Tree-sitter) engine does not
+      // populate `astContext`, so its hits land in the `unknown` bucket and
+      // cannot be reasoned about here.
+      if (rule.engine !== 'regex') continue;
+
+      // Skip manual regex rules. Manual rules take the Pipeline 1 path in
+      // `compileLesson`, which never receives `telemetryPrefix` — so a
+      // `--upgrade` run on a manual rule would just recompile the same
+      // hand-written pattern and produce a permanent false positive.
+      //
+      // Post-mmnto/totem#1265: prefer the explicit `manual: true` flag set in
+      // `buildManualRule`. Pre-mmnto/totem#1265 rules don't have the flag, so fall back to
+      // the legacy `lessonHeading === message` heuristic — which only worked
+      // because pre-#1265 manual rules had no way to express a custom message
+      // and the compiler hardcoded `message: lesson.heading`. After mmnto/totem#1265 added
+      // Pipeline 1 Message field support, manual rules can have rich messages
+      // distinct from their headings, breaking the heuristic for new rules.
+      if (rule.manual === true || rule.lessonHeading === rule.message) continue;
+
+      const metric = metricsFile.rules[rule.lessonHash];
+      if (!metric || !metric.contextCounts) continue;
+
+      // Exclude `unknown` from both numerator and denominator — it represents
+      // historical / unclassified telemetry (pre-context-aware hits, or seeding
+      // via `triggerCount - 1`) and is not evidence of non-code leakage.
+      // The `?? 0` defaults are defensive: the Zod schema at
+      // packages/core/src/rule-metrics.ts declares every contextCounts field
+      // as a non-negative integer, but a hand-edited rule-metrics.json could
+      // bypass that and produce NaN in the arithmetic below.
+      const cc = metric.contextCounts;
+      const code = cc.code ?? 0;
+      const strings = cc.string ?? 0;
+      const comments = cc.comment ?? 0;
+      const regexes = cc.regex ?? 0;
+      const classifiedTotal = code + strings + comments + regexes;
+      if (classifiedTotal < MIN_CONTEXT_EVENTS) continue;
+
+      const nonCodeRatio = (strings + comments + regexes) / classifiedTotal;
+      if (nonCodeRatio > NON_CODE_THRESHOLD) {
+        candidates.push({
+          lessonHash: rule.lessonHash,
+          heading: rule.lessonHeading ?? rule.lessonHash,
+          engine: 'regex',
+          total: classifiedTotal,
+          codeCount: code,
+          nonCodeRatio,
+        });
+      }
+    }
+    // Highest non-code ratio first for human readability
+    return candidates.sort((a, b) => b.nonCodeRatio - a.nonCodeRatio);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Find regex/ast rules whose telemetry shows >NON_CODE_THRESHOLD of matches landing
+ * in non-code contexts (strings, comments, regex literals). These are good candidates
+ * for being upgraded to structural ast-grep patterns via `totem lesson compile --upgrade`.
+ */
+export async function checkUpgradeCandidates(
+  cwd: string,
+  totemDir = '.totem',
+): Promise<DiagnosticResult> {
+  const rulesPath = path.join(cwd, totemDir, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) {
+    return {
+      name: 'Upgrade Candidates',
+      status: 'skip',
+      message: 'compiled-rules.json missing',
+    };
+  }
+
+  const candidates = await findUpgradeCandidates(cwd, totemDir);
+  if (candidates === null) {
+    return {
+      name: 'Upgrade Candidates',
+      status: 'skip',
+      message: 'Could not analyze rules',
+    };
+  }
+
+  if (candidates.length === 0) {
+    return {
+      name: 'Upgrade Candidates',
+      status: 'pass',
+      message: 'No regex rules exceed non-code threshold',
+    };
+  }
+
+  const summary = candidates
+    .map(
+      (c) =>
+        `${c.lessonHash} (${c.engine}, ${(c.nonCodeRatio * 100).toFixed(0)}% non-code, ${c.total} matches)`,
+    )
+    .join(', ');
+
+  const firstHash = candidates[0]!.lessonHash;
+  return {
+    name: 'Upgrade Candidates',
+    status: 'warn',
+    message: `${candidates.length} rule(s) firing in non-code contexts: ${summary}`,
+    remediation: `Run \`totem lesson compile --upgrade ${firstHash}\` to re-compile through Claude Sonnet with telemetry guidance.`,
+  };
+}
+
+// ─── Output formatting ──────────────────────────────────
+
+function statusIcon(status: CheckStatus): string {
+  switch (status) {
+    case 'pass':
+      return pc.green('\u2713');
+    case 'warn':
+      return pc.yellow('!');
+    case 'fail':
+      return pc.red('\u2717');
+    case 'skip':
+      return pc.dim('-');
+  }
+}
+
+function statusColor(status: CheckStatus, text: string): string {
+  switch (status) {
+    case 'pass':
+      return pc.green(text);
+    case 'warn':
+      return pc.yellow(text);
+    case 'fail':
+      return pc.red(text);
+    case 'skip':
+      return pc.dim(text);
+  }
+}
+
+function formatResult(result: DiagnosticResult): string {
+  const icon = statusIcon(result.status);
+  const name = result.name.padEnd(18);
+  const msg = statusColor(result.status, result.message);
+  let line = `  ${icon} ${name} ${msg}`;
+  if (result.remediation && (result.status === 'warn' || result.status === 'fail')) {
+    line += pc.dim(` → ${result.remediation}`);
+  }
+  return line;
+}
+
+// ─── Self-healing constants ─────────────────────────────
+
+/** Bypass rate above which a rule is considered "struggling" and eligible for downgrade. */
+export const BYPASS_THRESHOLD = 0.3;
+
+/** Minimum total events (triggers + bypasses) required before acting on a rule. */
+export const MIN_EVENTS = 5;
+
+// ─── Upgrade-candidate constants (mmnto/totem#1131) ────────────────
+
+/** Non-code match ratio above which a regex/ast rule is flagged for ast-grep upgrade. */
+export const NON_CODE_THRESHOLD = 0.2; // 20%+ non-code matches → upgrade candidate
+
+/** Minimum total context events required before flagging a rule as an upgrade candidate. */
+export const MIN_CONTEXT_EVENTS = 5;
+
+// ─── Upgrade-candidate types ────────────────────────────
+
+export interface UpgradeCandidate {
+  lessonHash: string;
+  heading: string;
+  /**
+   * Always `'regex'` — `findUpgradeCandidates` filters to regex rules only
+   * because only they carry trustworthy non-code telemetry. Narrowed from
+   * the broader engine union so the type matches the implementation.
+   */
+  engine: 'regex';
+  total: number;
+  codeCount: number;
+  nonCodeRatio: number;
+}
+
+// ─── Stale-rule detection (mmnto-ai/totem#1483) ────────
+
+/**
+ * Pure helper signature: a staleness candidate as returned by
+ * `findStaleRules`. The `severity` distinction lets the formatter label
+ * security rules visually distinct from standard rules without the caller
+ * needing to re-derive the category from the compiled rule.
+ */
+export interface StaleRuleCandidate {
+  lessonHash: string;
+  heading: string;
+  evaluationCount: number;
+  severity: 'standard' | 'security';
+  /** The recommended next step surfaced in the advisory text. */
+  recommendation: string;
+  /** Compile-metadata flags relevant to the advisory. */
+  flags: {
+    unverified?: boolean;
+    immutable?: boolean;
+    category?: string;
+  };
+}
+
+/**
+ * Pure helper: scan compiled rules + metrics and return structured
+ * stale-rule candidates. A rule is stale when it has accrued at least
+ * `staleRuleWindow` evaluations over its lifetime and has never landed a
+ * match in code context (`contextCounts.code === 0`).
+ *
+ * Security rules (`category === 'security'` OR `immutable === true`) get
+ * flagged with the `security` severity so the formatter can mark them
+ * with a higher-severity label. Per the design doc, doctor never
+ * recommends archival for security rules.
+ */
+export async function findStaleRules(
+  cwd: string,
+  totemDir = '.totem',
+  thresholds: { staleRuleWindow: number } = { staleRuleWindow: 10 },
+): Promise<StaleRuleCandidate[] | null> {
+  const totemDirAbs = path.join(cwd, totemDir);
+  const rulesPath = path.join(totemDirAbs, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) return null;
+
+  try {
+    const { loadCompiledRulesFile, loadRuleMetrics } = await import('@mmnto/totem');
+    const rulesFile = loadCompiledRulesFile(rulesPath);
+    const metricsFile = loadRuleMetrics(totemDirAbs);
+
+    const candidates: StaleRuleCandidate[] = [];
+    for (const rule of rulesFile.rules) {
+      // Skip archived rules — the advisory addresses active rules only.
+      if (rule.status === 'archived') continue;
+
+      const metric = metricsFile.rules[rule.lessonHash];
+      const evaluationCount = metric?.evaluationCount ?? 0;
+
+      // v1 staleness check: cumulative lifetime evaluations against a single
+      // threshold. A rule that fired once years ago then went silent stays
+      // exempt forever. mmnto-ai/totem#1550 tracks swapping to rolling-window
+      // semantics via a `RuleMetric.runHistory` ring buffer; the config key
+      // stays, only the math upgrades.
+      if (evaluationCount < thresholds.staleRuleWindow) continue;
+
+      const codeMatches = metric?.contextCounts?.code ?? 0;
+      if (codeMatches > 0) continue;
+
+      const isSecurity = rule.category === 'security' || rule.immutable === true;
+      const recommendation = isSecurity
+        ? `Review and refine the rule via totem compile --upgrade ${rule.lessonHash}. Do not archive security rules.`
+        : `Run totem compile --upgrade ${rule.lessonHash} to refine the pattern, or archive the rule by setting status: 'archived'.`;
+
+      candidates.push({
+        lessonHash: rule.lessonHash,
+        heading: rule.lessonHeading ?? rule.lessonHash,
+        evaluationCount,
+        severity: isSecurity ? 'security' : 'standard',
+        recommendation,
+        flags: {
+          unverified: rule.unverified,
+          immutable: rule.immutable,
+          category: rule.category,
+        },
+      });
+    }
+    // Surface security rules first, then by evaluationCount descending so the
+    // stalest rules lead the list.
+    return candidates.sort((a, b) => {
+      if (a.severity !== b.severity) return a.severity === 'security' ? -1 : 1;
+      return b.evaluationCount - a.evaluationCount;
+    });
+  } catch (err) {
+    // Best-effort fallback — degrade to "no data" so a corrupt rules or
+    // metrics file does not crash the doctor pipeline. Matches the
+    // `findUpgradeCandidates` sibling path in this file. The caller wraps
+    // the root cause into the telemetry fallback advisory rather than
+    // dropping the signal.
+    if (err instanceof Error && err.message.length === 0) {
+      throw err;
+    }
+    return null;
+  }
+}
+
+/**
+ * Stale-rule advisory diagnostic. Returns a single DiagnosticResult
+ * regardless of how many rules were flagged; the details list is
+ * serialized into the `message` + `remediation` fields. Per the design
+ * doc, this is advisory-only — no auto-archive, no side effects on the
+ * rules file.
+ */
+export async function checkStaleRules(
+  cwd: string,
+  totemDir = '.totem',
+  thresholds?: { staleRuleWindow: number },
+): Promise<DiagnosticResult> {
+  const rulesPath = path.join(cwd, totemDir, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) {
+    return {
+      name: 'Stale Rules',
+      status: 'skip',
+      message: 'compiled-rules.json missing',
+    };
+  }
+
+  const candidates = await findStaleRules(cwd, totemDir, thresholds);
+  if (candidates === null) {
+    return {
+      name: 'Stale Rules',
+      status: 'skip',
+      message: 'Could not analyze rules',
+    };
+  }
+
+  if (candidates.length === 0) {
+    return {
+      name: 'Stale Rules',
+      status: 'pass',
+      message:
+        'All active rules have exercised code-context hits or are still accruing evaluations',
+    };
+  }
+
+  const securityCount = candidates.filter((c) => c.severity === 'security').length;
+  const standardCount = candidates.length - securityCount;
+
+  // Build a compact summary line for message. Detailed per-rule guidance
+  // rides in remediation.
+  const summaryParts: string[] = [];
+  if (securityCount > 0) summaryParts.push(`${securityCount} security`);
+  if (standardCount > 0) summaryParts.push(`${standardCount} standard`);
+  const summary = summaryParts.join(', ');
+
+  const top = candidates[0]!;
+  return {
+    name: 'Stale Rules',
+    status: 'warn',
+    message: `${candidates.length} rule(s) flagged stale (${summary}); leader: ${top.lessonHash.slice(0, 8)} "${top.heading}" after ${top.evaluationCount} runs with 0 code-context hits`,
+    remediation: top.recommendation,
+  };
+}
+
+// ─── Grandfathered-rule advisory (mmnto-ai/totem#1603) ─
+
+/**
+ * ISO timestamp for the 1.13.0 ship date. Rules whose vintage timestamp
+ * precedes this never saw the ADR-088 Phase 1 substrate fields
+ * (`badExample`, `goodExample`, `unverified`) during their compile. Used
+ * by `findLegacyGrandfatheredRules` to categorize the pre-zero-trust
+ * cohort the 2026-04-20 audit measured at 357 of 378 active rules.
+ */
+export const V_1_13_0_SHIP_DATE_ISO = '2026-04-07T00:00:00.000Z';
+
+export type GrandfatheredReasonCode = 'vintage-pre-1.13.0' | 'no-badExample' | 'no-goodExample';
+
+export interface GrandfatheredRuleCandidate {
+  lessonHash: string;
+  heading: string;
+  /** Non-empty: rules with zero applicable reasons are not returned. */
+  reasons: GrandfatheredReasonCode[];
+  /** `createdAt` when present, `compiledAt` otherwise; used for the vintage check. */
+  vintage: string;
+}
+
+/**
+ * Pure helper: scan compiled rules and return the grandfathered
+ * pre-zero-trust cohort categorized by reason. A rule is a candidate
+ * when it is active (`status !== 'archived'`) and lacks the `unverified`
+ * flag from ADR-089 part 1 (mmnto-ai/totem#1581). Each candidate gets
+ * every reason that applies:
+ *
+ *   - `vintage-pre-1.13.0`: vintage timestamp precedes the 1.13.0 ship date.
+ *   - `no-badExample`: empty or absent `badExample` field.
+ *   - `no-goodExample`: empty or absent `goodExample` field.
+ *
+ * Rules with at least one reason are returned; rules that satisfy all
+ * three substrate checks are omitted.
+ *
+ * Returns `null` when `compiled-rules.json` is missing or unreadable,
+ * matching the fallback convention used by `findStaleRules` so the
+ * caller can render a `skip` diagnostic rather than fail the pipeline.
+ */
+export async function findLegacyGrandfatheredRules(
+  cwd: string,
+  totemDir = '.totem',
+): Promise<GrandfatheredRuleCandidate[] | null> {
+  const rulesPath = path.join(cwd, totemDir, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) return null;
+
+  try {
+    const { loadCompiledRulesFile } = await import('@mmnto/totem');
+    const rulesFile = loadCompiledRulesFile(rulesPath);
+
+    const candidates: GrandfatheredRuleCandidate[] = [];
+    for (const rule of rulesFile.rules) {
+      if (rule.status === 'archived') continue;
+      if (rule.unverified === true) continue;
+
+      const vintage = rule.createdAt ?? rule.compiledAt;
+      const reasons: GrandfatheredReasonCode[] = [];
+      if (vintage < V_1_13_0_SHIP_DATE_ISO) reasons.push('vintage-pre-1.13.0');
+      if (!rule.badExample || rule.badExample.trim().length === 0) {
+        reasons.push('no-badExample');
+      }
+      if (!rule.goodExample || rule.goodExample.trim().length === 0) {
+        reasons.push('no-goodExample');
+      }
+
+      if (reasons.length === 0) continue;
+
+      candidates.push({
+        lessonHash: rule.lessonHash,
+        heading: rule.lessonHeading,
+        reasons,
+        vintage,
+      });
+    }
+
+    // Sort by reason count desc (worst-off first), then vintage asc
+    // (oldest first) so the leader line surfaces the most affected rule.
+    return candidates.sort((a, b) => {
+      if (a.reasons.length !== b.reasons.length) return b.reasons.length - a.reasons.length;
+      return a.vintage.localeCompare(b.vintage);
+    });
+  } catch (err) {
+    // Matches `findStaleRules` fallback: corrupt or unreadable rules file
+    // degrades to "no data" so one bad read cannot crash the diagnostic
+    // pipeline. Defective Error objects (empty message) still propagate.
+    if (err instanceof Error && err.message.length === 0) {
+      throw err;
+    }
+    return null;
+  }
+}
+
+/**
+ * Grandfathered-rule advisory diagnostic. Summarizes the pre-zero-trust
+ * cohort by reason code. Advisory-only (`warn`): ADR-091 Stage 4
+ * Codebase Verifier (1.16.0, mmnto-ai/totem#1504) is the empirical
+ * audit path; this check gives users a triage-able surface until that
+ * ships.
+ */
+export async function checkGrandfatheredRules(
+  cwd: string,
+  totemDir = '.totem',
+): Promise<DiagnosticResult> {
+  const rulesPath = path.join(cwd, totemDir, 'compiled-rules.json');
+  if (!fs.existsSync(rulesPath)) {
+    return {
+      name: 'Grandfathered Rules',
+      status: 'skip',
+      message: 'compiled-rules.json missing',
+    };
+  }
+
+  const candidates = await findLegacyGrandfatheredRules(cwd, totemDir);
+  if (candidates === null) {
+    return {
+      name: 'Grandfathered Rules',
+      status: 'skip',
+      message: 'Could not analyze rules',
+    };
+  }
+
+  if (candidates.length === 0) {
+    return {
+      name: 'Grandfathered Rules',
+      status: 'pass',
+      message: 'All active rules carry the ADR-089 zero-trust substrate',
+    };
+  }
+
+  const reasonCounts: Record<GrandfatheredReasonCode, number> = {
+    'vintage-pre-1.13.0': 0,
+    'no-badExample': 0,
+    'no-goodExample': 0,
+  };
+  for (const candidate of candidates) {
+    for (const reason of candidate.reasons) {
+      reasonCounts[reason]++;
+    }
+  }
+
+  const summaryParts: string[] = [];
+  if (reasonCounts['vintage-pre-1.13.0'] > 0) {
+    summaryParts.push(`${reasonCounts['vintage-pre-1.13.0']} vintage-pre-1.13.0`);
+  }
+  if (reasonCounts['no-badExample'] > 0) {
+    summaryParts.push(`${reasonCounts['no-badExample']} no-badExample`);
+  }
+  if (reasonCounts['no-goodExample'] > 0) {
+    summaryParts.push(`${reasonCounts['no-goodExample']} no-goodExample`);
+  }
+
+  return {
+    name: 'Grandfathered Rules',
+    status: 'warn',
+    message: `${candidates.length} grandfathered rule(s): ${summaryParts.join(', ')}`,
+    remediation:
+      'Pre-zero-trust cohort. ADR-091 Stage 4 Codebase Verifier (1.16.0) will empirically validate these against real code; see mmnto-ai/totem#1504.',
+  };
+}
+
+// ─── Types ──────────────────────────────────────────────
+
+export interface DoctorOptions {
+  pr?: boolean;
+  /**
+   * Raw commander `--strict [tier]` value (`true` for the bare flag, a string
+   * for `--strict=<tier>`). When set, callers should treat gate-class
+   * diagnostics as a gating condition (exit non-zero) — resolve via
+   * `resolveStrictTier` and apply `doctorGateFailed` at the CLI edge. The flag
+   * itself doesn't change what `doctorCommand` returns — the exit-code
+   * decision lives at the CLI edge so this function stays composable and free
+   * of process-exit side effects.
+   *
+   * Reference: mmnto-ai/totem#1908 (Proposal 273 § 6 Q2 / § 7 routing matrix
+   * row 5); mmnto-ai/totem#2385 (warn tier — the all-wiring oracle).
+   */
+  strict?: boolean | string;
+  /**
+   * Test seam for the ambient `Estate` row. Production callers omit it and the
+   * row reads the real user-level registry; tests pass an empty registry so the
+   * suite never shells git at whatever repos this machine happens to have
+   * synced (same hermeticity reason as the mocked `fetch` for the Ollama probe).
+   */
+  estateSeamsForTest?: Parameters<typeof checkEstate>[0];
+}
+
+// ─── Self-healing flow ──────────────────────────────────
+
+// totem-context: spawnSync, fs, path, and pc are static imports at lines 1-5 of this file. The review pipeline only sees diff hunks, so new references to these symbols far from the import block should not be flagged as undefined.
+export async function runSelfHealing(cwd: string): Promise<void> {
+  // Note: we do NOT pre-flight `gh` here. The diagnostic + downgrade + upgrade
+  // work is still valuable on a machine without gh installed — the user just
+  // can't auto-open a PR. The try/catch around `gh pr create` below catches the
+  // missing-dependency case and tells the user how to push + open the PR
+  // manually, which is better UX than aborting all the work up front. (The
+  // original GCA suggestion to add requireGhCli() matches commands like
+  // `triage-pr` whose sole purpose is PR interaction; doctor's purpose is
+  // diagnosis, so gh is a nice-to-have, not a hard requirement.)
+
+  // Load config to get totemDir
+  const { loadConfig, resolveConfigPath } = await import('../utils.js');
+  const configPath = resolveConfigPath(cwd);
+  const config = await loadConfig(configPath);
+  const totemDir = path.join(cwd, config.totemDir);
+  const rulesPath = path.join(totemDir, 'compiled-rules.json');
+  // compileCommand rewrites this file on every --upgrade call, so the
+  // upgrade phase needs to stage it alongside compiled-rules.json (or revert
+  // it if no actual changes land) to keep the working tree clean.
+  const manifestPath = path.join(totemDir, 'compile-manifest.json');
+
+  console.error(`\n${pc.cyan('[Auto-Healing]')} Analyzing Trap Ledger...`);
+
+  const { analyzeLedger } = await import('./ledger-analyzer.js');
+  const stats = await analyzeLedger(totemDir, (msg) => console.error(pc.dim(`  ${msg}`)));
+
+  // ─── Guard: abort if compiled-rules.json has uncommitted changes ──
+  let gitDirty = false;
+  try {
+    const gitResult = spawnSync('git', ['status', '--porcelain', rulesPath], {
+      cwd,
+      encoding: 'utf-8',
+    });
+    const gitStatus = (gitResult.stdout ?? '').trim();
+    if (gitStatus) {
+      console.error(
+        pc.red('  ERROR: compiled-rules.json has uncommitted changes. Commit or stash first.'),
+      );
+      gitDirty = true;
+    }
+  } catch {
+    // Not a git repo or git not available — proceed anyway
+  }
+
+  // ─── Downgrade phase: demote noisy rules ─────────────
+  const downgraded: Array<{ ruleId: string; heading: string; rate: number }> = [];
+
+  if (stats.size === 0) {
+    console.error(
+      pc.dim('  No ledger data. Run totem lint with some // totem-context: overrides first.'),
+    );
+  } else {
+    // Find struggling rules
+    const struggling = [...stats.entries()]
+      .filter(([, s]) => s.bypassRate > BYPASS_THRESHOLD && s.totalEvents >= MIN_EVENTS)
+      .sort((a, b) => b[1].bypassRate - a[1].bypassRate);
+
+    if (struggling.length === 0) {
+      console.error(pc.green('  No rules exceed the 30% bypass threshold. All healthy.'));
+    } else {
+      console.error(
+        `  Found ${struggling.length} rule(s) exceeding ${BYPASS_THRESHOLD * 100}% bypass rate:\n`,
+      );
+
+      if (!gitDirty) {
+        // Downgrade each struggling rule
+        const { downgradeRuleToWarning } = await import('./rule-mutator.js');
+
+        for (const [ruleId, ruleStats] of struggling) {
+          const result = downgradeRuleToWarning(rulesPath, ruleId);
+          if (result.downgraded) {
+            const pct = (ruleStats.bypassRate * 100).toFixed(0);
+            console.error(
+              `  ${pc.yellow('↓')} ${result.ruleHeading ?? ruleId} — ${pct}% bypass rate (${ruleStats.bypassCount}/${ruleStats.totalEvents} events)`,
+            );
+            downgraded.push({
+              ruleId,
+              heading: result.ruleHeading ?? ruleId,
+              rate: ruleStats.bypassRate,
+            });
+          } else {
+            console.error(
+              pc.dim(`  - ${result.ruleHeading ?? ruleId} — already at warning, skipping`),
+            );
+          }
+        }
+
+        if (downgraded.length > 0) {
+          console.error(
+            `\n  ${pc.green(`Downgraded ${downgraded.length} rule(s) from error → warning.`)}`,
+          );
+        }
+      }
+    }
+  }
+
+  // ─── GC phase: archive stale rules ───────────────────
+  const { shouldArchiveRule } = await import('./gc-rules.js');
+  let archivedCount = 0;
+
+  // GC is opt-in: only runs when garbageCollection is explicitly configured
+  const gcConfig = config.garbageCollection;
+  if (gcConfig && gcConfig.enabled !== false && !gitDirty) {
+    console.error(`\n${pc.cyan('[Auto-Healing]')} Checking for stale rules to archive...`);
+
+    // fs is statically imported at the top of this file (line 2); no need to
+    // re-import dynamically here (mmnto/totem#1234 CR cleanup).
+    if (!fs.existsSync(rulesPath)) {
+      console.error(pc.dim('  No compiled-rules.json found. Skipping GC.'));
+    } else {
+      const {
+        loadCompiledRulesFile,
+        saveCompiledRulesFile,
+        loadRuleMetrics,
+      } = // totem-context: verified — both functions exist in core/compiler.ts and core/index.ts
+        await import('@mmnto/totem');
+      const rulesFile = loadCompiledRulesFile(rulesPath);
+      const metricsFile = loadRuleMetrics(totemDir); // returns { version, rules: Record<hash, RuleMetric> }
+
+      for (const rule of rulesFile.rules) {
+        const ruleMetrics = metricsFile.rules[rule.lessonHash];
+        const reason = shouldArchiveRule(
+          {
+            lessonHash: rule.lessonHash,
+            createdAt: rule.createdAt,
+            compiledAt: rule.compiledAt,
+            category: rule.category,
+            status: rule.status ?? 'active',
+          },
+          ruleMetrics
+            ? { triggerCount: ruleMetrics.triggerCount, suppressCount: ruleMetrics.suppressCount }
+            : undefined,
+          gcConfig,
+        );
+
+        if (reason) {
+          rule.status = 'archived';
+          rule.archivedReason = reason;
+          archivedCount++;
+          console.error(`  ${pc.dim('🗃')} ${rule.lessonHeading ?? rule.lessonHash} — ${reason}`);
+        }
+      }
+
+      if (archivedCount > 0) {
+        saveCompiledRulesFile(rulesPath, rulesFile);
+        console.error(`\n  ${pc.green(`Archived ${archivedCount} stale rule(s).`)}`);
+      } else {
+        console.error(pc.green('  No stale rules found. All active rules have recent activity.'));
+      }
+    } // end fs.existsSync guard
+  }
+
+  // ─── Upgrade phase: re-compile flagged rules through Sonnet (mmnto/totem#1131, #1235) ─
+  const upgraded: UpgradeCandidate[] = [];
+  // Set to true whenever we invoke compileCommand({ upgradeBatch }) — even for
+  // noop outcomes — because the call rewrites compile-manifest.json. Drives
+  // the manifest-revert / manifest-stage decision below.
+  let upgradePhaseTouchedManifest = false;
+
+  if (!gitDirty) {
+    console.error(`\n${pc.cyan('[Auto-Healing]')} Checking for ast-grep upgrade candidates...`);
+    const candidates = await findUpgradeCandidates(cwd, config.totemDir);
+
+    if (candidates === null || candidates.length === 0) {
+      console.error(pc.dim('  No rules flagged for upgrade.'));
+    } else {
+      console.error(`  Found ${candidates.length} upgrade candidate(s). Re-compiling...`);
+
+      // mmnto/totem#1235: build telemetry prefixes for all candidates in one
+      // metrics load, then invoke compileCommand once with upgradeBatch so the
+      // config/lessons/rules load cycle runs exactly once regardless of N.
+      // mmnto/totem#1232: pass cwd explicitly so the compile runs against the
+      // directory runSelfHealing was called with, not process.cwd().
+      const { buildTelemetryPrefix, compileCommand } = await import('./compile.js');
+      const { loadRuleMetrics } = await import('@mmnto/totem');
+      // loadRuleMetrics catches ENOENT and parse errors internally; the try/catch
+      // here is a defensive belt-and-suspenders guard for future changes.
+      let metricsFile: ReturnType<typeof loadRuleMetrics>;
+      try {
+        metricsFile = loadRuleMetrics(path.join(cwd, config.totemDir));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[Doctor] Could not load rule metrics, proceeding without telemetry - ${msg}`);
+        metricsFile = { version: 1, rules: {} };
+      }
+
+      const upgradeBatch = candidates.map((cand) => {
+        const metric = metricsFile.rules[cand.lessonHash];
+        const telemetryPrefix = metric?.contextCounts
+          ? buildTelemetryPrefix(metric.contextCounts)
+          : undefined;
+        return { hash: cand.lessonHash, telemetryPrefix };
+      });
+
+      // Build a lookup so we can map outcomes back to UpgradeCandidates for
+      // the console log and the upgraded[] list used in the PR body.
+      const candByHash = new Map(candidates.map((c) => [c.lessonHash, c]));
+
+      try {
+        const outcomes = await compileCommand({ upgradeBatch, cwd });
+        upgradePhaseTouchedManifest = true;
+        // Only count actual replacements. `skipped` / `noop` / `failed` all
+        // return normally but leave no real upgrade to report (mmnto/totem#1234
+        // CR finding — avoids lying in the auto-heal PR body).
+        if (Array.isArray(outcomes)) {
+          for (const outcome of outcomes) {
+            const cand = candByHash.get(outcome.hash);
+            if (!cand) continue;
+            if (outcome.status === 'replaced') {
+              upgraded.push(cand);
+              console.error(
+                `  ${pc.green('↑')} ${cand.heading} (${(cand.nonCodeRatio * 100).toFixed(0)}% non-code)`,
+              );
+            } else if (outcome.status === 'skipped') {
+              console.error(
+                pc.dim(`  - ${cand.heading} — compiler marked non-compilable; no upgrade`),
+              );
+            } else if (outcome.status === 'failed') {
+              console.error(pc.red(`  ✗ ${cand.heading} — upgrade failed`));
+            } else {
+              // 'noop' and any other status
+              console.error(pc.dim(`  - ${cand.heading} — no change`));
+            }
+          }
+        }
+      } catch (err) {
+        // compileCommand can throw on config errors, network hard failures,
+        // etc. Even a thrown error means the manifest may have been touched
+        // before the throw, so keep the flag set above.
+        upgradePhaseTouchedManifest = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(pc.yellow(`  Upgrade batch failed: ${msg}`));
+      }
+
+      if (upgraded.length > 0) {
+        console.error(`\n  ${pc.green(`Upgraded ${upgraded.length} rule(s) via telemetry.`)}`);
+      }
+    }
+  }
+
+  if (downgraded.length === 0 && archivedCount === 0 && upgraded.length === 0) {
+    // If the upgrade phase called compileCommand at all (even for candidates
+    // that ended in noop/skipped/failed), compile-manifest.json was rewritten.
+    // Revert it so the working tree on the original branch stays clean
+    // (mmnto/totem#1234 CR finding). spawnSync is imported at the top of this
+    // file; stdio: 'ignore' + no status check makes the call a silent no-op
+    // if the file is already clean or the checkout fails for any reason.
+    if (upgradePhaseTouchedManifest) {
+      spawnSync('git', ['checkout', '--', manifestPath], { cwd, stdio: 'ignore' });
+    }
+    return;
+  }
+
+  // Create branch and PR
+  const branchName = `totem/auto-healing-${Date.now()}`;
+
+  // Capture current branch so we can restore on failure
+  const currentBranchRes = spawnSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+    cwd,
+    stdio: 'pipe',
+    encoding: 'utf-8',
+  });
+  const originalBranch = currentBranchRes.error ? null : (currentBranchRes.stdout ?? '').trim();
+  let branchCreated = false;
+
+  /** Run a shell command via spawnSync, throw on failure */
+  function run(cmd: string, args: string[]): void {
+    const res = spawnSync(cmd, args, { cwd, stdio: 'pipe', encoding: 'utf-8' });
+    if (res.error) throw res.error;
+    if (res.status !== 0) {
+      const stderr = (res.stderr ?? '').trim();
+      throw new Error(
+        `${cmd} ${args[0]} failed (exit ${res.status})${stderr ? ': ' + stderr : ''}`,
+      );
+    }
+  }
+
+  try {
+    run('git', ['checkout', '-b', branchName]);
+    branchCreated = true;
+    // Stage compile-manifest.json alongside compiled-rules.json when the
+    // upgrade phase ran — otherwise the temp branch will diverge from the
+    // working tree and the checkout back to originalBranch can fail
+    // (mmnto/totem#1234 CR finding).
+    if (upgradePhaseTouchedManifest && fs.existsSync(manifestPath)) {
+      run('git', ['add', rulesPath, manifestPath]);
+    } else {
+      run('git', ['add', rulesPath]);
+    }
+
+    // Build commit message
+    const parts: string[] = [];
+    if (downgraded.length > 0) {
+      const ruleList = downgraded
+        .map((d) => `- ${d.heading} (${(d.rate * 100).toFixed(0)}% bypass)`)
+        .join('\n');
+      parts.push(`Downgraded ${downgraded.length} rule(s):\n${ruleList}`);
+    }
+    if (archivedCount > 0) {
+      parts.push(`Archived ${archivedCount} stale rule(s)`);
+    }
+    if (upgraded.length > 0) {
+      const ruleList = upgraded
+        .map((u) => `- ${u.heading} (${(u.nonCodeRatio * 100).toFixed(0)}% non-code)`)
+        .join('\n');
+      parts.push(`Upgraded ${upgraded.length} rule(s) via telemetry diagnostic:\n${ruleList}`);
+    }
+    const totalChanges = downgraded.length + archivedCount + upgraded.length;
+    const commitMsg = `fix: auto-heal ${totalChanges} rule(s)\n\n${parts.join('\n\n')}\n\nGenerated by totem doctor --pr`;
+
+    run('git', ['commit', '-m', commitMsg]);
+    run('git', ['push', '-u', 'origin', branchName]);
+
+    // Build PR body
+    const prBodyParts = ['## Auto-Healing: Rule Maintenance', ''];
+
+    if (downgraded.length > 0) {
+      prBodyParts.push(
+        `### Downgrades`,
+        '',
+        `${downgraded.length} compiled rule(s) exceeded the 30% bypass rate threshold and have been downgraded from \`error\` to \`warning\`.`,
+        '',
+        '| Rule | Bypass Rate |',
+        '|---|---|',
+        ...downgraded.map((d) => `| ${d.heading} | ${(d.rate * 100).toFixed(0)}% |`),
+        '',
+      );
+    }
+
+    if (archivedCount > 0) {
+      prBodyParts.push(
+        `### Archives`,
+        '',
+        `${archivedCount} stale rule(s) with zero activity past their minimum age have been archived.`,
+        '',
+      );
+    }
+
+    if (upgraded.length > 0) {
+      prBodyParts.push(
+        `### Upgrades (mmnto/totem#1131)`,
+        '',
+        `${upgraded.length} rule(s) were re-compiled through Claude Sonnet because telemetry showed >${NON_CODE_THRESHOLD * 100}% of matches landing in non-code contexts.`,
+        '',
+        '| Rule | Hash | Non-Code Ratio |',
+        '|---|---|---|',
+        ...upgraded.map(
+          (u) => `| ${u.heading} | \`${u.lessonHash}\` | ${(u.nonCodeRatio * 100).toFixed(0)}% |`,
+        ),
+        '',
+      );
+    }
+
+    prBodyParts.push(
+      'These rules are not deleted (ADR-027). Downgraded rules continue to fire as warnings. Archived rules are skipped during lint but preserved for audit. Upgraded rules retain the same lessonHash but ship with a structural ast-grep pattern.',
+      '',
+      'Generated by `totem doctor --pr`',
+    );
+
+    const prBody = prBodyParts.join('\n');
+    const prTitle =
+      upgraded.length > 0 && downgraded.length === 0 && archivedCount === 0
+        ? `chore(doctor): upgrade ${upgraded.length} rule(s) to ast-grep via telemetry diagnostic`
+        : `fix: auto-heal ${totalChanges} rule(s)`;
+    run('gh', ['pr', 'create', '--title', prTitle, '--body', prBody]);
+
+    console.error(pc.green(`\n  PR created on branch ${branchName}`));
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(pc.red(`\n  Failed to create PR: ${msg}`));
+    if (branchCreated) {
+      console.error(
+        pc.dim(
+          `  Changes are committed on branch ${branchName}. Push manually with: git push -u origin ${branchName}`,
+        ),
+      );
+    } else {
+      console.error(
+        pc.dim('  The compiled-rules.json changes are in your working tree. Commit manually.'),
+      );
+    }
+  } finally {
+    // Only switch back if we created the branch (otherwise we'd change the user's branch)
+    if (branchCreated && originalBranch) {
+      spawnSync('git', ['checkout', originalBranch], { cwd, stdio: 'pipe' });
+    }
+  }
+}
+
+/**
+ * Sensor-only freeze surfacing (strategy#584 read half, mmnto-ai/totem#2167). Renders the
+ * effective freeze union (repo-local ∪ distributed cohort) with per-source
+ * channel status — absent-package / absent-file / corrupt / genuinely-none
+ * stay distinct (codex W1). NEVER emits 'fail': freezes are sensed state, not
+ * drift, and doctor `--strict` gates on fail — a freeze (or a broken channel)
+ * must report loudly without gating (Tenet 13; the gate consumer is
+ * verify-manifest, not doctor).
+ */
+export async function checkFreezes(cwd: string, totemDir = '.totem'): Promise<DiagnosticResult> {
+  const name = 'Freeze state';
+  try {
+    const { readEffectiveFreezes } = await import('@mmnto/totem');
+    const { DOCTRINE_PIN_PACKAGE } = await import('./init-doctrine.js');
+    // No await: readEffectiveFreezes is synchronous — the async signature
+    // exists for the dynamic imports above (CR mmnto-ai/totem#2168 nit).
+    const result = readEffectiveFreezes(cwd, path.join(cwd, totemDir), DOCTRINE_PIN_PACKAGE);
+
+    const channel = ((): string => {
+      switch (result.cohortStatus) {
+        case 'ok':
+          return `cohort channel ok (${DOCTRINE_PIN_PACKAGE}@${result.cohortPackageVersion ?? '?'})`;
+        case 'absent-package':
+          return 'cohort channel not adopted (doctrine snapshot not installed)';
+        case 'absent-file':
+          return `cohort channel: snapshot ${result.cohortPackageVersion ?? '?'} predates freeze distribution`;
+        case 'corrupt':
+          return 'cohort channel CORRUPT — distributed freezes treated as none (conservative)';
+      }
+    })();
+
+    const warningsSuffix =
+      result.warnings.length > 0 ? ` Warnings: ${result.warnings.join(' | ')}` : '';
+
+    if (result.entries.length === 0) {
+      return {
+        name,
+        status: result.cohortStatus === 'corrupt' || result.warnings.length > 0 ? 'warn' : 'pass',
+        message: `No active freezes; ${channel}.${warningsSuffix}`,
+        ...(result.cohortStatus === 'corrupt'
+          ? {
+              remediation:
+                'Republish or pin-bump the doctrine snapshot; until then consumers treat distributed freezes as none.',
+            }
+          : {}),
+      };
+    }
+
+    const described = result.entries.map((f) => {
+      const provTag =
+        f.provenance === 'cohort' ? ` [cohort@${f.sourceVersion ?? '?'}]` : ' [local]';
+      return `"${f.entry.subsystem}"${provTag}`;
+    });
+    return {
+      name,
+      status: 'warn',
+      message: `Active freeze(s): ${described.join(', ')}; ${channel}.${warningsSuffix}`,
+      remediation:
+        'Respect each do-not list; entries lift at their tracking refs. This row never gates (sensor-only).',
+    };
+    // totem-context: a corrupt LOCAL freeze.json throws fail-closed in the reader; doctor reports it loudly as warn-class diagnostics rather than gating (sensor-only row)
+  } catch (err) {
+    return {
+      name,
+      status: 'warn',
+      message: `Freeze state underivable: ${err instanceof Error ? err.message : String(err)}`,
+      remediation:
+        'Fix .totem/freeze.json — gate consumers stay conservative while it is unreadable.',
+    };
+  }
+}
+
+/**
+ * Ambient worktree-estate row (mmnto-ai/totem#2580, open question 1 ruled (a)).
+ * Quiet when the estate is clean, a named SKIP when nothing is registered, and
+ * a `warn` — never a `fail` — when husks or stale worktrees exist: this is a
+ * sensor, and the detail lives behind `totem doctor --estate`.
+ *
+ * `@mmnto/totem` is dynamic-imported INSIDE the check, per the ruling's
+ * constraint: a static core-barrel import here would pull core onto the CLI
+ * cold-start path for every command.
+ *
+ * Every return carries `gateExempt: true`: this row is sensor-class and must
+ * not gate under any `--strict` tier (mmnto-ai/totem#2580 ruled scope —
+ * removal verbs and gating are later slices).
+ */
+export async function checkEstate(
+  seams: {
+    registry?: TotemRegistry;
+    safeExec?: EstateExecFn;
+    now?: number;
+    /**
+     * Test seam — bypasses the user-level `~/.totem/worktrees.json` read that
+     * supplies the wt-registry's recorded container roots (mmnto-ai/totem#2580
+     * slice 2). Pinned in tests so a developer machine that has actually used
+     * `totem wt create` cannot drag its real roots into an assertion.
+     */
+    wtRoots?: string[];
+  } = {},
+): Promise<DiagnosticResult> {
+  const name = 'Estate';
+  // Hoisted ABOVE the try: BOTH registry disclosures must ride EVERY arm of
+  // the row — the live arms AND the catch. With recorded wt roots the scan
+  // proceeds on zero repo entries, and a row without these notes would hide
+  // the one signal that the sensor is blind to a registry (#2580 slice-2
+  // falsification finding 1; catch arm per re-verification round 2 finding 4;
+  // wt-side symmetry per the bot round, CR finding 3).
+  const registryWarnings: string[] = [];
+  const wtWarnings: string[] = [];
+  // Sanitize-at-interpolation (bot round, CR finding 2): warning text can
+  // embed registry-CONTROLLED bytes — a parse error quotes the invalid value —
+  // and this row's message reaches the terminal unsanitized downstream.
+  // `sanitizeForTerminal` is core-owned and this module must not import core
+  // statically, so the sanitizer is captured after the dynamic import; until
+  // then the fallback still FLATTENS (the line-forging vector) and only lacks
+  // the ANSI strip — a pre-import failure carries loader text, not registry
+  // bytes.
+  let sanitize: (text: string) => string = (text) => text;
+  const flatten = (text: string): string =>
+    sanitize(text)
+      .replace(/[\t\n]+/g, ' ')
+      .replace(/ {2,}/g, ' ')
+      .trim();
+  const registryNote = (): string =>
+    registryWarnings.length === 0
+      ? ''
+      : ` Sync registry unreadable — no repos enumerated: ${registryWarnings.map(flatten).join(' | ')}.`;
+  const wtNote = (): string =>
+    wtWarnings.length === 0 ? '' : ` ${wtWarnings.map(flatten).join(' | ')}.`;
+  try {
+    const {
+      existingWorktreeRoots,
+      partitionWorktreeRoots,
+      readRegistry,
+      readWorktreeRegistry,
+      safeExec,
+      sanitizeForTerminal,
+      scanEstate,
+    } = await import('@mmnto/totem');
+    sanitize = sanitizeForTerminal;
+    const registry = seams.registry ?? readRegistry((msg: string) => registryWarnings.push(msg));
+    const entries = Object.values(registry).map((entry) => ({
+      path: entry.path,
+      lastSync: entry.lastSync,
+    }));
+
+    // The wt-registry's recorded roots (mmnto-ai/totem#2580 slice 2): the
+    // ambient row sweeps exactly what `--estate` sweeps, or it would report a
+    // clean estate that the explicit command reports dirty. Only the DEFAULT
+    // `~/.totem/worktrees` location sweeps with container semantics; every
+    // other recorded root sweeps as a STANDARD root, where husk-ness needs
+    // shape evidence. Unreadable file → disclosed in the message, scan
+    // proceeds (a degraded scan may report LESS, never more); a recorded root
+    // that no longer exists is filtered out — an absent root is an empty
+    // sweep, not a scan hole.
+    const wtRoots =
+      seams.wtRoots ??
+      existingWorktreeRoots(readWorktreeRegistry((msg: string) => wtWarnings.push(msg)));
+    const wtPartition = partitionWorktreeRoots(wtRoots);
+
+    if (entries.length === 0 && wtRoots.length === 0) {
+      // `readRegistry` warns only when it swallowed a non-ENOENT read/parse
+      // failure and returned `{}` — a broken registry must not read as the
+      // clean "nothing registered" skip (the same collapse `doctor --estate`
+      // already refuses in its registry-status derivation).
+      if (registryWarnings.length > 0) {
+        return {
+          name,
+          status: 'warn',
+          message: `Registry unreadable — no repos scanned: ${registryWarnings.map(flatten).join(' | ')}${wtNote()}`,
+          // The message carries wtNote() when BOTH files are broken, so the
+          // remediation must name both too — telling the user to repair only
+          // registry.json would leave the next run warning again (round 3, CR).
+          remediation:
+            wtWarnings.length > 0
+              ? 'Repair ~/.totem/registry.json and ~/.totem/worktrees.json, then run `totem doctor --estate`.'
+              : 'Repair ~/.totem/registry.json, then run `totem doctor --estate`.',
+          gateExempt: true,
+        };
+      }
+      // Same collapse, worktree side (round 2, CR outside-diff finding): an
+      // unreadable worktrees.json yields zero roots, which is exactly what
+      // routes the row onto this short-circuit — a clean "nothing registered"
+      // skip here would hide that recorded roots may exist and went unscanned.
+      if (wtWarnings.length > 0) {
+        return {
+          name,
+          status: 'warn',
+          message: `Worktree registry unreadable — recorded roots not scanned: ${wtWarnings.map(flatten).join(' | ')}`,
+          remediation: 'Repair ~/.totem/worktrees.json, then run `totem doctor --estate`.',
+          gateExempt: true,
+        };
+      }
+      return {
+        name,
+        status: 'skip',
+        message: `No registered repos — nothing to scan for worktree residue.${wtNote()}`,
+        gateExempt: true,
+      };
+    }
+
+    const result = scanEstate({
+      registry: entries,
+      safeExec: seams.safeExec ?? safeExec,
+      now: seams.now ?? Date.now(),
+      extraRoots: wtPartition.container,
+      extraStandardRoots: wtPartition.standard,
+    });
+    const s = result.summary;
+    // Named on EVERY row, pass included: a failed probe is a hole in the scan
+    // and a missing registry path is a repo this row never looked at. Hiding
+    // either inside a green line would be the silent degradation the sensor
+    // exists to prevent. Neither promotes the status — only husks and stale
+    // worktrees do (the ruling); registry hygiene is `totem list`'s charge.
+    const probes = s.unscannable > 0 ? ` ${s.unscannable} probe(s) unscannable.` : '';
+    // Only the registry entries this scan actually enumerated are the
+    // denominator — an entry that is missing, not a git root, or unprobeable
+    // was never looked inside, and folding it into a "repos scanned" count
+    // would overstate the coverage.
+    const enumerated = s.repos - s.reposMissing - s.reposNotGitRoot - s.reposUnscannable;
+    const caveats = [
+      s.reposMissing > 0 ? `${s.reposMissing} missing` : '',
+      s.reposNotGitRoot > 0 ? `${s.reposNotGitRoot} not-git-root` : '',
+      s.reposUnscannable > 0 ? `${s.reposUnscannable} unprobeable` : '',
+    ].filter((c) => c.length > 0);
+    const skipped = caveats.length > 0 ? ` (${caveats.join(', ')})` : '';
+
+    if (s.huskCandidates > 0 || s.stale > 0) {
+      return {
+        name,
+        status: 'warn',
+        message: `${s.stale} stale worktree(s), ${s.huskCandidates} husk candidate(s) across ${enumerated} enumerated repo(s)${skipped}.${probes}${registryNote()}${wtNote()}`,
+        remediation:
+          'Run `totem doctor --estate` for the per-row evidence (report-only — this row never gates).',
+        gateExempt: true,
+      };
+    }
+    // An unreadable registry — sync OR worktree — demotes the clean arm to
+    // warn: the row scanned what it could see, but a file it could not read
+    // may name repos or recorded roots it never looked at (round 2, CR
+    // outside-diff finding for the worktree side).
+    const unreadable = [
+      registryWarnings.length > 0 ? '~/.totem/registry.json' : '',
+      wtWarnings.length > 0 ? '~/.totem/worktrees.json' : '',
+    ].filter((f) => f.length > 0);
+    return {
+      name,
+      status: unreadable.length > 0 ? 'warn' : 'pass',
+      message: `${enumerated} enumerated repo(s)${skipped} · ${s.worktrees} linked worktree(s); no stale worktrees or husk candidates.${probes}${registryNote()}${wtNote()}`,
+      ...(unreadable.length > 0
+        ? { remediation: `Repair ${unreadable.join(' and ')}, then run \`totem doctor --estate\`.` }
+        : {}),
+      gateExempt: true,
+    };
+    // totem-context: a scan failure is reported as a warn row — the estate sensor must never take `totem doctor` down with it (report-only, Tenet 13)
+  } catch (err) {
+    return {
+      name,
+      status: 'warn',
+      message: `Estate scan failed: ${flatten(err instanceof Error ? err.message : String(err))}.${registryNote()}${wtNote()}`,
+      remediation: 'Run `totem doctor --estate` to see which probe failed.',
+      gateExempt: true,
+    };
+  }
+}
+
+// ─── Main command ───────────────────────────────────────
+
+export async function doctorCommand(options: DoctorOptions = {}): Promise<DiagnosticResult[]> {
+  const cwd = process.cwd();
+
+  console.error(`${pc.cyan('[Totem]')} Running diagnostics...\n`);
+
+  // Resolve doctor thresholds + strategyRoot from config when available. The
+  // default window (10) lines up with the schema default so missing config
+  // still gives the documented behavior. mmnto-ai/totem#1710 R2: capture
+  // `strategyRoot` here too so `checkStrategyRoot` honors the precedence-2
+  // config layer. R3 (CR): only use the config's `strategyRoot` when the
+  // resolved path is the repo-local file. A global `~/.totem/` profile is
+  // a personal default for tier/embedder choice and must NOT leak its
+  // strategyRoot across every repo on disk.
+  let doctorThresholds: { staleRuleWindow: number } | undefined;
+  let loadedConfig:
+    | { strategyRoot?: string; embedding?: { provider?: string; baseUrl?: string } }
+    | undefined;
+  try {
+    const { loadConfig, resolveConfigPath, isGlobalConfigPath } = await import('../utils.js');
+    const configPath = resolveConfigPath(cwd);
+    const config = await loadConfig(configPath);
+    if (!isGlobalConfigPath(configPath)) {
+      loadedConfig = config;
+    }
+    if (config.doctor) {
+      doctorThresholds = { staleRuleWindow: config.doctor.staleRuleWindow };
+    }
+  } catch (err) {
+    // Running `totem doctor` against a repo with no config is a valid path
+    // (every other check handles its own missing-file case). A corrupt or
+    // unreadable config lets the stale-rule check fall back to schema
+    // defaults rather than blocking the rest of the diagnostic pipeline.
+    // Surface the error only on a defective error object so sentinels
+    // still propagate.
+    if (err instanceof Error && err.message.length === 0) {
+      throw err;
+    }
+  }
+
+  const results: DiagnosticResult[] = [
+    checkConfig(cwd),
+    checkCompiledRules(cwd),
+    checkGitHooks(cwd),
+    await checkPrepareWrapper(cwd),
+    checkEmbeddingConfig(cwd),
+    await checkOllama(loadedConfig),
+    checkIndex(cwd),
+    checkLinkedIndexes(cwd),
+    await checkStrategyRoot(cwd, loadedConfig),
+    await checkSecretLeaks(cwd),
+    checkSecretsFileTracked(cwd),
+    checkAgentsMdCanonical(cwd),
+    await checkUpgradeCandidates(cwd),
+    await checkStaleRules(cwd, '.totem', doctorThresholds),
+    await checkGrandfatheredRules(cwd),
+    await checkFreezes(cwd),
+    await checkEstate(options.estateSeamsForTest ?? {}),
+    // Seat-identity sense (mmnto-ai/totem#2511) — lazily imported so the row's
+    // module stays off the cold-start graph, the command-layer discipline.
+    await (await import('./doctor-seat-identity.js')).checkSeatIdentity(cwd),
+  ];
+
+  for (const result of results) {
+    console.error(formatResult(result));
+  }
+
+  const counts = {
+    pass: results.filter((r) => r.status === 'pass').length,
+    warn: results.filter((r) => r.status === 'warn').length,
+    fail: results.filter((r) => r.status === 'fail').length,
+    skip: results.filter((r) => r.status === 'skip').length,
+  };
+
+  const parts: string[] = [];
+  parts.push(pc.green(`${counts.pass} passed`));
+  if (counts.warn > 0) parts.push(pc.yellow(`${counts.warn} warnings`));
+  else parts.push(`${counts.warn} warnings`);
+  if (counts.fail > 0) parts.push(pc.red(`${counts.fail} failures`));
+  else parts.push(`${counts.fail} failures`);
+
+  console.error(`\n${pc.cyan('[Totem]')} ${parts.join(', ')}`);
+
+  // After diagnostics, if --pr is passed, run self-healing
+  if (options.pr) {
+    await runSelfHealing(cwd);
+  }
+
+  return results;
+}

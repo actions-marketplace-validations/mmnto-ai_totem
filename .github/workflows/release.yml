@@ -15,34 +15,80 @@ jobs:
       pull-requests: write
       id-token: write
     steps:
-      - uses: actions/checkout@v6
-
-      - uses: pnpm/action-setup@v4
-
-      - uses: actions/setup-node@v6
+      # token: makes ALL git operations in this job PAT-actored — including the
+      # changesets action's fallback `git push` of changeset-release/main. The
+      # 2026-07-08 actor flip (#2331) happened because the push path degraded
+      # to the checkout-persisted default GITHUB_TOKEN: bot-actored pushes put
+      # every VP-PR pull_request run into action_required (GitHub's stock
+      # posture), stalling cuts behind a manual approval click. The PAT keeps
+      # runs auto-running as they did from 2026-03-03 (433fc92d) to 2026-07-08.
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          node-version: 22
-          cache: pnpm
-          registry-url: https://registry.npmjs.org
+          token: ${{ secrets.RELEASE_TOKEN }}
 
-      - run: npm install -g npm@latest
-        name: Upgrade npm for OIDC support
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+
+      # Node 24 ships with npm 11.x natively, which supports OIDC trusted
+      # publishing (added in npm 11.5.1). Node 22 ships with npm 10.9.x and
+      # `npm install -g npm@11.x` to self-upgrade is broken on the hosted
+      # runner (MODULE_NOT_FOUND: promise-retry — npm loads its own arborist
+      # code, then replaces files mid-install). Avoiding the self-upgrade
+      # entirely by using a Node version that ships the right npm.
+      # No registry-url: it writes an .npmrc with _authToken=${NODE_AUTH_TOKEN},
+      # which blocks npm's OIDC trusted-publishing negotiation. See #1180 +
+      # #1182 history.
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+          cache: pnpm
 
       - run: pnpm install --frozen-lockfile
 
       - run: pnpm build
 
-      - name: Create Release PR or Publish
+      - name: Allow tag overwrites for republish resilience
+        run: git config --global push.followTags false
+
+      - name: Create Release PR (version-only)
         id: changesets
-        uses: changesets/action@v1
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1
         with:
           version: pnpm run version
-          publish: pnpm run release
+          # No `publish` parameter: `changeset publish` does not propagate
+          # OIDC tokens correctly to pnpm child processes
+          # (changesets/action#515). Publishing happens in the next step
+          # via tools/publish-oidc.mjs, which uses npm CLI directly.
+          createGithubReleases: false
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_TOKEN }}
 
-      - name: Update Action v0 Tag
-        if: steps.changesets.outputs.published == 'true'
+      - name: Publish unpublished packages via OIDC
+        if: steps.changesets.outputs.hasChangesets == 'false'
+        id: publish
+        run: node tools/publish-oidc.mjs
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+
+      # Tenet 15 axiom-mandate: convert post-publish provenance verification
+      # from manual `npm view` ritual into deterministic workflow gate.
+      # Fails the release loud (Tenet 4) if OIDC silently regressed to token
+      # auth — e.g. NPM_TOKEN re-added, `registry-url` re-written into .npmrc,
+      # trusted publisher misconfigured. See tools/verify-oidc-provenance.mjs.
+      # timeout-minutes caps the verify step at the YAML layer; the script's
+      # MAX_ATTEMPTS × SPAWN_TIMEOUT_MS + RETRY_DELAY_MS arithmetic bounds it
+      # to ~2 min/package (8 min worst case across 4 packages), but encoding
+      # the cap in the workflow makes the contract explicit rather than
+      # implicit in script constants.
+      - name: Verify OIDC provenance on published packages
+        if: steps.publish.outputs.published == 'true'
+        timeout-minutes: 4
+        run: node tools/verify-oidc-provenance.mjs
+        env:
+          PUBLISHED_PACKAGES: ${{ steps.publish.outputs.published_packages }}
+
+      - name: Push release tags
+        if: steps.publish.outputs.published == 'true'
         run: |
+          git push origin --tags --force
           git tag -f v0
           git push origin refs/tags/v0 --force

@@ -1,5 +1,7 @@
 import { z } from 'zod';
 
+import { TotemOrchestratorError, TotemParseError } from '@mmnto/totem';
+
 import { log } from '../ui.js';
 import type { OrchestratorInvokeOptions, OrchestratorResult } from './orchestrator.js';
 import { isQuotaError } from './orchestrator.js';
@@ -30,7 +32,14 @@ const OllamaChatResponseSchema = z.object({
 export async function invokeOllamaOrchestrator(
   opts: OrchestratorInvokeOptions & { baseUrl?: string; numCtx?: number },
 ): Promise<OrchestratorResult> {
-  const { prompt, model, tag, baseUrl, numCtx } = opts;
+  // mmnto/totem#1291 Phase 3: opts.systemPrompt is consumed via the Ollama
+  // chat API's standard `system` role message so the LLM receives the
+  // compiler instructions correctly. Without this, Phase 3's prompt split
+  // would silently strip the instructions when compile is routed to a local
+  // Ollama model, leaving the model with only the lesson body. Caught by
+  // Shield AI on the first push attempt — same cascade pattern as the
+  // Gemini and OpenAI fixes.
+  const { prompt, systemPrompt, model, tag, baseUrl, numCtx } = opts;
 
   // Normalize base URL (strip trailing slash)
   const base = (baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
@@ -40,16 +49,27 @@ export async function invokeOllamaOrchestrator(
   log.info(tag, `Invoking Ollama at ${base}${ctxLabel} (this may take 15-60 seconds)...`);
   const startMs = Date.now();
 
+  const messages: { role: 'system' | 'user'; content: string }[] = [];
+  // SAFETY INVARIANT: Some local model implementations behave unexpectedly
+  // when receiving empty role messages. Skip the system role entirely when
+  // systemPrompt is undefined or empty. Matches the parallel checks in
+  // anthropic/gemini/openai after the GCA round 2 review on PR mmnto/totem#1292.
+  if (systemPrompt !== undefined && systemPrompt.length > 0) {
+    messages.push({ role: 'system', content: systemPrompt });
+  }
+  messages.push({ role: 'user', content: prompt });
+
   const body: Record<string, unknown> = {
     model,
     stream: false,
-    messages: [{ role: 'user', content: prompt }],
+    messages,
   };
 
-  // Only inject num_ctx if explicitly configured
-  if (numCtx) {
-    body.options = { num_ctx: numCtx };
-  }
+  // Only inject options when explicitly configured
+  const options: Record<string, unknown> = {};
+  if (numCtx) options.num_ctx = numCtx;
+  if (opts.temperature !== undefined) options.temperature = opts.temperature;
+  if (Object.keys(options).length > 0) body.options = options;
 
   let response: Response;
   try {
@@ -60,15 +80,22 @@ export async function invokeOllamaOrchestrator(
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    throw new Error(
-      `[Totem Error] Cannot connect to Ollama at ${base}.\n` +
-        `Is Ollama running? Start it with: ollama serve\n` +
-        `Details: ${msg}`,
+    throw new TotemOrchestratorError(
+      `Cannot connect to Ollama at ${base}. Details: ${msg}`,
+      'Is Ollama running? Start it with: ollama serve',
+      err,
     );
   }
 
   if (!response.ok) {
     const errorBody = await response.text();
+
+    if (response.status === 404 || /not found|no such model/i.test(errorBody)) {
+      throw new TotemOrchestratorError(
+        `Ollama model '${model}' is not installed.`,
+        `Run 'ollama pull ${model}' and try again.`,
+      );
+    }
 
     if (isQuotaError(Object.assign(new Error(errorBody), { status: response.status }))) {
       const err = new Error(`Ollama rate limit: ${errorBody}`);
@@ -78,29 +105,35 @@ export async function invokeOllamaOrchestrator(
 
     // 500 errors from Ollama are often VRAM/context exhaustion
     if (response.status >= 500) {
-      throw new Error(
-        `[Totem Error] Ollama server error (${response.status}): ${errorBody}\n` +
-          (numCtx
-            ? `Try lowering numCtx (currently ${numCtx}) in your orchestrator config.`
-            : `Try setting a smaller numCtx in your orchestrator config to limit VRAM usage.`),
+      throw new TotemOrchestratorError(
+        `Ollama server error (${response.status}): ${errorBody}`,
+        numCtx
+          ? `Try lowering numCtx (currently ${numCtx}) in your orchestrator config.`
+          : 'Try setting a smaller numCtx in your orchestrator config to limit VRAM usage.',
       );
     }
 
-    throw new Error(`[Totem Error] Ollama API error (${response.status}): ${errorBody}`);
+    throw new TotemOrchestratorError(
+      `Ollama API error (${response.status}): ${errorBody}`,
+      'Check that the model is pulled and Ollama is running correctly.',
+    );
   }
 
   let raw: unknown;
   try {
     raw = await response.json();
   } catch {
-    throw new Error(`[Totem Error] Ollama returned invalid JSON. Is the model loaded?`);
+    throw new TotemParseError(
+      'Ollama returned invalid JSON.',
+      'Ensure the model is fully loaded. Try: ollama pull <model>',
+    );
   }
 
   const parsed = OllamaChatResponseSchema.safeParse(raw);
   if (!parsed.success) {
-    throw new Error(
-      `[Totem Error] Unexpected response from Ollama API.\n` +
-        `Validation: ${parsed.error.issues.map((i) => i.message).join(', ')}`,
+    throw new TotemParseError(
+      `Unexpected response from Ollama API. Validation: ${parsed.error.issues.map((i) => i.message).join(', ')}`,
+      'Ensure Ollama is up to date. Try: ollama --version',
     );
   }
   const data = parsed.data;

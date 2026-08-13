@@ -1,0 +1,1794 @@
+import { createHash } from 'node:crypto';
+
+import { parse } from '@ast-grep/napi';
+
+import { resolveAstGrepLangs } from './ast-grep-query.js';
+import { runSmokeGate } from './compile-smoke-gate.js';
+import { engineFields, sanitizeFileGlobs, validateRegex } from './compiler.js';
+import type {
+  CompiledRule,
+  CompilerOutput,
+  NonCompilableReasonCode,
+  RegexValidation,
+} from './compiler-schema.js';
+import {
+  extractBadGoodSnippets,
+  extractManualPattern,
+  extractRuleExamples,
+  isGlobSetEqual,
+  parseDeclaredScope,
+  parseDeclaredSeverity,
+} from './lesson-pattern.js';
+import type { RuleTestResult } from './rule-tester.js';
+import { testRule } from './rule-tester.js';
+import type { Stage4VerificationResult } from './stage4-verifier.js';
+import { sanitizeForTerminal } from './terminal-sanitize.js';
+
+// ─── Types ──────────────────────────────────────────
+
+export interface LessonInput {
+  index: number;
+  heading: string;
+  body: string;
+  hash: string;
+}
+
+/**
+ * Machine-readable skip reasons. Threaded through `CompileLessonResult` so
+ * downstream consumers (totem doctor, Layer 4 fallthrough reporting per ADR-088)
+ * can distinguish why a lesson produced no rule without string-matching
+ * human-readable messages.
+ *
+ * mmnto-ai/totem#1481 aligned this internal type 1:1 with the persisted
+ * `NonCompilableReasonCode` enum so ledger writers can pass the code through
+ * without a mapping table. `'non-compilable'` renamed to `'out-of-scope'`,
+ * `'security-verify-rejected'` renamed to `'security-rule-rejected'`, and
+ * four producer-facing codes joined: `'no-pattern-generated'`,
+ * `'pattern-syntax-invalid'`, `'pattern-zero-match'`, `'no-pattern-found'`.
+ * Fresh compile runs MUST NOT emit `'legacy-unknown'`; that sentinel exists
+ * solely for migrating pre-#1481 2-tuples.
+ */
+export type CompileLessonReasonCode = Exclude<NonCompilableReasonCode, 'legacy-unknown'>;
+
+/**
+ * Single event inside a lesson's compile pipeline. Appended to a per-lesson
+ * `trace` array on every pipeline step (generate / verify / retry / result)
+ * and surfaced via `CompileLessonResult.trace` for the CLI `--verbose`
+ * renderer (mmnto-ai/totem#1482).
+ *
+ * `layer` numbers align with the ADR-088 staging (1 = manual, 2 = example-
+ * based, 3 = Layer 3 LLM with verify-retry). Consumers MUST tolerate unknown
+ * layer numbers so a future ADR-088 phase (dedicated Layer 1 / Layer 2
+ * telemetry) can emit without breaking the renderer.
+ *
+ * `patternHash` is a stable 16-character sha256 prefix of the emitted
+ * pattern, included only on `generate` events. Callers use it to correlate
+ * retries ("this retry produced the same pattern") without forwarding the
+ * pattern string itself.
+ *
+ * `reasonCode` is only set on the terminal `result` event when the lesson
+ * skipped. A compiled or failed lesson omits the field.
+ */
+export interface LayerTraceEvent {
+  layer: number;
+  action: 'generate' | 'verify' | 'retry' | 'result';
+  outcome: string;
+  patternHash?: string;
+  reasonCode?: Exclude<NonCompilableReasonCode, 'legacy-unknown'>;
+}
+
+export type CompileLessonResult =
+  | { status: 'compiled'; rule: CompiledRule; trace?: LayerTraceEvent[] }
+  | {
+      status: 'skipped';
+      hash: string;
+      reason?: string;
+      reasonCode: CompileLessonReasonCode;
+      trace?: LayerTraceEvent[];
+    }
+  | { status: 'failed'; trace?: LayerTraceEvent[] }
+  | { status: 'noop'; trace?: LayerTraceEvent[] };
+
+/** Produce a stable short hash of a pattern string for trace correlation. */
+function hashPattern(pattern: string): string {
+  return createHash('sha256').update(pattern).digest('hex').slice(0, 16);
+}
+
+export interface CompileLessonCallbacks {
+  onWarn?: (heading: string, message: string) => void;
+  onDim?: (heading: string, message: string) => void;
+  /**
+   * Fires when the declared-severity override (mmnto-ai/totem#1656) actually
+   * changed the emitted severity. CLI callers use this to write telemetry
+   * records tagged `type: 'severity-override'` for prompt-tuning feedback —
+   * frequent fires mean the prompt directive is drifting. Absent = core runs
+   * without telemetry plumbing.
+   */
+  onSeverityOverride?: (
+    lesson: { heading: string; hash: string },
+    event: { from: 'error' | 'warning' | undefined; to: 'error' | 'warning' },
+  ) => void;
+  /**
+   * Fires when the declared-scope override (mmnto-ai/totem#1665) actually
+   * changed the emitted `fileGlobs`. CLI callers use this to write telemetry
+   * records tagged `type: 'scope-override'` for prompt-tuning feedback —
+   * frequent fires mean the LLM is drifting on Scope preservation. Absent =
+   * core runs without telemetry plumbing. Mirrors `onSeverityOverride`
+   * shape and discipline from #1656.
+   */
+  onScopeOverride?: (
+    lesson: { heading: string; hash: string },
+    event: { from: string[] | undefined; to: string[] },
+  ) => void;
+  /**
+   * Fires after Stage 4 verification returns a result (mmnto-ai/totem#1682).
+   * CLI callers use this to write telemetry records tagged
+   * `type: 'stage4-verify'` to `.totem/temp/telemetry.jsonl`. Absent = core
+   * runs without telemetry plumbing. The result mirrors the discriminated
+   * union returned by `verifyAgainstCodebase`; see ADR-091 §"Stage 4" for
+   * the four-outcome contract. Telemetry path-redaction (per
+   * mmnto-ai/totem#1644 precedent) is the caller's responsibility — the
+   * verifier returns repo-relative paths, but the telemetry writer must
+   * apply the `<extern:<sha256-12>>` redaction for any path outside the
+   * repo root.
+   */
+  onStage4Outcome?: (
+    lesson: { heading: string; hash: string },
+    result: Stage4VerificationResult,
+  ) => void;
+}
+
+export interface CompileLessonDeps {
+  parseCompilerResponse: (response: string) => CompilerOutput | null;
+  /**
+   * Invoke the LLM. The optional second parameter `systemPrompt` carries the
+   * persistent compiler template separately from the per-lesson user prompt
+   * so the orchestrator can mark it as a cache target (mmnto/totem#1291
+   * Phase 3). When the wrapper threads systemPrompt through to a caching-
+   * capable provider (Anthropic), repeat calls within the TTL window read
+   * from prompt cache instead of paying full input-token cost.
+   *
+   * Backward compatible: callers that ignore the second parameter and
+   * receive a wrapper-prepended single string still work — just without
+   * the cache benefit.
+   */
+  runOrchestrator: (prompt: string, systemPrompt?: string) => Promise<string | undefined>;
+  existingByHash: Map<string, CompiledRule>;
+  callbacks?: CompileLessonCallbacks;
+  /** Optional: specialized system prompt for Pipeline 3 (Bad/Good example-based compilation). */
+  pipeline3Prompt?: string;
+  /**
+   * Optional telemetry-driven directive prepended to the Pipeline 2 USER prompt
+   * (not the system prompt). Used by `totem compile --upgrade <hash>`
+   * (mmnto/totem#1131) to nudge Sonnet toward an ast-grep structural pattern
+   * when the existing rule is firing in non-code contexts. Has no effect on
+   * Pipeline 1 (manual) or Pipeline 3 (example-based) compilation.
+   *
+   * Note: this lives in the user prompt rather than the system prompt because
+   * it's per-lesson (specific to one rule's telemetry). Putting it in the
+   * system prompt would invalidate the cache on every --upgrade call.
+   */
+  telemetryPrefix?: string;
+  /**
+   * Assert that this compile is producing a security rule. Per ADR-088
+   * Decision 3 (Layer 3 zero-tolerance), security rules that fail the smoke
+   * gate are rejected outright with no retry. Reserved for callers that know
+   * the source pack context (e.g., compiling lessons from a pack scoped
+   * `@mmnto/pack-agent-security` or any pack whose manifest carries an
+   * immutable severity contract). Today's `totem lesson compile` at repo
+   * level does not set this; a future pack-build command will. Defaults to
+   * false; security zero-tolerance is gated on an affirmative caller assertion.
+   */
+  securityContext?: boolean;
+  /**
+   * ADR-091 Stage 4 Verify-Against-Codebase verifier (mmnto-ai/totem#1682).
+   * When provided, runs after Layer 3 verify-retry produces a compiled rule
+   * (Pipeline 2 / Pipeline 3 only — Pipeline 1 manual rules bypass Stage 4
+   * because they are human-authored). The callback returns a discriminated
+   * `Stage4VerificationResult` and `compileLesson` mutates the rule in-place
+   * per the four-outcome contract:
+   *
+   *   - `'no-matches'`           → `status: 'untested-against-codebase'`
+   *   - `'out-of-scope'`         → `status: 'archived'`, `archivedReason`
+   *                                cites the offending paths, archive
+   *                                timestamp set
+   *   - `'in-scope-bad-example'` → `confidence: 'high'` (status remains
+   *                                unset / 'active')
+   *   - `'candidate-debt'`       → force `severity: 'warning'`, log the
+   *                                candidate-debt sites via `onWarn`
+   *
+   * Absent (undefined) means Stage 4 does not run. The compiled rule keeps
+   * its Layer 3 zero-trust shape (`unverified: true`, status absent =
+   * active). Callers that don't have filesystem access (cloud compile
+   * worker, packs without consumer codebase) leave this absent; consumer-
+   * side `totem lint` runs the verifier later via the
+   * `pending-verification` flow shipped in T3 (mmnto-ai/totem#1684).
+   */
+  verifyStage4?: (rule: CompiledRule) => Promise<Stage4VerificationResult>;
+}
+
+// ─── ast-grep pattern validation ───────────────────
+
+/**
+ * Compile-time validation for ast-grep patterns (#1062, #1339).
+ *
+ * Two layers:
+ *   1. Heuristic fast-path — reject empty patterns, multi-root string
+ *      patterns (statement boundaries outside braces/parens), and
+ *      compound object patterns missing the required `rule` key.
+ *      Gives fast, human-readable error messages for the common cases.
+ *   2. Parser-based check (#1339, #1654) — actually invoke ast-grep's rule
+ *      compiler via `parse(lang, '').root().findAll(pattern)` for every
+ *      Lang resolved from the rule's `fileGlobs`. The pattern is accepted
+ *      if it parses under any of those Langs; rejected with the last
+ *      Lang's error message if all of them fail. This catches single-line
+ *      patterns that look balanced but fail semantic validation — e.g.
+ *      `.option("--no-$FLAG", $$$REST)` (floating member call with no
+ *      receiver) or `catch($E) { $$$ }` (bare catch clause that can only
+ *      exist inside a try statement) — and equally importantly, surfaces
+ *      grammar-mismatch failures when a pattern would parse under TSX
+ *      but not under the rule's actual target grammar (e.g. a Rust
+ *      `ResMut<TacticalState>` pattern that TSX accepts as a JSX element
+ *      but Rust rejects as a malformed type expression).
+ *
+ * Language choice: when `fileGlobs` resolves to one or more registered
+ * languages (e.g., `**\/*.rs` → Rust, `**\/*.ts` → TypeScript), the pattern
+ * is validated under every such grammar and accepted if any one accepts
+ * it. When `fileGlobs` is absent or no glob carries a registered
+ * extension, falls back to `Lang.Tsx` — the most permissive parser
+ * available (superset of TypeScript plus JSX) — so unscoped pre-1.16
+ * rules retain their legacy validation behavior. Empty source (`''`)
+ * keeps the call cheap — ast-grep compiles the pattern into a rule
+ * before iterating any AST, so we see the rule-compile error even though
+ * there's nothing to match against.
+ *
+ * Lite-build safety: this function is only called from compile flows
+ * (buildCompiledRule / buildManualRule), which require an orchestrator
+ * and therefore never run in the Lite binary. The esbuild alias swaps
+ * `@ast-grep/napi` for the WASM shim in Lite builds, but since this
+ * function is dead code there, the shim's `ensureInit()` requirement
+ * is never triggered. The parser call is additionally wrapped in
+ * try/catch so any surprise error (uninitialized engine, native-binding
+ * failure) degrades conservatively to `valid: false` rather than
+ * crashing the compile command.
+ */
+export function validateAstGrepPattern(
+  pattern: string | Record<string, unknown>,
+  fileGlobs?: readonly string[],
+): RegexValidation {
+  // ── Object pattern (NapiConfig / compound rule) ──
+  if (typeof pattern === 'object' && pattern !== null) {
+    if (!('rule' in pattern)) {
+      return { valid: false, reason: 'object pattern missing required "rule" key' };
+    }
+    // Fall through to the parser-based check below — compound rules are
+    // validated by handing them directly to findAll().
+  } else if (typeof pattern !== 'string') {
+    return { valid: false, reason: 'pattern must be a string or object' };
+  } else {
+    // String pattern — run the cheap heuristic checks first.
+    const trimmed = pattern.trim();
+    if (trimmed.length === 0) {
+      return { valid: false, reason: 'empty pattern' };
+    }
+
+    // Detect multiple top-level statements separated by semicolons or newlines.
+    // ast-grep requires a single root node; multiple roots crash at runtime.
+    // Split on statement boundaries (semicolons and newlines outside braces/parens)
+    // using a simple brace/paren depth tracker.
+    let depth = 0;
+    let inString: string | null = null; // tracks quote char (' or " or `)
+    const roots: string[] = [];
+    let current = '';
+    for (let i = 0; i < trimmed.length; i++) {
+      const ch = trimmed[i]!;
+      const prev = i > 0 ? trimmed[i - 1] : '';
+
+      // String literal tracking — skip depth/split logic inside strings
+      // Note: escaped backslash edge case ("\\") is not handled — unlikely in ast-grep patterns
+      if (inString) {
+        current += ch;
+        if (ch === inString && prev !== '\\') inString = null;
+        continue;
+      }
+      if ((ch === '"' || ch === "'" || ch === '`') && prev !== '\\') {
+        inString = ch;
+        current += ch;
+        continue;
+      }
+
+      if (ch === '(' || ch === '{' || ch === '[') {
+        depth++;
+        current += ch;
+      } else if (ch === ')' || ch === '}' || ch === ']') {
+        depth = Math.max(0, depth - 1);
+        current += ch;
+      } else if (depth === 0 && (ch === ';' || ch === '\n')) {
+        if (current.trim().length > 0) roots.push(current.trim());
+        current = '';
+      } else {
+        current += ch;
+      }
+    }
+    if (current.trim().length > 0) roots.push(current.trim());
+
+    if (roots.length > 1) {
+      return {
+        valid: false,
+        reason: `pattern has ${roots.length} top-level expressions (ast-grep requires a single root)`,
+      };
+    }
+  }
+
+  // ── Parser-based check (#1339, #1654) ──
+  // Hand the pattern to ast-grep's actual rule compiler. If ast-grep
+  // can't compile it into a single-rooted rule under any of the rule's
+  // target Langs, we see the exact runtime error ("Multiple AST nodes
+  // are detected", "No AST root is detected", "rule is not configured
+  // correctly", etc.) at compile time instead. The pattern is accepted
+  // when any one Lang accepts it; rejected with the last failure's
+  // message when all Langs reject it.
+  // totem-context: try-each-Lang-then-collect-and-rethrow. The per-iteration
+  // catch is not silent degradation — `lastErr` is rethrown via the
+  // rejection-return below if every Lang fails, and the function returns
+  // `{ valid: true }` from inside the try the moment any Lang accepts the
+  // pattern. Pattern is the deliberate cross-grammar acceptance shape per
+  // mmnto-ai/totem#1654.
+  const langs = resolveAstGrepLangs(fileGlobs);
+  let lastErr: unknown = undefined;
+  for (const lang of langs) {
+    try {
+      const emptyRoot = parse(lang, '');
+      // findAll accepts both string patterns and NapiConfig objects.
+      emptyRoot.root().findAll(pattern as string);
+      return { valid: true };
+      // totem-context: see preamble — collect-and-rethrow per #1654 cross-grammar accept
+    } catch (err) {
+      lastErr = err; // totem-context: collected; rejection-return below uses it
+    }
+  }
+  // All Langs rejected — surface the last failure with the same
+  // first-line preservation logic the original single-Lang code used.
+  {
+    const raw = lastErr instanceof Error ? lastErr.message : String(lastErr ?? '');
+    // Keep the first LINE of the ast-grep error only — multi-line errors
+    // confuse downstream loggers. Do NOT slice on `.` — ast-grep error
+    // messages almost always embed the user's pattern source verbatim
+    // (e.g. `Multiple AST nodes are detected. Please check the pattern
+    // source `.option("--no-$FLAG", $$$REST)`.`), and most ast-grep
+    // patterns either start with a dot (`.option(...)`) or contain many
+    // dots (`console.log($A)`, `$OBJ.method()`). Slicing on `.` would
+    // discard the pattern source — the single most useful signal for
+    // debugging a rejected rule — and in the pathological case where
+    // the error message begins with a dot, would leave an empty string.
+    // Taking the first line preserves the full first-line context
+    // including the verbatim pattern source. (GCA finding on PR
+    // mmnto/totem#1349.)
+    //
+    // Using `/^[^\n]*/` exec rather than the idiomatic newline-split
+    // array accessor because two over-broad Pipeline 5 rules flag that
+    // idiom as an error regardless of context — a "LLM metadata token"
+    // false positive and a "loop-over-lines" false positive, neither of
+    // which apply to a one-shot catch-block first-line extraction. The
+    // regex form is semantically identical: `[^\n]*` matches zero-or-
+    // more non-newline chars from the start of the string and always
+    // matches at least the empty string, so the `?? raw` fallback is
+    // defensive only. Archive follow-up tracked in mmnto/totem#1352.
+    const firstLine = (/^[^\n]*/.exec(raw)?.[0] ?? raw).trim();
+    return {
+      valid: false,
+      reason: `ast-grep rejected pattern: ${firstLine}`,
+    };
+  }
+}
+
+// ─── Self-suppression guard (#1177) ─────────────────
+
+/** Patterns containing suppression markers can never fire — the engine suppresses those lines first. */
+function isSelfSuppressing(pattern: string): boolean {
+  // Unescape the regex string to check for literal directive substrings
+  const unescaped = pattern.replace(/\\\\/g, '\\').replace(/\\b/g, '').toLowerCase();
+  return (
+    unescaped.includes('totem-ignore') ||
+    unescaped.includes('totem-context') ||
+    unescaped.includes('shield-context')
+  );
+}
+
+// ─── Rule builder (pure, no I/O) ────────────────────
+
+/**
+ * Options controlling how `buildCompiledRule` validates its input before
+ * emitting a `CompiledRule`. The smoke gate is opt-in so Pipeline 1 (manual)
+ * callers and ad-hoc test callers keep their existing behaviour unchanged;
+ * Pipeline 2 (LLM) and Pipeline 3 (example-based) opt in explicitly in the
+ * compileLesson flow.
+ */
+export interface BuildCompiledRuleOptions {
+  /**
+   * When true, the smoke gate runs after validation and before rule emission.
+   * Missing badExample or zero-match badExample both reject the rule with a
+   * rejectReason that names the gate. When false (default), the gate is
+   * skipped entirely - backward compatible.
+   */
+  enforceSmokeGate?: boolean;
+  /**
+   * Optional badExample override. When supplied, takes precedence over
+   * `parsed.badExample`. Pipeline 3 uses this to reuse its Bad snippet as the
+   * smoke-gate target without relying on the LLM to echo the snippet back in
+   * the structured output.
+   */
+  badExampleOverride?: string;
+  /**
+   * Optional goodExample override (mmnto-ai/totem#1580). When supplied,
+   * takes precedence over `parsed.goodExample`. Pipeline 3 uses this to
+   * reuse its Good snippet as the over-matching check target without
+   * relying on the LLM to echo the snippet back.
+   */
+  goodExampleOverride?: string;
+  /**
+   * Optional declared-severity override (mmnto-ai/totem#1656). When
+   * supplied, takes precedence over `parsed.severity` regardless of
+   * LLM emission. Sourced from the lesson body's `**Severity:** error`
+   * / `Severity: warning` prose convention. `buildCompiledRule`
+   * reports the override event in `BuildRuleResult.severityOverride`
+   * when the override actually changes the emitted severity, so CLI
+   * callers can record telemetry for prompt-tuning feedback.
+   */
+  declaredSeverityOverride?: 'error' | 'warning';
+  /**
+   * Optional lesson body for declared-scope override (mmnto-ai/totem#1665).
+   * When supplied AND the body declares a `**Scope:**` line, the parsed
+   * source-Scope glob list takes precedence over `parsed.fileGlobs`
+   * regardless of LLM emission. Author-declared intent always wins; #1626's
+   * test-contract auto-include heuristic only applies when source omits Scope.
+   * `buildCompiledRule` reports the override event in
+   * `BuildRuleResult.scopeOverride` when the override actually changes the
+   * emitted globs, so CLI callers can record telemetry for prompt-tuning
+   * feedback (mirrors `declaredSeverityOverride` from #1656).
+   */
+  lessonBody?: string;
+}
+
+/**
+ * Extract archive lifecycle fields from an existing compiled rule so they
+ * carry forward during `--force` recompile (mmnto-ai/totem#1587). Lifecycle
+ * fields are additive state owned by `totem lesson archive` and the
+ * postmerge curation scripts; `--force` regenerates the pattern but must
+ * not silently un-archive. `createdAt` is preserved separately at each
+ * engine site because its fallback is `now` rather than absent.
+ *
+ * The dangling-archive guard is implicit: a lesson whose source was
+ * deleted is not in `toCompile`, so buildCompiledRule is never called
+ * for it, so its lifecycle fields are never resurrected onto new output.
+ */
+function preserveLifecycleFields(existing: CompiledRule | undefined): Partial<CompiledRule> {
+  if (!existing) return {};
+  const preserved: Partial<CompiledRule> = {};
+  if (existing.status !== undefined) preserved.status = existing.status;
+  // archivedReason and archivedAt are only meaningful when status is
+  // 'archived'. Copying them onto an active rule (or one with absent
+  // status) would leave the rule in a half-archived state that later
+  // lesson-archive idempotency logic cannot safely untangle.
+  if (existing.status === 'archived') {
+    if (existing.archivedReason !== undefined) preserved.archivedReason = existing.archivedReason;
+    if (existing.archivedAt !== undefined) preserved.archivedAt = existing.archivedAt;
+  }
+  return preserved;
+}
+
+/**
+ * Build a CompiledRule from parsed compiler output.
+ * Returns { rule, rejectReason } so callers can report why a rule was rejected.
+ */
+export function buildCompiledRule(
+  parsed: CompilerOutput,
+  lesson: { hash: string; heading: string },
+  existingByHash: Map<string, CompiledRule>,
+  options: BuildCompiledRuleOptions = {},
+): BuildRuleResult {
+  if (!parsed.compilable) return { rule: null };
+
+  // mmnto-ai/totem#1656: declared severity (parsed from the lesson body's
+  // `**Severity:** error` / `Severity: warning` prose convention) wins over
+  // the LLM's emission. Post-LLM override is the deterministic safety net
+  // for prompt-directive drift. The `severityOverride` marker is populated
+  // only when the override actually changed the outcome, so CLI callers
+  // can emit telemetry for prompt-tuning feedback without noise.
+  //
+  // Marker fires when the declared value differs from what the final rule
+  // WOULD HAVE SHIPPED without the override (i.e., `emittedSeverity ??
+  // 'warning'`). If the LLM emits nothing and the declaration is 'warning',
+  // the final severity is 'warning' both ways and the marker stays absent
+  // (Shield finding on initial PR round).
+  const declaredSeverity = options.declaredSeverityOverride;
+  const emittedSeverity = parsed.severity;
+  const severity: 'error' | 'warning' = declaredSeverity ?? emittedSeverity ?? 'warning';
+  const wouldHaveShipped = emittedSeverity ?? 'warning';
+  const severityOverride =
+    declaredSeverity !== undefined && declaredSeverity !== wouldHaveShipped
+      ? { from: emittedSeverity, to: declaredSeverity }
+      : undefined;
+
+  // mmnto-ai/totem#1665: declared scope (parsed from the lesson body's
+  // `**Scope:**` prose convention) wins over the LLM's emission. Author
+  // intent is supreme; #1626's test-contract auto-include heuristic only
+  // applies when source omits Scope. The `scopeOverride` marker fires only
+  // when the override actually changed the outcome (mirrors `severityOverride`
+  // discipline from #1656).
+  //
+  // Both source-declared and LLM-emitted lists pass through `sanitizeFileGlobs`
+  // for parity (brace expansion, shallow → recursive normalization). Set-of-
+  // strings equality uses the post-sanitization values so an authored
+  // `**/*.{ts,js}` matches an LLM-emitted `['**/*.ts', '**/*.js']`.
+  const llmGlobsSanitized = parsed.fileGlobs ? sanitizeFileGlobs(parsed.fileGlobs) : undefined;
+  const declaredScope = options.lessonBody ? parseDeclaredScope(options.lessonBody) : undefined;
+  const declaredScopeSanitized = declaredScope ? sanitizeFileGlobs(declaredScope) : undefined;
+
+  const sanitizedGlobs = declaredScopeSanitized ?? llmGlobsSanitized;
+  const scopeOverride =
+    declaredScopeSanitized !== undefined &&
+    !isGlobSetEqual(declaredScopeSanitized, llmGlobsSanitized ?? [])
+      ? { from: llmGlobsSanitized, to: declaredScopeSanitized }
+      : undefined;
+
+  // Thread overrides through rejection paths too (mmnto-ai/totem#1658 CR
+  // round-3 finding). If the LLM drifts AND emits an invalid/missing
+  // pattern, the telemetry signal still fires — the rejection captures
+  // exactly the prompt-drift cases this signal is meant to detect.
+  const reject = (rejectReason: string): BuildRuleResult => {
+    const result: BuildRuleResult = { rule: null, rejectReason };
+    if (severityOverride) result.severityOverride = severityOverride;
+    if (scopeOverride) result.scopeOverride = scopeOverride;
+    return result;
+  };
+
+  const engine = parsed.engine ?? 'regex';
+  const now = new Date().toISOString();
+  const existing = existingByHash.get(lesson.hash);
+  const globsObj = sanitizedGlobs && sanitizedGlobs.length > 0 ? { fileGlobs: sanitizedGlobs } : {};
+  // mmnto/totem#1408: the effective badExample is the override when present,
+  // else whatever the LLM echoed back in CompilerOutput. Pipeline 1 and ad-hoc
+  // callers that leave the option off bypass the gate entirely.
+  const effectiveBadExample = options.badExampleOverride ?? parsed.badExample;
+  const badExampleObj =
+    effectiveBadExample && effectiveBadExample.length > 0
+      ? { badExample: effectiveBadExample }
+      : {};
+  // mmnto-ai/totem#1580: the effective goodExample mirrors bad — override
+  // wins, else whatever the LLM echoed back. Persisted on the rule so
+  // downstream over-matching checks (and future recompile cycles) have
+  // the ground-truth negative fixture without needing the source lesson.
+  const effectiveGoodExample = options.goodExampleOverride ?? parsed.goodExample;
+  const goodExampleObj =
+    effectiveGoodExample && effectiveGoodExample.length > 0
+      ? { goodExample: effectiveGoodExample }
+      : {};
+
+  let candidate: CompiledRule;
+
+  if (engine === 'ast-grep') {
+    // mmnto/totem#1407 split the field. Mutual exclusion is enforced
+    // upstream by the schema superRefine; here we pick whichever the
+    // LLM emitted and route it to validation.
+    const astSource: string | Record<string, unknown> | undefined =
+      typeof parsed.astGrepPattern === 'string' && parsed.astGrepPattern.length > 0
+        ? parsed.astGrepPattern
+        : parsed.astGrepYamlRule;
+
+    if (!astSource || !parsed.message) {
+      return reject('Missing astGrepPattern or astGrepYamlRule or message');
+    }
+
+    // Validate ast-grep pattern at compile time (#1062, #1339, #1407, #1654).
+    // `sanitizedGlobs` carries the rule's effective fileGlobs (post-scope-
+    // override) so the validator can pick the right Lang grammar — TSX
+    // for unscoped or TS/JS rules, Rust for `**\/*.rs`, etc. Without this,
+    // a Rust pattern parses under Lang.Tsx and accidentally either
+    // false-passes (TSX accepts a JSX-ish tree) or false-fails.
+    const astValidation = validateAstGrepPattern(astSource, sanitizedGlobs);
+    if (!astValidation.valid) {
+      return reject(`Invalid ast-grep pattern: ${astValidation.reason}`);
+    }
+
+    // Guard: reject patterns that match suppression directives (#1177).
+    // For compound rules, the existing stringify path walks the entire
+    // tree; any `totem-ignore` marker anywhere in the nested structure
+    // is caught. Deliberately no object walker here (design doc open
+    // question 2, resolved "keep existing stringify path").
+    const astPatternStr = typeof astSource === 'string' ? astSource : JSON.stringify(astSource);
+    if (isSelfSuppressing(astPatternStr)) {
+      return reject(
+        'Pattern matches a suppression directive (totem-ignore/totem-context) and will self-suppress at runtime',
+      );
+    }
+
+    candidate = {
+      lessonHash: lesson.hash,
+      lessonHeading: lesson.heading,
+      message: parsed.message,
+      engine: 'ast-grep',
+      severity,
+      ...engineFields('ast-grep', astSource),
+      compiledAt: now,
+      createdAt: existing?.createdAt ?? now,
+      ...preserveLifecycleFields(existing),
+      ...globsObj,
+      ...badExampleObj,
+      ...goodExampleObj,
+    };
+  } else if (engine === 'ast') {
+    if (!parsed.astQuery || !parsed.message) {
+      return reject('Missing astQuery or message');
+    }
+    candidate = {
+      lessonHash: lesson.hash,
+      lessonHeading: lesson.heading,
+      message: parsed.message,
+      engine: 'ast',
+      severity,
+      ...engineFields('ast', parsed.astQuery),
+      compiledAt: now,
+      createdAt: existing?.createdAt ?? now,
+      ...preserveLifecycleFields(existing),
+      ...globsObj,
+      ...badExampleObj,
+      ...goodExampleObj,
+    };
+  } else {
+    // Regex engine (default)
+    if (!parsed.pattern || !parsed.message) {
+      return reject('Missing pattern or message');
+    }
+    // mmnto-ai/totem#1641 Change 2 invariant: `validateRegex` (safe-regex2
+    // static complexity check) MUST run before any smoke-gate evaluation
+    // so catastrophic-backtracking patterns are rejected before the gate
+    // executes them against the badExample/goodExample snippets. The
+    // smoke gate below (enforceSmokeGate via runSmokeGate) expects this
+    // ordering; a future refactor that re-orders these stages would
+    // expose the compile smoke gate to the same ReDoS vector the lint
+    // runtime bound (RegexEvaluator) now protects against.
+    const validation = validateRegex(parsed.pattern);
+    if (!validation.valid) {
+      return reject(`Rejected regex: ${validation.reason}`);
+    }
+
+    // Guard: reject patterns that match suppression directives (#1177)
+    // These rules can never fire — the engine suppresses matching lines before rule evaluation.
+    if (isSelfSuppressing(parsed.pattern)) {
+      return reject(
+        'Pattern matches a suppression directive (totem-ignore/totem-context) and will self-suppress at runtime',
+      );
+    }
+
+    candidate = {
+      lessonHash: lesson.hash,
+      lessonHeading: lesson.heading,
+      message: parsed.message,
+      engine: 'regex',
+      severity,
+      ...engineFields('regex', parsed.pattern),
+      compiledAt: now,
+      createdAt: existing?.createdAt ?? now,
+      ...preserveLifecycleFields(existing),
+      ...globsObj,
+      ...badExampleObj,
+      ...goodExampleObj,
+    };
+  }
+
+  // mmnto/totem#1408: compile-time smoke gate. Opt-in via options so Pipeline 1
+  // and ad-hoc test callers are unaffected. The gate reuses the runtime engine
+  // entry points so a rule passing here cannot silently fail to match at
+  // runtime on identical input. Skipped for the 'ast' (Tree-sitter) engine
+  // because runSmokeGate does not yet cover S-expression queries; those rules
+  // fall back to the existing `verifyRuleExamples` path. Skipping here
+  // matches the comment in compile-smoke-gate.ts and prevents the gate from
+  // hard-rejecting a rule it is not equipped to evaluate.
+  if (options.enforceSmokeGate && candidate.engine !== 'ast') {
+    // `.trim().length > 0` mirrors the schema refines. A caller who
+    // bypasses schema parsing and supplies a whitespace-only override
+    // would otherwise slip through the !effectiveExample check because
+    // `'   '` is truthy, and then runSmokeGate's early-return on
+    // `trim().length === 0` would report matched: false for both
+    // checks — under-match would (correctly) reject but for the wrong
+    // reason, and over-match would (incorrectly) accept.
+    const hasBadExample =
+      typeof effectiveBadExample === 'string' && effectiveBadExample.trim().length > 0;
+    if (!hasBadExample) {
+      return reject('smoke gate: missing badExample (required for Pipeline 2/3)');
+    }
+    const gate = runSmokeGate(candidate, effectiveBadExample);
+    if (!gate.matched) {
+      const suffix = gate.reason ? ` (${gate.reason})` : '';
+      return reject(`smoke gate: zero matches against badExample${suffix}`);
+    }
+    // mmnto-ai/totem#1580: over-matching check. The rule must fire on its
+    // badExample (above) AND must NOT fire on its goodExample. Symmetric
+    // guards catch the under-match and over-match defect classes with the
+    // same deterministic engine the runtime uses.
+    const hasGoodExample =
+      typeof effectiveGoodExample === 'string' && effectiveGoodExample.trim().length > 0;
+    if (!hasGoodExample) {
+      return reject('smoke gate: missing goodExample (required for Pipeline 2/3)');
+    }
+    const overMatchGate = runSmokeGate(candidate, effectiveGoodExample);
+    if (overMatchGate.matched) {
+      return reject(
+        `smoke gate: matches goodExample (over-matching: ${overMatchGate.matchCount} match${overMatchGate.matchCount === 1 ? '' : 'es'})`,
+      );
+    }
+  }
+
+  const result: BuildRuleResult = { rule: candidate };
+  if (severityOverride) result.severityOverride = severityOverride;
+  if (scopeOverride) result.scopeOverride = scopeOverride;
+  return result;
+}
+
+// ─── Manual pattern builder ─────────────────────────
+
+export interface BuildRuleResult {
+  rule: CompiledRule | null;
+  rejectReason?: string;
+  /**
+   * Populated when `declaredSeverityOverride` actually changed the emitted
+   * severity (mmnto-ai/totem#1656). Absent when no override was supplied, or
+   * when the override matched the LLM's emission. CLI callers use this as a
+   * telemetry signal for prompt-tuning feedback — frequent overrides mean
+   * the prompt directive is drifting and the LLM needs a stronger signal.
+   */
+  severityOverride?: { from: 'error' | 'warning' | undefined; to: 'error' | 'warning' };
+  /**
+   * Populated when source-declared `**Scope:**` actually changed the emitted
+   * `fileGlobs` (mmnto-ai/totem#1665). Absent when no `lessonBody` was
+   * supplied, when the body declared no Scope, or when the LLM emission
+   * already matched the source declaration. CLI callers use this as a
+   * telemetry signal for prompt-tuning feedback — frequent overrides mean
+   * the LLM is dropping or hallucinating Scope entries.
+   */
+  scopeOverride?: { from: string[] | undefined; to: string[] };
+}
+
+/**
+ * Derive a virtual file path that satisfies a rule's fileGlobs.
+ * Used to construct test fixtures where glob matching is active.
+ */
+export function deriveVirtualFilePath(rule: CompiledRule): string {
+  if (!rule.fileGlobs || rule.fileGlobs.length === 0) return 'src/example.ts';
+  const positiveGlob = rule.fileGlobs.find((g) => !g.startsWith('!'));
+  if (!positiveGlob) return 'src/example.ts';
+
+  // Exact file (no glob chars) — return as-is
+  if (!positiveGlob.includes('*') && !positiveGlob.includes('?')) {
+    return positiveGlob;
+  }
+
+  // Replace glob wildcards with concrete segments to produce a path
+  // that satisfies the glob: **/ → src/, * → example
+  // e.g. **/*.test.ts → src/example.test.ts, *.py → example.py
+  return positiveGlob.replace(/\*\*\//g, 'src/').replace(/\*/g, 'example');
+}
+
+/**
+ * Verify a compiled rule against inline Example Hit/Miss lines.
+ * Returns null if no examples exist or engine is `'ast'` (Tree-sitter).
+ * Tree-sitter rules are skipped because `testRule`'s non-`ast-grep` branch
+ * runs the regex pipeline (`applyRulesToAdditions`), which does not handle
+ * S-expression queries. Regex and ast-grep rules both flow through to
+ * `testRule`. mmnto-ai/totem#1699.
+ * Returns RuleTestResult if verification was run.
+ */
+export function verifyRuleExamples(rule: CompiledRule, body: string): RuleTestResult | null {
+  const examples = extractRuleExamples(body);
+  if (!examples) return null;
+  if (rule.engine !== 'regex' && rule.engine !== 'ast-grep') return null;
+
+  const fixture = {
+    ruleHash: rule.lessonHash,
+    filePath: deriveVirtualFilePath(rule),
+    failLines: examples.hits,
+    passLines: examples.misses,
+    fixturePath: '(inline examples)',
+  };
+
+  return testRule(rule, fixture);
+}
+
+export function formatExampleFailure(result: RuleTestResult): string {
+  const details: string[] = [];
+  if (result.missedFails.length > 0) {
+    details.push(
+      `Example Hits that did NOT match: ${result.missedFails.map((l) => JSON.stringify(l)).join(', ')}`,
+    );
+  }
+  if (result.falsePositives.length > 0) {
+    details.push(
+      `Example Misses that DID match: ${result.falsePositives.map((l) => JSON.stringify(l)).join(', ')}`,
+    );
+  }
+  return `Rule failed inline examples — ${details.join('; ')}`;
+}
+
+/**
+ * Build a CompiledRule from a lesson's manually specified pattern.
+ * Returns { rule, rejectReason } so callers can report why a pattern was rejected.
+ */
+export function buildManualRule(
+  lesson: LessonInput,
+  existingByHash: Map<string, CompiledRule>,
+): BuildRuleResult {
+  const manual = extractManualPattern(lesson.body);
+  if (!manual) return { rule: null };
+
+  // Hoist sanitization above ast-grep validation (CR review on PR #1775,
+  // outside-diff): brace-expanded globs like `**/*.{rs,tsx}` need
+  // `sanitizeFileGlobs` (brace-expansion → `['**/*.rs', '**/*.tsx']`)
+  // before `resolveAstGrepLangs` can map them to Lang values. Validating
+  // against raw `manual.fileGlobs` would silently fall back to `Lang.Tsx`
+  // on every brace-expanded scope and reintroduce the #1654 grammar
+  // mismatch on the manual-authoring path.
+  const sanitizedGlobs = manual.fileGlobs ? sanitizeFileGlobs(manual.fileGlobs) : undefined;
+
+  // Compound ast-grep path: the lesson authored a NapiConfig-shaped rule via
+  // a yaml fenced block under **Pattern:**. Route the parsed object through
+  // validateAstGrepPattern (which accepts both string and object shapes via
+  // the spike-validated polymorphic signature).
+  const isCompound = manual.engine === 'ast-grep' && manual.astGrepYamlRule !== undefined;
+  const astSource: string | Record<string, unknown> | undefined = isCompound
+    ? manual.astGrepYamlRule
+    : manual.engine === 'ast-grep'
+      ? manual.pattern
+      : undefined;
+
+  if (manual.engine === 'regex') {
+    const validation = validateRegex(manual.pattern);
+    if (!validation.valid) {
+      return { rule: null, rejectReason: `Manual pattern rejected: ${validation.reason}` };
+    }
+  }
+
+  if (manual.engine === 'ast-grep') {
+    if (astSource === undefined || (typeof astSource === 'string' && astSource.length === 0)) {
+      return {
+        rule: null,
+        rejectReason:
+          'Manual ast-grep lesson has neither a flat **Pattern:** value nor a `yaml`-tagged fenced block',
+      };
+    }
+    const validation = validateAstGrepPattern(astSource, sanitizedGlobs);
+    if (!validation.valid) {
+      return { rule: null, rejectReason: `Manual ast-grep pattern rejected: ${validation.reason}` };
+    }
+  }
+
+  const now = new Date().toISOString();
+  const existing = existingByHash.get(lesson.hash);
+
+  const engineFieldArgs: string | Record<string, unknown> =
+    manual.engine === 'ast-grep' && astSource !== undefined ? astSource : manual.pattern;
+
+  return {
+    rule: {
+      lessonHash: lesson.hash,
+      lessonHeading: lesson.heading,
+      // #1265: prefer the extracted **Message:** field over the heading fallback.
+      // The heading is the *what*; the message is the *why and how*.
+      message: manual.message ?? lesson.heading,
+      engine: manual.engine,
+      severity: manual.severity,
+      // #1265: explicit Pipeline 1 marker. Pre-#1265, downstream code (doctor,
+      // compile.ts:logCompiledRule) used `lessonHeading === message` to identify
+      // manual rules. That heuristic breaks when manual rules have rich messages,
+      // so we set this flag explicitly here. Old compiled-rules.json files don't
+      // have it; the legacy heuristic stays as a fallback for those.
+      manual: true,
+      ...engineFields(manual.engine, engineFieldArgs),
+      compiledAt: now,
+      createdAt: existing?.createdAt ?? now,
+      ...preserveLifecycleFields(existing),
+      ...(sanitizedGlobs && sanitizedGlobs.length > 0 ? { fileGlobs: sanitizedGlobs } : {}),
+    },
+  };
+}
+
+// ─── Single-lesson compilation ──────────────────────
+
+/**
+ * Check whether the lesson body carries a non-empty Example Hit block.
+ * ADR-088 Phase 1 Layer 3 (mmnto-ai/totem#1480): rules compiled without an
+ * Example Hit ship as `unverified: true` (non-security) or fail outright
+ * (security). Empty code fences like ```ts\n``` are treated as absent —
+ * `trim()` is applied before the length check.
+ */
+function hasExampleHits(body: string): boolean {
+  const examples = extractRuleExamples(body);
+  if (!examples) return false;
+  return examples.hits.some((line) => line.trim().length > 0);
+}
+
+/**
+ * Security-context signal for the missing-Example-Hit check. Either the
+ * compile orchestrator asserts the pack is security-scoped
+ * (`deps.securityContext === true`) OR the rule under construction already
+ * carries `immutable: true` (set by the pack manifest, ADR-089). Both
+ * paths trigger the zero-tolerance reject per ADR-088 Decision 3.
+ *
+ * The LLM-emitted `CompilerOutput` does not currently carry an `immutable`
+ * field (packs set it at pack-merge time), so the second signal only
+ * engages on the Pipeline 1 manual-rule path where `buildManualRule`
+ * could synthesize an immutable rule directly. A future change that
+ * threads `immutable` through `CompilerOutput` can wire Pipeline 2/3
+ * into this helper without touching the call sites.
+ */
+export function isSecurityContext(
+  deps: CompileLessonDeps,
+  rule?: { immutable?: boolean } | null,
+): boolean {
+  if (deps.securityContext === true) return true;
+  if (rule?.immutable === true) return true;
+  return false;
+}
+
+// ─── Test-scope wording mismatch classifier (mmnto-ai/totem#1752) ──
+
+/**
+ * Heading vocabulary that implies a test-contract intent. When the lesson
+ * heading carries one of these words AND the explicit `**Scope:**` excludes
+ * test files, `detectTestScopeMismatch` emits a non-blocking warning so the
+ * author can align the surfaces. Word-boundary-anchored to dodge substring
+ * traps like `latest`, `protest`, `contestant`, `inspector`.
+ */
+const TEST_VOCAB_HEADING_RE = /\b(?:tests?|specs?|assertions?|contracts?)\b/i;
+
+/**
+ * Glob patterns that exclude test files. Mirrors the four shapes the
+ * test-contract scope classifier (mmnto-ai/totem#1626 / mmnto-ai/totem#1652)
+ * promotes-to-test-inclusive — `.test.*`, `.spec.*`, `tests/**`,
+ * `__tests__/**` — but keyed on the negated-glob form (leading `!`).
+ *
+ * Two alternation arms:
+ *   1. File-extension form — `.test.` or `.spec.` anywhere after the `!`.
+ *      Matches `!**\/*.test.*`, `!*.spec.ts`, etc.
+ *   2. Directory form — `tests/` or `__tests__/` either at the root (right
+ *      after `!`) or after any path segment. Matches `!tests/**`,
+ *      `!**\/tests/**`, `!__tests__/**`, `!**\/__tests__/**`. The optional
+ *      `[^!]*\/` prefix lets the directory live at the root of the glob too.
+ */
+const TEST_EXCLUDING_GLOB_RE = /^!(?:[^!]*\.(?:test|spec)\.|(?:[^!]*\/)?(?:tests|__tests__)\/)/;
+
+/**
+ * mmnto-ai/totem#1752: warn when a lesson's heading suggests test-contract
+ * intent but its explicit `**Scope:**` excludes test files. The mismatch is
+ * authoring-side — the rule itself fires correctly per its declared scope,
+ * but the agent-rendered title implies one thing while the rule enforces
+ * another, eroding clarity in `.github/copilot-instructions.md` and the other
+ * agent-mirror exports.
+ *
+ * Non-blocking: fires `callbacks.onWarn` and returns. Wording is heuristic;
+ * false positives on creative phrasings are acceptable per the ticket
+ * (warn-not-reject contract).
+ *
+ * Sibling classifiers:
+ *   - mmnto-ai/totem#1626 (closed via mmnto-ai/totem#1652) promotes test-
+ *     inclusive globs when the `testing` tag AND test-framework call signals
+ *     align with a missing scope. This classifier fires the inverse
+ *     direction: explicit scope contradicts heading wording.
+ *   - mmnto-ai/totem#1702 rejects test-scoped enforcement rules that lack
+ *     a `testing` tag — the third sub-dimension on the same axis.
+ */
+function detectTestScopeMismatch(
+  lesson: LessonInput,
+  callbacks: CompileLessonCallbacks | undefined,
+): void {
+  if (!callbacks?.onWarn) return;
+  if (!TEST_VOCAB_HEADING_RE.test(lesson.heading)) return;
+  const scope = parseDeclaredScope(lesson.body);
+  if (!scope) return;
+  const excludesTests = scope.some((glob) => TEST_EXCLUDING_GLOB_RE.test(glob));
+  if (!excludesTests) return;
+  callbacks.onWarn(
+    lesson.heading,
+    'Heading suggests test-contract intent, but explicit **Scope:** excludes test files. Align the heading with the scope, or widen the scope to include tests.',
+  );
+}
+
+/**
+ * Apply ADR-091 Stage 4 verification to a freshly-compiled rule
+ * (mmnto-ai/totem#1682). Runs only when `deps.verifyStage4` is set; absent
+ * means the caller does not have a codebase to verify against (cloud compile,
+ * unit tests). Mutates the rule in-place per the four-outcome contract and
+ * appends a `layer: 4` trace event so `totem compile --verbose` and downstream
+ * telemetry can observe the verdict.
+ *
+ * Returns `true` when the rule was archived by Stage 4 (the caller should
+ * still ship the rule — `loadCompiledRules` filters archived rules at lint
+ * time, but the manifest preserves them for telemetry continuity per
+ * `lesson-a2f799c0`). Returns `false` for any other outcome.
+ */
+async function applyStage4(
+  rule: CompiledRule,
+  lesson: LessonInput,
+  deps: CompileLessonDeps,
+  callbacks: CompileLessonCallbacks | undefined,
+  trace: LayerTraceEvent[],
+): Promise<boolean> {
+  if (!deps.verifyStage4) return false;
+
+  const result = await deps.verifyStage4(rule);
+
+  callbacks?.onStage4Outcome?.({ heading: lesson.heading, hash: lesson.hash }, result);
+
+  switch (result.outcome) {
+    case 'no-matches': {
+      // Don't clobber a previously archived lifecycle. `preserveLifecycleFields`
+      // carries `status: 'archived'` (and its `archivedReason`/`archivedAt`)
+      // forward on `--force` recompile; setting `'untested-against-codebase'`
+      // unconditionally would silently un-archive rules that the postmerge
+      // curation path explicitly silenced (CR mmnto-ai/totem#1757 R1).
+      if (rule.status !== 'archived') {
+        rule.status = 'untested-against-codebase';
+      }
+      trace.push({ layer: 4, action: 'verify', outcome: 'no-matches' });
+      return false;
+    }
+    case 'in-scope-bad-example': {
+      rule.confidence = 'high';
+      // Clear a carry-forward `'untested-against-codebase'` status so a
+      // previously-untested rule that now finds matches gets promoted to
+      // active (the F6 lint-path filter in `loadCompiledRules` excludes
+      // `'untested-against-codebase'`, so without this clear the rule
+      // would stay inert despite Stage 4 producing positive evidence).
+      // Sonnet pre-push review on the F3+F6 seam (CR mmnto-ai/totem#1757
+      // R1). `'archived'` is preserved — that's an explicit lifecycle
+      // decision; `'untested-against-codebase'` is a Stage 4-managed
+      // intermediate state that promotion can clear.
+      if (rule.status === 'untested-against-codebase') rule.status = 'active';
+      trace.push({ layer: 4, action: 'verify', outcome: 'in-scope-bad-example' });
+      return false;
+    }
+    case 'candidate-debt': {
+      // Force severity to 'warning' so the rule is alive and logs hits but
+      // cannot break CI on first run — ADR-091 §"Stage 4: Candidate Debt"
+      // is explicit. `buildCompiledRule` defaults severity to 'warning'
+      // when neither declared nor emitted, but persisted pre-1.16.0 rules
+      // can still arrive with `severity: undefined` (back-compat per
+      // schema); treating undefined as a no-op would let an older rule
+      // skip the candidate-debt downgrade if a future lint pass starts
+      // interpreting undefined as 'error'. Setting unconditionally to
+      // 'warning' is post-condition-explicit without violating the
+      // never-elevate contract — 'warning' is the floor, not above it.
+      if (rule.severity !== 'warning') rule.severity = 'warning';
+      // Promote a carry-forward `'untested-against-codebase'` rule to
+      // active — same rationale as the in-scope-bad-example branch above.
+      // Candidate-debt is positive evidence the rule fires on real code;
+      // the warning severity carries the human-confirmation signal.
+      if (rule.status === 'untested-against-codebase') rule.status = 'active';
+      trace.push({ layer: 4, action: 'verify', outcome: 'candidate-debt' });
+      // Surface the debt sites so `totem doctor` (mmnto-ai/totem#1685) and
+      // human reviewers can decide whether to confirm or archive. Cap the
+      // displayed sample to keep the warning concise; the full list lives
+      // in telemetry via `onStage4Outcome`. Sanitize first — debt lines
+      // are raw repository code that can carry CSI / control bytes from a
+      // tampered file, and `onWarn` lands in terminal output (CR
+      // mmnto-ai/totem#1757 R1, mirrors the #1743 R4-R7 sanitization wave).
+      const safeDebtLines = result.candidateDebtLines.map(sanitizeForTerminal);
+      const totalDebt = safeDebtLines.length;
+      const sampleSuffix = formatSampleSuffix(safeDebtLines.slice(0, 3), ' | ', totalDebt, 3);
+      callbacks?.onWarn?.(
+        lesson.heading,
+        `Stage 4: candidate debt — ${totalDebt} site(s) outside the badExample shape: ${sampleSuffix}`,
+      );
+      return false;
+    }
+    case 'out-of-scope': {
+      rule.status = 'archived';
+      rule.archivedAt = new Date().toISOString();
+      // Sanitize before formatting — paths are repo-relative strings but
+      // a hostile filename (e.g. via a typosquatting commit) could plant
+      // CSI bytes that survive into `archivedReason` (persisted to
+      // compiled-rules.json) and `onWarn` (terminal). Same vector class
+      // as candidate-debt above (CR mmnto-ai/totem#1757 R1).
+      const safeBaselineMatches = result.baselineMatches.map(sanitizeForTerminal);
+      const totalBaseline = safeBaselineMatches.length;
+      const pathSuffix = formatSampleSuffix(
+        safeBaselineMatches.slice(0, 5),
+        ', ',
+        totalBaseline,
+        5,
+      );
+      rule.archivedReason = `Stage 4 (mmnto-ai/totem#1682): pattern fired on ${totalBaseline} file(s) in the verification baseline (test files, fixture directories, or files outside fileGlobs scope) — over-broad. Offending paths: ${pathSuffix}. reasonCode: stage4-out-of-scope-match.`;
+      trace.push({
+        layer: 4,
+        action: 'verify',
+        outcome: 'out-of-scope',
+        reasonCode: 'stage4-out-of-scope-match',
+      });
+      callbacks?.onWarn?.(
+        lesson.heading,
+        `Stage 4: archived — pattern fired on ${totalBaseline} file(s) in the verification baseline (${pathSuffix})`,
+      );
+      return true;
+    }
+  }
+}
+
+/**
+ * Joins a sample slice with a separator and appends a "(+ N more)" tail when
+ * the full count exceeds the sample size. Used by the Stage 4 callback emit
+ * sites to keep template-literal substitutions adjacent-with-delimiter.
+ */
+function formatSampleSuffix(
+  sample: readonly string[],
+  separator: string,
+  total: number,
+  sampleLimit: number,
+): string {
+  const head = sample.join(separator);
+  if (total <= sampleLimit) return head;
+  return `${head} (+ ${total - sampleLimit} more)`;
+}
+
+/**
+ * Compile a single lesson into a rule.
+ * Handles both manual patterns (zero LLM) and LLM-compiled patterns.
+ * Pure business logic — no UI, no I/O, no process.exit.
+ */
+export async function compileLesson(
+  lesson: LessonInput,
+  compilerPrompt: string,
+  deps: CompileLessonDeps,
+): Promise<CompileLessonResult> {
+  const { parseCompilerResponse, runOrchestrator, existingByHash, callbacks } = deps;
+  const exampleHitPresent = hasExampleHits(lesson.body);
+
+  // mmnto-ai/totem#1752: heading-vs-scope wording mismatch classifier. Runs
+  // before any pipeline so the warning fires regardless of which path the
+  // lesson takes (manual / Pipeline 3 / Pipeline 2). Non-blocking by design
+  // — the rule still compiles per its declared scope.
+  detectTestScopeMismatch(lesson, callbacks);
+
+  // mmnto-ai/totem#1656: extract the declared severity from the lesson body
+  // via the shared `parseDeclaredSeverity` helper (same parser surface as
+  // `buildFrontmatterFromLegacy`). Threaded into every `buildCompiledRule`
+  // call below so the post-LLM override is authoritative regardless of
+  // whether the prompt directive holds.
+  const declaredSeverity = parseDeclaredSeverity(lesson.body);
+
+  // Trace buffer (mmnto-ai/totem#1482). Populated unconditionally across all
+  // three pipelines so the CLI can choose to render it under --verbose
+  // without a per-call gate. Cost of empty-or-small arrays per lesson is
+  // negligible; gating would fork the test surface.
+  const trace: LayerTraceEvent[] = [];
+
+  // ── Pipeline 1: Manual pattern (zero LLM) ────────
+  const manualResult = buildManualRule(lesson, existingByHash);
+  if (manualResult.rule) {
+    // ADR-088 Phase 1 Layer 3 (mmnto-ai/totem#1480): security-scoped manual
+    // rules without an Example Hit are rejected outright.
+    if (!exampleHitPresent && isSecurityContext(deps, manualResult.rule)) {
+      const reason = 'Security rule missing Example Hit block (manual)';
+      callbacks?.onWarn?.(lesson.heading, `${reason} — rejecting`);
+      trace.push({
+        layer: 1,
+        action: 'result',
+        outcome: 'skipped',
+        reasonCode: 'security-rule-rejected',
+      });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason,
+        reasonCode: 'security-rule-rejected',
+        trace,
+      };
+    }
+    const testResult = verifyRuleExamples(manualResult.rule, lesson.body);
+    if (testResult && !testResult.passed) {
+      // A manual rule that failed its own inline examples is authoring
+      // error territory. Keep the existing 'failed' contract so the
+      // lesson stays pending rather than landing in nonCompilable.
+      // Pre-#1480 `verifyRuleExamples` fired on any hit or miss; the
+      // `hasExampleHits` check guards the unverified flag below without
+      // changing the verify gate itself.
+      callbacks?.onWarn?.(lesson.heading, formatExampleFailure(testResult));
+      trace.push({ layer: 1, action: 'result', outcome: 'failed' });
+      return { status: 'failed', trace };
+    }
+    if (!exampleHitPresent) {
+      manualResult.rule.unverified = true;
+    }
+    trace.push({ layer: 1, action: 'result', outcome: 'compiled' });
+    return { status: 'compiled', rule: manualResult.rule, trace };
+  }
+  if (manualResult.rejectReason) {
+    callbacks?.onWarn?.(lesson.heading, manualResult.rejectReason);
+    trace.push({ layer: 1, action: 'result', outcome: 'failed' });
+    return { status: 'failed', trace };
+  }
+  // manualResult.rule === null && no rejectReason → no manual pattern, proceed to Pipeline 3 or 2
+
+  // ADR-088 Phase 1 Layer 3 (mmnto-ai/totem#1480): security rules that enter
+  // the LLM path with no Example Hit short-circuit before the orchestrator
+  // call. Compile has no ground truth to verify against, and zero-tolerance
+  // per Decision 3 leaves nothing to retry.
+  if (!exampleHitPresent && deps.securityContext === true) {
+    const reason = 'Security rule missing Example Hit block';
+    callbacks?.onWarn?.(lesson.heading, `${reason} — rejecting`);
+    trace.push({
+      layer: 3,
+      action: 'result',
+      outcome: 'skipped',
+      reasonCode: 'security-rule-rejected',
+    });
+    return {
+      status: 'skipped',
+      hash: lesson.hash,
+      reason,
+      reasonCode: 'security-rule-rejected',
+      trace,
+    };
+  }
+
+  // ── Pipeline 3: Example-based compilation (Bad/Good snippets) ──
+  const snippets = extractBadGoodSnippets(lesson.body);
+  if (snippets) {
+    // The base prompt (Pipeline 3 specialized template, or compilerPrompt fallback)
+    // is the persistent system context — same bytes across every Pipeline 3 call
+    // within a session. Pass it as systemPrompt so the orchestrator can cache it
+    // (mmnto/totem#1291 Phase 3). The user prompt carries only the per-lesson
+    // bad/good snippets and lesson body.
+    const systemPrompt = deps.pipeline3Prompt ?? compilerPrompt;
+    const userPrompt = [
+      '## Lesson to Compile (Example-Based — Pipeline 3)',
+      '',
+      `Heading: ${lesson.heading}`,
+      '',
+      '### Bad Code (should trigger the rule):',
+      ...snippets.bad,
+      '',
+      '### Good Code (should NOT trigger the rule):',
+      ...snippets.good,
+      '',
+      lesson.body,
+    ].join('\n');
+
+    const response = await runOrchestrator(userPrompt, systemPrompt);
+    if (response == null) {
+      trace.push({ layer: 2, action: 'result', outcome: 'noop' });
+      return { status: 'noop', trace };
+    }
+
+    const parsed = parseCompilerResponse(response);
+    if (!parsed) {
+      callbacks?.onWarn?.(lesson.heading, 'Pipeline 3: failed to parse LLM response — skipping');
+      trace.push({
+        layer: 2,
+        action: 'result',
+        outcome: 'skipped',
+        reasonCode: 'pattern-syntax-invalid',
+      });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason: 'Pipeline 3: failed to parse LLM response',
+        reasonCode: 'pattern-syntax-invalid',
+        trace,
+      };
+    }
+
+    if (!parsed.compilable) {
+      // mmnto-ai/totem#1598 + mmnto-ai/totem#1634: when the LLM flags a
+      // lesson as non-compilable via one of the narrow LLM-emittable
+      // classifier codes (`context-required`, `semantic-analysis-required`),
+      // thread the code through to the ledger so downstream triage can
+      // distinguish structural-cannot-capture from semantic-analysis-required
+      // from generic conceptual-principle lessons. Absent the signal, keep
+      // the existing out-of-scope fallback.
+      const reasonCode = parsed.reasonCode ?? 'out-of-scope';
+      callbacks?.onDim?.(lesson.heading, 'Pipeline 3: not compilable — skipping');
+      trace.push({
+        layer: 2,
+        action: 'result',
+        outcome: 'skipped',
+        reasonCode,
+      });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason: parsed.reason,
+        reasonCode,
+        trace,
+      };
+    }
+
+    // Only include `patternHash` when the parsed output actually carries a
+    // pattern. Hashing the `(pattern unavailable)` fallback would make a
+    // failed generation look identical to a successful one in verbose output.
+    const pipeline3HasPattern = hasExtractablePattern(parsed);
+    trace.push({
+      layer: 2,
+      action: 'generate',
+      outcome: 'produced',
+      ...(pipeline3HasPattern ? { patternHash: hashPattern(extractPatternString(parsed)) } : {}),
+    });
+
+    // mmnto/totem#1408: Pipeline 3 reuses its Bad snippet as the smoke-gate
+    // target. The LLM may or may not echo the snippet back in parsed.badExample;
+    // the override guarantees the gate has something to work with regardless.
+    const ruleResult = buildCompiledRule(parsed, lesson, existingByHash, {
+      enforceSmokeGate: true,
+      declaredSeverityOverride: declaredSeverity,
+      lessonBody: lesson.body,
+      // Guard empty snippet arrays so they don't clobber parsed.badExample
+      // or parsed.goodExample via ?? in buildCompiledRule. `[].join('\n')`
+      // is the empty string, which is defined and would win over the LLM's
+      // echo-back. Pipeline 3's extractBadGoodSnippets requires both Bad
+      // and Good to be present, so the .length check is belt-and-braces.
+      badExampleOverride: snippets.bad.length > 0 ? snippets.bad.join('\n') : undefined,
+      goodExampleOverride: snippets.good.length > 0 ? snippets.good.join('\n') : undefined,
+    });
+    if (ruleResult.severityOverride) {
+      callbacks?.onSeverityOverride?.(
+        { heading: lesson.heading, hash: lesson.hash },
+        ruleResult.severityOverride,
+      );
+    }
+    if (ruleResult.scopeOverride) {
+      // totem-context: telemetry-only callback (mmnto-ai/totem#1665). Silent
+      // when omitted is the intended contract — drift telemetry is observability,
+      // not correctness. The override itself already applied in buildCompiledRule.
+      callbacks?.onScopeOverride?.(
+        { heading: lesson.heading, hash: lesson.hash },
+        ruleResult.scopeOverride,
+      );
+    }
+    if (!ruleResult.rule) {
+      const rejectReason = ruleResult.rejectReason ?? 'Unknown error';
+      callbacks?.onWarn?.(lesson.heading, `Pipeline 3: ${rejectReason} — skipping`);
+      const reasonCode = classifyBuildRejectReason(rejectReason);
+      trace.push({ layer: 2, action: 'verify', outcome: 'rejected' });
+      trace.push({ layer: 2, action: 'result', outcome: 'skipped', reasonCode });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason: `Pipeline 3: ${rejectReason}`,
+        reasonCode,
+        trace,
+      };
+    }
+
+    // Self-verify: at least one Bad line should trigger, no Good line should trigger
+    const virtualPath = deriveVirtualFilePath(ruleResult.rule);
+    const testFixture = {
+      ruleHash: lesson.hash,
+      filePath: virtualPath,
+      failLines: snippets.bad,
+      passLines: snippets.good,
+      fixturePath: '(pipeline-3-self-test)',
+    };
+    const testResult = testRule(ruleResult.rule, testFixture);
+    // For Pipeline 3, we only require at least one Bad line triggers (not all).
+    // Context lines in multi-line Bad snippets (e.g., `{`, `}`) won't match.
+    const badCaught = snippets.bad.length - testResult.missedFails.length;
+    if (badCaught === 0 || testResult.falsePositives.length > 0) {
+      callbacks?.onWarn?.(
+        lesson.heading,
+        'Pipeline 3: generated rule failed self-verification against Bad/Good snippets — skipping',
+      );
+      trace.push({ layer: 2, action: 'verify', outcome: 'self-test-failed' });
+      trace.push({ layer: 2, action: 'result', outcome: 'failed' });
+      return { status: 'failed', trace };
+    }
+
+    trace.push({ layer: 2, action: 'verify', outcome: 'passed' });
+    trace.push({ layer: 2, action: 'result', outcome: 'compiled' });
+
+    // ADR-089 zero-trust default (mmnto-ai/totem#1581): every LLM-generated
+    // rule ships `unverified: true` unconditionally. Pipeline 3 self-test
+    // against Bad/Good snippets is not a human sign-off; Example Hit/Miss
+    // is also an LLM-produced artifact of the compile process. Activation
+    // requires `totem rule promote <hash>` or the ADR-091 Stage 4 Codebase
+    // Verifier in 1.16.0. `exampleHitPresent` retained in trace scope for
+    // Pipeline 1 (manual) guard below, which keeps its pre-#1581 semantics
+    // because manual rules are human-authored and self-evidencing.
+    ruleResult.rule.unverified = true;
+
+    // ADR-091 Stage 4 (mmnto-ai/totem#1682): orthogonal to ADR-089's
+    // `unverified` flag — Stage 4 mutates `status` / `confidence` / `severity`
+    // based on a deterministic codebase walk. Runs only if the caller wired
+    // `deps.verifyStage4`; absent means the consumer codebase is not
+    // reachable (cloud compile / packs) and the verifier defers to T3's
+    // pending-verification flow.
+    await applyStage4(ruleResult.rule, lesson, deps, callbacks, trace);
+
+    return { status: 'compiled', rule: ruleResult.rule, trace };
+  }
+
+  // ── Pipeline 2 / Layer 3: LLM compilation with verify-retry loop ──
+  // ADR-088 Phase 1 (mmnto-ai/totem#1479). The compilerPrompt (ast-grep
+  // manual + few-shot examples, ~50KB) is the persistent system context —
+  // same bytes across every call within a session. Pass it as systemPrompt
+  // so the orchestrator can cache it (mmnto/totem#1291 Phase 3). The user
+  // prompt carries only the per-lesson body, the optional telemetry
+  // directive (per --upgrade target, not cacheable), and on retries the
+  // prior-attempt feedback block.
+  //
+  // Retry semantics:
+  //   - On smoke-gate zero-match, rebuild the user prompt with a
+  //     "Previous Attempt Failed Verification" section that names the
+  //     failed pattern and the badExample it could not match, then call
+  //     the LLM again. Up to MAX_VERIFY_ATTEMPTS total attempts.
+  //   - Security context (deps.securityContext === true or the LLM-emitted
+  //     rule declared `immutable: true`) disables retry: a failing verify
+  //     rejects outright with reasonCode 'security-rule-rejected' per
+  //     ADR-088 Decision 3 (zero tolerance).
+  //   - On attempt exhaustion, fall through to Layer 4 with reasonCode
+  //     'verify-retry-exhausted'. The lesson is recorded as skipped
+  //     with a machine-readable reason so totem doctor and downstream
+  //     tooling can distinguish this from 'out-of-scope'.
+  const MAX_VERIFY_ATTEMPTS = 3;
+  let previousFailure: { pattern: string; snippet: string; reason: string } | null = null;
+
+  for (let attempt = 1; attempt <= MAX_VERIFY_ATTEMPTS; attempt++) {
+    const userPromptParts: string[] = [];
+    if (deps.telemetryPrefix) {
+      userPromptParts.push('## Telemetry-Driven Refinement Directive', deps.telemetryPrefix);
+    }
+    if (previousFailure) {
+      userPromptParts.push(
+        '## Previous Attempt Failed Verification',
+        buildRetryDirective(previousFailure, attempt, MAX_VERIFY_ATTEMPTS),
+      );
+    }
+    userPromptParts.push('## Lesson to Compile', `Heading: ${lesson.heading}`, lesson.body);
+    const userPrompt = userPromptParts.join('\n\n');
+    const response = await runOrchestrator(userPrompt, compilerPrompt);
+
+    if (response == null) {
+      trace.push({ layer: 3, action: 'result', outcome: 'noop' });
+      return { status: 'noop', trace };
+    }
+
+    const parsed = parseCompilerResponse(response);
+    if (!parsed) {
+      callbacks?.onWarn?.(lesson.heading, 'Failed to parse LLM response — skipping');
+      trace.push({
+        layer: 3,
+        action: 'result',
+        outcome: 'skipped',
+        reasonCode: 'pattern-syntax-invalid',
+      });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason: 'Failed to parse LLM response',
+        reasonCode: 'pattern-syntax-invalid',
+        trace,
+      };
+    }
+
+    if (!parsed.compilable) {
+      // mmnto-ai/totem#1598 + mmnto-ai/totem#1634: see Pipeline 3 block above.
+      // Same classifier routing applies here — the LLM may emit either
+      // `context-required` or `semantic-analysis-required`; both thread
+      // through. Absent signal defaults to the generic out-of-scope bucket.
+      const reasonCode = parsed.reasonCode ?? 'out-of-scope';
+      callbacks?.onDim?.(lesson.heading, 'Not compilable (conceptual/architectural) — skipping');
+      trace.push({
+        layer: 3,
+        action: 'result',
+        outcome: 'skipped',
+        reasonCode,
+      });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason: parsed.reason,
+        reasonCode,
+        trace,
+      };
+    }
+
+    // Only include `patternHash` when the parsed output actually carries a
+    // pattern. Hashing the `(pattern unavailable)` fallback would make a
+    // failed generation look identical to a successful one in verbose output.
+    const currentHasPattern = hasExtractablePattern(parsed);
+    trace.push({
+      layer: 3,
+      action: 'generate',
+      outcome: `attempt-${attempt}`,
+      ...(currentHasPattern ? { patternHash: hashPattern(extractPatternString(parsed)) } : {}),
+    });
+
+    // Smoke gate enforcement lives in buildCompiledRule (mmnto-ai/totem#1408).
+    // Rules without a badExample, or whose badExample fails to match the
+    // pattern, come back with rule === null and a rejectReason. Classify the
+    // outcome into one of four buckets:
+    //   success          — rule built AND Example Hit/Miss verify passed
+    //   retry-eligible   — smoke-gate zero-match OR verifyRuleExamples failure
+    //   missing-badexample — LLM omitted a required field (structural)
+    //   validator-failure  — invalid regex / ast-grep parse error / self-
+    //                        suppression guard; retrying would produce more
+    //                        invalid patterns, so the lesson stays pending
+    const ruleResult = buildCompiledRule(parsed, lesson, existingByHash, {
+      enforceSmokeGate: true,
+      declaredSeverityOverride: declaredSeverity,
+      lessonBody: lesson.body,
+    });
+    if (ruleResult.severityOverride) {
+      callbacks?.onSeverityOverride?.(
+        { heading: lesson.heading, hash: lesson.hash },
+        ruleResult.severityOverride,
+      );
+    }
+    if (ruleResult.scopeOverride) {
+      // totem-context: telemetry-only callback (mmnto-ai/totem#1665). Silent
+      // when omitted is the intended contract — drift telemetry is observability,
+      // not correctness. The override itself already applied in buildCompiledRule.
+      callbacks?.onScopeOverride?.(
+        { heading: lesson.heading, hash: lesson.hash },
+        ruleResult.scopeOverride,
+      );
+    }
+
+    let retryReason: string;
+    let retrySnippet: string;
+
+    if (ruleResult.rule) {
+      const testResult = verifyRuleExamples(ruleResult.rule, lesson.body);
+      if (!testResult || testResult.passed) {
+        // ADR-089 zero-trust default (mmnto-ai/totem#1581): every
+        // LLM-generated rule ships `unverified: true` unconditionally,
+        // even when Example Hit/Miss verification passed. The LLM cannot
+        // self-certify structural invariants; activation requires
+        // `totem rule promote <hash>` or the ADR-091 Stage 4 Codebase
+        // Verifier in 1.16.0. Pre-#1581 behavior keyed on
+        // `exampleHitPresent`; under zero-trust that signal is an
+        // authoring heuristic rather than a trust boundary.
+        ruleResult.rule.unverified = true;
+        trace.push({ layer: 3, action: 'verify', outcome: 'MATCH' });
+        trace.push({ layer: 3, action: 'result', outcome: 'compiled' });
+
+        // ADR-091 Stage 4 (mmnto-ai/totem#1682). See Pipeline 3 site above
+        // for the full rationale. Same contract: orthogonal to ADR-089
+        // unverified flag; mutates status/confidence/severity per the
+        // four-outcome verifier result.
+        await applyStage4(ruleResult.rule, lesson, deps, callbacks, trace);
+
+        return { status: 'compiled', rule: ruleResult.rule, trace };
+      }
+      // Example Hit/Miss verification failed against the lesson's ground
+      // truth. ADR-088 AC: "verifies every LLM-generated pattern against
+      // the lesson's Example Hit block. Zero-match triggers a retry."
+      retryReason = formatExampleFailure(testResult);
+      trace.push({ layer: 3, action: 'verify', outcome: 'example-hit-miss' });
+      // The snippet the retry directive should show is the Example Hit
+      // line the pattern missed, not the LLM's own badExample (which the
+      // pattern did match, since the smoke gate passed). If missedFails
+      // is empty but the test still failed (false-positive-only case),
+      // fall back to the badExample so the directive has something
+      // concrete to anchor on.
+      retrySnippet =
+        testResult.missedFails.length > 0
+          ? testResult.missedFails.join('\n')
+          : (parsed.badExample ?? '(no snippet available)');
+    } else {
+      const rejectReason = ruleResult.rejectReason ?? 'Unknown error';
+
+      // Missing-badExample is a structural-output failure. Retrying won't
+      // teach the LLM to emit a field it just omitted — the compiler
+      // system prompt already requires it (mmnto-ai/totem#1409).
+      // Short-circuit to skipped with a distinct reasonCode.
+      if (rejectReason.includes('missing badExample')) {
+        callbacks?.onWarn?.(lesson.heading, `${rejectReason} — skipping`);
+        trace.push({ layer: 3, action: 'verify', outcome: 'missing-badexample' });
+        trace.push({
+          layer: 3,
+          action: 'result',
+          outcome: 'skipped',
+          reasonCode: 'missing-badexample',
+        });
+        return {
+          status: 'skipped',
+          hash: lesson.hash,
+          reason: rejectReason,
+          reasonCode: 'missing-badexample',
+          trace,
+        };
+      }
+
+      // Only smoke-gate zero-match against the LLM's own badExample is
+      // retry-eligible. Validator-level rejections — invalid regex,
+      // ast-grep parse errors, self-suppression guards — are terminal.
+      // Retrying them produces more invalid patterns and wastes tokens.
+      // Record a machine-readable code in the ledger so `totem doctor`
+      // and downstream telemetry can distinguish syntax rejections from
+      // retry-exhaustion.
+      const isZeroMatch = rejectReason.startsWith('smoke gate: zero matches');
+      if (!isZeroMatch) {
+        callbacks?.onWarn?.(lesson.heading, `${rejectReason} — skipping`);
+        const reasonCode = classifyBuildRejectReason(rejectReason);
+        trace.push({ layer: 3, action: 'verify', outcome: 'validator-rejected' });
+        trace.push({ layer: 3, action: 'result', outcome: 'skipped', reasonCode });
+        return {
+          status: 'skipped',
+          hash: lesson.hash,
+          reason: rejectReason,
+          reasonCode,
+          trace,
+        };
+      }
+
+      retryReason = rejectReason;
+      retrySnippet = parsed.badExample ?? '(no badExample emitted)';
+      trace.push({ layer: 3, action: 'verify', outcome: 'smoke-gate-zero-match' });
+    }
+
+    // Shared retry path. Triggered by smoke-gate zero-match OR by
+    // Example Hit/Miss verify failure. Both carry a retryReason that
+    // threads back into the next LLM attempt's user prompt.
+
+    // ADR-088 Decision 3: security rules zero-tolerance. No retry.
+    if (isSecurityContext(deps, ruleResult.rule)) {
+      callbacks?.onWarn?.(
+        lesson.heading,
+        `Security rule rejected on verify failure (no retry): ${retryReason}`,
+      );
+      trace.push({
+        layer: 3,
+        action: 'result',
+        outcome: 'skipped',
+        reasonCode: 'security-rule-rejected',
+      });
+      return {
+        status: 'skipped',
+        hash: lesson.hash,
+        reason: retryReason,
+        reasonCode: 'security-rule-rejected',
+        trace,
+      };
+    }
+
+    if (attempt < MAX_VERIFY_ATTEMPTS) {
+      previousFailure = {
+        pattern: extractPatternString(parsed),
+        snippet: retrySnippet,
+        reason: retryReason,
+      };
+      callbacks?.onDim?.(
+        lesson.heading,
+        `Verify failed (attempt ${attempt}/${MAX_VERIFY_ATTEMPTS}): ${retryReason} — retrying`,
+      );
+      trace.push({ layer: 3, action: 'retry', outcome: `attempt-${attempt + 1}-scheduled` });
+      continue;
+    }
+
+    // Attempts exhausted → Layer 4 fallthrough per ADR-088.
+    callbacks?.onWarn?.(
+      lesson.heading,
+      `Verify retry exhausted after ${MAX_VERIFY_ATTEMPTS} attempts: ${retryReason} — skipping`,
+    );
+    trace.push({
+      layer: 3,
+      action: 'result',
+      outcome: 'skipped',
+      reasonCode: 'verify-retry-exhausted',
+    });
+    return {
+      status: 'skipped',
+      hash: lesson.hash,
+      reason: `Verify retry exhausted after ${MAX_VERIFY_ATTEMPTS} attempts: ${retryReason}`,
+      reasonCode: 'verify-retry-exhausted',
+      trace,
+    };
+  }
+
+  // Unreachable: every path inside the loop returns. Kept to satisfy the
+  // return-type checker without using a non-null assertion dance. Push a
+  // terminal result event defensively so any caller relying on the
+  // terminal-result invariant still sees one even if the loop ever leaks.
+  trace.push({ layer: 3, action: 'result', outcome: 'failed' });
+  return { status: 'failed', trace };
+}
+
+// ─── Retry loop helpers (ADR-088 Layer 3) ──────────
+
+/**
+ * Map a `buildCompiledRule` rejectReason string to a machine-readable
+ * `CompileLessonReasonCode`. Substring matching is deliberate: these
+ * strings originate inside `compiler.ts` / `compile-lesson.ts` and the
+ * tests on this module pin them, so prefix drift surfaces as a test
+ * failure rather than a silent reclassification.
+ *
+ *   - 'Missing pattern/message/astQuery/astGrepPattern/astGrepYamlRule'
+ *     → `'no-pattern-generated'`. The LLM emitted a structured response
+ *     without the fields needed to build a rule.
+ *   - 'Rejected regex' / 'Invalid ast-grep pattern' →
+ *     `'pattern-syntax-invalid'`. The pattern exists but cannot be parsed
+ *     / executed / safely run. Retry-pending — the LLM may produce a
+ *     valid pattern on the next attempt.
+ *   - 'Pattern matches a suppression directive' →
+ *     `'self-suppressing-pattern'` (mmnto-ai/totem#1664). The pattern
+ *     would match `totem-ignore` / `totem-context` and self-suppress at
+ *     runtime — structural, not transient. Terminal (writes to ledger)
+ *     so bot reviewers can cite the reasonCode instead of synthesizing
+ *     a "missing from manifest" finding (item 021 audit-trail gap).
+ *   - 'smoke gate: zero matches' → `'pattern-zero-match'`. The pattern
+ *     compiled fine but did not fire against the badExample. On the
+ *     Pipeline 2 retry-loop path this branch is used for retry fuel;
+ *     the retry-exhausted terminal uses `'verify-retry-exhausted'`.
+ *     Pipeline 3 does not retry, so the gate rejection lands here
+ *     directly.
+ *   - Fallback is `'pattern-syntax-invalid'` so every skipped ledger
+ *     entry carries a specific code per ADR-088 Layer 4.
+ */
+function classifyBuildRejectReason(rejectReason: string): CompileLessonReasonCode {
+  if (rejectReason.startsWith('Missing ')) return 'no-pattern-generated';
+  if (rejectReason.startsWith('Rejected regex')) return 'pattern-syntax-invalid';
+  if (rejectReason.startsWith('Invalid ast-grep pattern')) return 'pattern-syntax-invalid';
+  if (rejectReason.includes('suppression directive')) return 'self-suppressing-pattern';
+  if (rejectReason.startsWith('smoke gate: zero matches')) return 'pattern-zero-match';
+  if (rejectReason.startsWith('smoke gate: matches goodExample')) return 'matches-good-example';
+  if (rejectReason.startsWith('smoke gate: missing goodExample')) return 'missing-goodexample';
+  return 'pattern-syntax-invalid';
+}
+
+/**
+ * Render the parsed LLM output's pattern as a printable string for the
+ * retry-directive prompt. regex and astGrepPattern are string-native; a
+ * compound ast-grep rule is JSON-serialized so the LLM can see the
+ * structure that produced zero matches.
+ */
+function extractPatternString(parsed: CompilerOutput): string {
+  if (typeof parsed.pattern === 'string' && parsed.pattern.length > 0) return parsed.pattern;
+  if (typeof parsed.astGrepPattern === 'string' && parsed.astGrepPattern.length > 0) {
+    return parsed.astGrepPattern;
+  }
+  if (parsed.astGrepYamlRule) return JSON.stringify(parsed.astGrepYamlRule, null, 2);
+  return '(pattern unavailable)';
+}
+
+/**
+ * Whether the parsed compiler output carries a concrete pattern we can hash.
+ * Callers emitting a `generate` trace event use this guard so the event
+ * records `patternHash` only when the LLM actually produced a pattern; a
+ * missing-pattern case emits the event without the field rather than
+ * hashing the `(pattern unavailable)` fallback, which would misleadingly
+ * look like a successful generation in verbose output.
+ */
+function hasExtractablePattern(parsed: CompilerOutput): boolean {
+  if (typeof parsed.pattern === 'string' && parsed.pattern.length > 0) return true;
+  if (typeof parsed.astGrepPattern === 'string' && parsed.astGrepPattern.length > 0) return true;
+  if (parsed.astGrepYamlRule) return true;
+  return false;
+}
+
+/**
+ * Build the "Previous Attempt Failed Verification" user-prompt block that
+ * threads the prior-attempt pattern, badExample, and reject reason back to
+ * the LLM so it can correct its output.
+ */
+function buildRetryDirective(
+  failure: { pattern: string; snippet: string; reason: string },
+  attempt: number,
+  maxAttempts: number,
+): string {
+  return [
+    `This is attempt ${attempt} of ${maxAttempts}. The previous attempt produced a pattern that failed verification.`,
+    '',
+    '**Previous pattern:**',
+    '```',
+    failure.pattern,
+    '```',
+    '',
+    '**Code snippet the pattern had to match:**',
+    '```',
+    failure.snippet,
+    '```',
+    '',
+    `**Failure reason:** ${failure.reason}`,
+    '',
+    'Generate a corrected pattern that satisfies the requirements. Keep the lesson intent unchanged; only fix the pattern so it triggers correctly.',
+  ].join('\n');
+}

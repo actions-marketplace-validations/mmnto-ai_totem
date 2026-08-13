@@ -1,0 +1,407 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+import {
+  type CompiledRule,
+  CompiledRulesFileSchema,
+  matchAstGrepPattern,
+  matchesGlob,
+  readJsonSafe,
+} from '@mmnto/totem';
+
+const PACK_ROOT = path.resolve(__dirname, '..');
+const REPO_ROOT = path.resolve(__dirname, '..', '..', '..');
+
+const manifest = readJsonSafe(path.join(PACK_ROOT, 'compiled-rules.json'), CompiledRulesFileSchema);
+
+// ─── Sweep targets ──────────────────────────────────────
+//
+// The rules apply to source code under packages/. We walk that tree, skip
+// node_modules and build outputs, and let each rule's own fileGlobs decide
+// whether it applies to a given file. The pack is dogfood: its own fixture
+// files under packages/pack-agent-security/test/fixtures/ are excluded by
+// every rule's `!**/test/**` glob, so the sweep cannot trip on them.
+
+const SWEEP_DIRS = ['packages'];
+const SKIP_DIRS = new Set(['node_modules', 'dist', 'build', '.turbo', '.next', 'coverage']);
+const SWEEP_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+
+// totem-context: the pack's own fixtures intentionally exercise the
+// attack patterns the rules flag. They live under the pack's test/
+// directory, but the rule globs' `!**/test/**` does not catch nested
+// test directories (matchesGlob treats `**/X/**` as "top-level X only").
+// Skip the pack's fixture tree at walk time rather than bloating every
+// rule's fileGlobs with a pack-specific exclusion.
+const SKIP_PATH_PREFIXES = ['packages/pack-agent-security/test'];
+
+function walkDir(dir: string, acc: string[]): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    // CR-5 finding on #1521: don't swallow fs errors. A silent return here
+    // would turn the repo-wide FP sweep into a false-negative generator —
+    // if a directory becomes unreadable mid-sweep, the sweep would still
+    // "pass" on a partial scan. Fail loud with the offending path.
+    throw new Error(
+      `repo-sweep: failed to read directory ${dir}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  for (const ent of entries) {
+    if (SKIP_DIRS.has(ent.name)) continue;
+    const abs = path.join(dir, ent.name);
+    if (ent.isDirectory()) {
+      walkDir(abs, acc);
+    } else if (ent.isFile() && SWEEP_EXTS.has(path.extname(ent.name))) {
+      const rel = path.relative(REPO_ROOT, abs).split(path.sep).join('/');
+      if (SKIP_PATH_PREFIXES.some((prefix) => rel.startsWith(prefix + '/'))) continue;
+      acc.push(rel);
+    }
+  }
+}
+
+function collectTargetFiles(): string[] {
+  const out: string[] = [];
+  for (const top of SWEEP_DIRS) walkDir(path.join(REPO_ROOT, top), out);
+  return out;
+}
+
+function fileMatchesRuleGlobs(file: string, rule: CompiledRule): boolean {
+  const globs = rule.fileGlobs ?? [];
+  if (globs.length === 0) return true;
+  const positive = globs.filter((g) => !g.startsWith('!'));
+  const negative = globs.filter((g) => g.startsWith('!')).map((g) => g.slice(1));
+  const posOk = positive.length === 0 || positive.some((g) => matchesGlob(file, g));
+  const negOk = negative.some((g) => matchesGlob(file, g));
+  return posOk && !negOk;
+}
+
+function extForFile(file: string): string {
+  return path.extname(file);
+}
+
+type Violation = {
+  hash: string;
+  file: string;
+  line: number;
+};
+
+// totem-context: test-harness helper. Sync read is intentional (test setup,
+// no event-loop concern); fail-loud via a bare Error wrapper is a test
+// assertion failure path, not a runtime error surface.
+function readSweepFileOrThrow(abs: string): string {
+  try {
+    return fs.readFileSync(abs, 'utf-8');
+  } catch (err) {
+    throw new Error(
+      `repo-sweep: failed to read file ${abs}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+function sweepAstGrep(rule: CompiledRule, files: string[]): Violation[] {
+  const pattern = rule.astGrepYamlRule ?? rule.astGrepPattern;
+  if (!pattern) {
+    // Fail loud: a malformed rule with no pattern would silently skip the
+    // repo sweep (CR #1522 catch, same class as the unknown-engine dispatch).
+    throw new Error(
+      `repo-sweep: rule ${rule.lessonHash} declares engine 'ast-grep' but has no astGrepYamlRule or astGrepPattern`,
+    );
+  }
+  const out: Violation[] = [];
+  for (const file of files) {
+    if (!fileMatchesRuleGlobs(file, rule)) continue;
+    const abs = path.join(REPO_ROOT, file);
+    const content = readSweepFileOrThrow(abs);
+    const lineCount = content.split('\n').length;
+    const lineNumbers = Array.from({ length: lineCount }, (_, i) => i + 1);
+    const matches = matchAstGrepPattern(content, extForFile(file), pattern, lineNumbers);
+    for (const m of matches) {
+      out.push({ hash: rule.lessonHash, file, line: m.lineNumber });
+    }
+  }
+  return out;
+}
+
+function sweepRegex(rule: CompiledRule, files: string[]): Violation[] {
+  if (!rule.pattern) {
+    throw new Error(
+      `repo-sweep: rule ${rule.lessonHash} declares engine 'regex' but has no pattern`,
+    );
+  }
+  let re: RegExp;
+  try {
+    // totem-context: pattern is the pack's own compiled rule regex, not user input
+    re = new RegExp(rule.pattern);
+  } catch (err) {
+    throw new Error(
+      `repo-sweep: rule ${rule.lessonHash} has invalid regex pattern: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  const out: Violation[] = [];
+  for (const file of files) {
+    if (!fileMatchesRuleGlobs(file, rule)) continue;
+    const abs = path.join(REPO_ROOT, file);
+    const content = readSweepFileOrThrow(abs);
+    const lines = content.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      // totem-context: non-global regex, lastIndex not mutated
+      if (re.test(lines[i]!)) {
+        out.push({ hash: rule.lessonHash, file, line: i + 1 });
+      }
+    }
+  }
+  return out;
+}
+
+function sweep(): Violation[] {
+  const files = collectTargetFiles();
+  const out: Violation[] = [];
+  for (const rule of manifest.rules) {
+    if (rule.engine === 'ast-grep') {
+      out.push(...sweepAstGrep(rule, files));
+    } else if (rule.engine === 'regex') {
+      out.push(...sweepRegex(rule, files));
+    } else {
+      // Fail loud: a silent skip of an unsupported engine would let a newly-
+      // added rule go uncovered by the repo-wide FP sweep. Every engine the
+      // pack ships MUST be dispatched here (CR catch on #1522).
+      throw new Error(
+        `repo-sweep: rule ${rule.lessonHash} has unsupported engine '${rule.engine}'; extend sweep() to cover it`,
+      );
+    }
+  }
+  return out;
+}
+
+// ─── Allowlist ──────────────────────────────────────────
+//
+// Known-legitimate uses of the flagged primitives inside Totem's own source
+// tree. Each entry records the hash (which rule fires), the file (what path),
+// the expected match count (CR-6 finding on #1521 — catches new matches in
+// already-allowed files instead of silently blessing them), and the reason
+// (why these calls are legit here).
+//
+// When a legitimate call site is added or removed, update the `expectedCount`
+// accordingly. When the count diverges from expected, the sweep fails with a
+// diff that identifies the new or missing line numbers.
+//
+// When adding an entry, also update the pack's README coverage notes so
+// consumers are aware that these sites are project-local exceptions rather
+// than pack-template holes.
+
+type AllowEntry = {
+  hash: string;
+  file: string;
+  expectedCount: number;
+  reason: string;
+};
+
+const ALLOWLIST: AllowEntry[] = [
+  {
+    hash: 'dd24f87f46e65812',
+    file: 'packages/core/src/sys/git.ts',
+    expectedCount: 1,
+    reason:
+      'listTrackedFilesUnder builds the NUL delimiter for `git ls-files -z` via String.fromCharCode(0) — a git output-parsing delimiter, not runtime string/command assembly. -z is required so tracked-lesson paths with spaces/unicode parse exactly (mmnto-ai/totem#2051 / mmnto-ai/totem#2055).',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/core/src/sys/exec.ts',
+    expectedCount: 1,
+    reason:
+      'The safeExec helper itself. Wraps cross-spawn.sync to provide the shell-injection-safe primitive the rest of the CLI uses. All consumer spawn surfaces route through this.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/index.ts',
+    expectedCount: 1,
+    reason:
+      'Capability probe (`gh --version`) to decide whether GitHub-CLI-backed commands are available. Literal target, no user input.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/reexec-local.ts',
+    expectedCount: 1,
+    reason:
+      'The mmnto-ai/totem#2018 L1 prefer-local re-exec. Cannot route through safeExec: delegation needs stdio inherit (live passthrough of the child CLI session) and non-throwing exit-code propagation (a delegated `totem lint` exiting 1 is a normal outcome to forward, not an exception), while safeExec is pipe-buffered and throws on non-zero. The spawn target is process.execPath (node itself) + the identity-guarded @mmnto/cli entry path; argv rides as an array, no shell, TOTEM_NO_REEXEC loop guard on the child env.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/doctor.ts',
+    expectedCount: 7,
+    reason:
+      '`totem doctor` invokes `spawnSync` to run git plumbing (rev-parse, ls-files, checkout) for hook installation, secrets-file checks, and manifest recovery. Literal targets, fixed args.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/install-hooks.ts',
+    expectedCount: 1,
+    reason:
+      'resolveHooksDir invokes `spawnSync` for one git plumbing call (`rev-parse --git-path hooks`) to locate the worktree-aware hooks directory (mmnto-ai/totem#2418). Literal target, fixed args, cwd anchored at the resolved git root; raw spawnSync (the doctor.ts idiom) because a static safeExec import would pull the core barrel into CLI cold-start.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/add-lesson.ts',
+    expectedCount: 1,
+    reason:
+      'Uses the safeExec helper (imported as `exec`) to shell out to git for metadata during lesson creation. Literal git subcommands only.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/extract-local.ts',
+    expectedCount: 3,
+    reason:
+      'safeExec alias (`{ safeExec: exec }`) used for diff and commit-history retrieval during lesson extraction. Literal git subcommands with branch-name args under Totem control.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/wt.ts',
+    expectedCount: 7,
+    reason:
+      '`totem wt` shells to git through the injected safeExec seam (default `safeExec`) for worktree plumbing: rev-parse --show-toplevel, rev-parse --git-common-dir (the primary-checkout guard), worktree list --porcelain, worktree add, status --porcelain (the ECL probe), worktree remove, worktree prune. Literal git subcommands; slug/branch/ticket args are pattern-validated and paths resolved before use (mmnto-ai/totem#2580 slice 2).',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/extract-pr.ts',
+    expectedCount: 1,
+    reason: 'Same safeExec alias pattern for PR-backed lesson extraction.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/extract-scan.ts',
+    expectedCount: 1,
+    reason: 'Same safeExec alias pattern for scan-mode extraction.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/handoff.ts',
+    expectedCount: 1,
+    reason: 'safeExec alias used to read commit history during end-of-session journal scaffolding.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/lesson.ts',
+    expectedCount: 1,
+    reason: 'safeExec alias used for git plumbing when listing/inspecting lessons.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/spine-review-thread-source.ts',
+    expectedCount: 1,
+    reason:
+      'The ADR-111 slice-5a live ReviewThreadSource adapter invokes its injected `GhExec` seam (a function parameter named `exec`) once to run `gh api graphql` for a PR. The seam delegates to lazy-loaded `safeExec` (cross-spawn, no shell); the PR number is numeric and owner/name are JSON-escaped into a single `-f query=` argument — no shell-injection vector. Not `child_process.exec`; the rule fires only on the `exec(` call-shape (mmnto-ai/totem#2201).',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/commands/spine-corpus-disposition-source.ts',
+    expectedCount: 1,
+    reason:
+      'The #709 5d-ii held-out CorpusDispositionSourceAdapter invokes its injected `GhExec` seam (a function parameter named `exec`) once to run `gh api graphql` for a held-out corpus PR — the identical safe call-shape as the sibling spine-review-thread-source adapter. The seam delegates to lazy-loaded `safeExec` (cross-spawn, no shell); the PR number is numeric and owner/name are JSON-escaped into a single `-f query=` argument — no shell-injection vector. Not `child_process.exec`; the rule fires only on the `exec(` call-shape (strategy#709).',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/orchestrators/orchestrator.ts',
+    expectedCount: 1,
+    reason: 'safeExec alias for git state probes inside the LLM orchestration pipeline.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/orchestrators/shell-orchestrator.ts',
+    expectedCount: 1,
+    reason:
+      'Primary orchestrator command execution via `spawn(resolvedCmd, ...)`. The command template is an intentionally trusted, repository-configured boundary rather than a hardcoded executable; dynamic fields are constrained: `model` passes `assertValidModelName`, both the model and temporary prompt-file path are shell-quoted before interpolation, and the prompt file is created with mode 0600.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/cli/src/utils/governance.ts',
+    expectedCount: 2,
+    reason:
+      '`totem proposal new` and `totem adr new` scaffolding orchestrator (#1288). Calls `pnpm run docs:inject` and `git add <file> <dashboard>` via safeExec (imported as `exec`). Literal binary names, structured argv. User-provided title is sanitized to `[a-z0-9-]+` before reaching the argv surface, so no shell-injection vector.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/mcp/src/tools/add-lesson.ts',
+    expectedCount: 2,
+    reason: 'Same Windows taskkill cleanup pattern as shell-orchestrator.ts.',
+  },
+  {
+    hash: 'c2c09301bb56a02b',
+    file: 'packages/mcp/src/tools/verify-execution.ts',
+    expectedCount: 3,
+    reason: 'Same Windows taskkill cleanup pattern via execFileSync.',
+  },
+];
+
+function keyFor(hash: string, file: string): string {
+  return `${hash}|${file}`;
+}
+
+// ─── Tests ──────────────────────────────────────────────
+
+describe('@mmnto/pack-agent-security Totem-repo FP sweep', () => {
+  const violations = sweep();
+
+  // Per-file tallies for count-based allowlist comparison (CR-6).
+  const countsByKey = new Map<string, { lines: number[]; hash: string; file: string }>();
+  for (const v of violations) {
+    const key = keyFor(v.hash, v.file);
+    const entry = countsByKey.get(key) ?? { lines: [], hash: v.hash, file: v.file };
+    entry.lines.push(v.line);
+    countsByKey.set(key, entry);
+  }
+  const allowByKey = new Map(ALLOWLIST.map((e) => [keyFor(e.hash, e.file), e]));
+
+  it('does not surface any rule violations outside the documented allowlist', () => {
+    const unexpectedKeys: string[] = [];
+    for (const [key, { hash, file, lines }] of countsByKey) {
+      if (!allowByKey.has(key)) {
+        unexpectedKeys.push(
+          `  ${hash}  ${file}  (${lines.length} match${lines.length === 1 ? '' : 'es'} at line${lines.length === 1 ? '' : 's'} ${lines.join(', ')})`,
+        );
+      }
+    }
+    if (unexpectedKeys.length > 0) {
+      throw new Error(
+        `Unexpected rule violations in Totem source (add to ALLOWLIST with justification, or narrow the rule):\n${unexpectedKeys.join('\n')}`,
+      );
+    }
+    expect(unexpectedKeys).toEqual([]);
+  });
+
+  it('every allowlisted (hash, file) pair still produces the expected number of matches', () => {
+    // CR-6 finding on #1521: file-level allowlisting masks regressions. If a
+    // new suspicious call is added to an allowlisted file, the hit count
+    // changes and this test fails, naming the file and showing the delta.
+    const deltas: string[] = [];
+    for (const entry of ALLOWLIST) {
+      const key = keyFor(entry.hash, entry.file);
+      const actual = countsByKey.get(key);
+      const actualCount = actual?.lines.length ?? 0;
+      if (actualCount !== entry.expectedCount) {
+        const detail = actual
+          ? `expected ${entry.expectedCount}, got ${actualCount} (actual lines: ${actual.lines.join(', ')})`
+          : `expected ${entry.expectedCount}, got ${actualCount}`;
+        deltas.push(`  ${entry.hash}  ${entry.file}: ${detail}`);
+      }
+    }
+    if (deltas.length > 0) {
+      throw new Error(
+        `Allowlist count drift (update expectedCount, or investigate the new/removed call site):\n${deltas.join('\n')}`,
+      );
+    }
+    expect(deltas).toEqual([]);
+  });
+
+  it('each allowlist entry references a hash that exists in the pack', () => {
+    const validHashes = new Set(manifest.rules.map((r) => r.lessonHash));
+    for (const entry of ALLOWLIST) {
+      expect(
+        validHashes.has(entry.hash),
+        `Allowlist hash ${entry.hash} does not match any rule in the pack`,
+      ).toBe(true);
+    }
+  });
+});

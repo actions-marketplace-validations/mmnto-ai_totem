@@ -1,0 +1,344 @@
+/**
+ * Config drift tests — ensures our dev environment stays in sync
+ * with the consumer templates shipped by `totem init` and `totem hooks`.
+ *
+ * If these fail, it means our dogfood config has diverged from what
+ * consumers get out of the box. Fix the drift before shipping.
+ */
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import { describe, expect, it } from 'vitest';
+
+import { AI_PROMPT_BLOCK, buildNpxCommand, REFLEX_VERSION } from '../commands/init.js';
+import { DOCS_SYSTEM_PROMPT } from './docs.js';
+import {
+  buildPreCommitHook,
+  buildPrePushHook,
+  TOTEM_PRECOMMIT_MARKER,
+  TOTEM_PREPUSH_MARKER,
+} from './install-hooks.js';
+import { SYSTEM_PROMPT as SPEC_SYSTEM_PROMPT } from './spec-templates.js';
+
+const ROOT = path.resolve(__dirname, '..', '..', '..', '..');
+
+function readRoot(file: string): string {
+  return fs.readFileSync(path.join(ROOT, file), 'utf-8');
+}
+
+// ─── Git hook drift ──────────────────────────────────
+
+describe('dev hooks match consumer templates', () => {
+  const devPreCommit = readRoot('tools/pre-commit');
+  const devPrePush = readRoot('tools/pre-push');
+  const devPostMerge = readRoot('tools/post-merge');
+
+  it('dev pre-commit contains consumer marker', () => {
+    expect(devPreCommit).toContain(TOTEM_PRECOMMIT_MARKER);
+  });
+
+  it('dev pre-push contains consumer marker', () => {
+    expect(devPrePush).toContain(TOTEM_PREPUSH_MARKER);
+  });
+
+  it('dev pre-commit blocks the same branches as consumer template', () => {
+    const consumerHook = buildPreCommitHook();
+    // Both must block main and master
+    expect(devPreCommit).toContain('"main"');
+    expect(devPreCommit).toContain('"master"');
+    expect(consumerHook).toContain('"main"');
+    expect(consumerHook).toContain('"master"');
+  });
+
+  it('dev pre-push runs totem lint and consumer template runs lint stateless', () => {
+    const consumerHook = buildPrePushHook('pnpm dlx @mmnto/cli');
+    // tools/ is now byte-identical to the builder output (mmnto-ai/totem#2404), so the
+    // dev hook runs lint via the resolved $TOTEM_CMD, exactly like the consumer template.
+    expect(devPrePush).toContain('$TOTEM_CMD lint');
+    // Consumer hook runs lint directly via $TOTEM_CMD — no flag files
+    expect(consumerHook).toContain('$TOTEM_CMD lint');
+    expect(consumerHook).toContain('verify-manifest');
+    expect(consumerHook).not.toContain('.lint-passed');
+  });
+
+  it('dev post-merge runs totem sync like consumer template', () => {
+    // Byte-identical to buildHookContent (mmnto-ai/totem#2404): sync runs via $TOTEM_CMD.
+    expect(devPostMerge).toContain('$TOTEM_CMD sync');
+    expect(devPostMerge).toContain('[totem]');
+  });
+
+  it('all dev hooks start with a shebang', () => {
+    expect(devPreCommit).toMatch(/^#!\/bin\/sh\r?\n/);
+    expect(devPrePush).toMatch(/^#!\/bin\/sh\r?\n/);
+    expect(devPostMerge).toMatch(/^#!\/bin\/sh\r?\n/);
+  });
+});
+
+// ─── Agent config drift ─────────────────────────────
+
+describe('agent instruction files match consumer AI_PROMPT_BLOCK', () => {
+  // Post ADR-038 migration: AGENTS.md is the canonical for Claude Code + Gemini CLI
+  // (read via CLAUDE.md + GEMINI.md redirect files). .junie/guidelines.md remains
+  // canonical for Junie sessions until that migration follows.
+  const agentsMd = readRoot('AGENTS.md');
+  const junieGuidelines = readRoot('.junie/guidelines.md');
+
+  it('AGENTS.md contains the search_knowledge instruction', () => {
+    expect(agentsMd).toContain('search_knowledge');
+  });
+
+  it('Junie guidelines.md contains the search_knowledge instruction', () => {
+    expect(junieGuidelines).toContain('search_knowledge');
+  });
+
+  it('AI_PROMPT_BLOCK contains the search_knowledge reflex', () => {
+    expect(AI_PROMPT_BLOCK).toContain('search_knowledge');
+  });
+
+  it('AI_PROMPT_BLOCK has a valid reflex version', () => {
+    expect(REFLEX_VERSION).toBeGreaterThanOrEqual(1); // totem-ignore — version floor check, not a set count
+    expect(AI_PROMPT_BLOCK).toContain(`totem:reflexes:version:${REFLEX_VERSION}`);
+  });
+});
+
+// ─── `totem review` billing honesty (mmnto-ai/totem#2536) ─
+
+describe('product surfaces bill `totem review` as an advisory sensor', () => {
+  // The Rituals text told agents `totem review` was "a full AI-powered code
+  // review" — read as THE review of record, which is what sent an agent at a
+  // ~100k-char diff straight into the truncation class (mmnto-ai/totem#2524).
+  // lint is the gate verb; review is a supplementary sensor whose limits are
+  // disclosed at the point of instruction.
+  it('the Rituals step names lint as the enforcement floor and review as advisory', () => {
+    expect(AI_PROMPT_BLOCK).toContain('the deterministic enforcement floor');
+    expect(AI_PROMPT_BLOCK).toContain('supplementary AI lanes');
+    expect(AI_PROMPT_BLOCK).toContain('advisory sensors, not a merge gate');
+    // The known limits ride the instruction itself, not just the run output.
+    expect(AI_PROMPT_BLOCK).toContain('truncation');
+    expect(AI_PROMPT_BLOCK).toContain('non-code files skipped');
+    // The superseded billing must be gone, not merely supplemented.
+    expect(AI_PROMPT_BLOCK).not.toContain('full AI-powered code review');
+  });
+
+  // Sterilization (mmnto-ai/totem-strategy#619): the internal review-process
+  // vocabulary is T1 and never ships in a consumer-facing template.
+  it('no internal review-process vocabulary reaches the consumer template', () => {
+    for (const term of ['review-leg', 'cohort', 'falsification']) {
+      expect(AI_PROMPT_BLOCK.toLowerCase()).not.toContain(term);
+    }
+  });
+
+  // The spec prompt is the strongest stale surface: every generated spec hands
+  // an executing agent a MANDATORY Verification block. lint stays the mandatory
+  // deterministic step; review is billed as the supplementary lane it is.
+  it('the spec system-prompt Verification block bills review as a supplementary advisory lane', () => {
+    expect(SPEC_SYSTEM_PROMPT).toContain('deterministic rule check');
+    expect(SPEC_SYSTEM_PROMPT).toContain('supplementary AI lanes over the diff');
+    expect(SPEC_SYSTEM_PROMPT).toContain('advisory');
+    expect(SPEC_SYSTEM_PROMPT).toContain('review of record');
+    expect(SPEC_SYSTEM_PROMPT).not.toContain('AI-powered architectural review');
+    for (const term of ['review-leg', 'cohort', 'falsification']) {
+      expect(SPEC_SYSTEM_PROMPT.toLowerCase()).not.toContain(term);
+    }
+  });
+
+  it('the docs system-prompt glossary bills review as advisory while keeping its mechanics', () => {
+    expect(DOCS_SYSTEM_PROMPT).toContain('not a merge gate');
+    // Factual mechanics must survive the rewording.
+    expect(DOCS_SYSTEM_PROMPT).toContain('LanceDB');
+    expect(DOCS_SYSTEM_PROMPT).toContain('~18s');
+    expect(DOCS_SYSTEM_PROMPT).toContain('Requires API keys');
+    expect(DOCS_SYSTEM_PROMPT).toContain('Full configuration tier');
+    for (const term of ['review-leg', 'cohort', 'falsification']) {
+      expect(DOCS_SYSTEM_PROMPT.toLowerCase()).not.toContain(term);
+    }
+  });
+});
+
+// ─── Instruction file length limits (FR-C01) ─────────
+
+describe('agent instruction files stay concise (FMEA-001 / FR-C01)', () => {
+  // Canonical files carry full agent context (cross-vendor for AGENTS.md,
+  // self-canonical for .junie/guidelines.md). Budget bumped to 6000/40 in
+  // ADR-038 migration to accommodate AGENTS.md absorbing the cross-vendor
+  // content that CLAUDE.md + GEMINI.md previously held separately.
+  const CANONICAL_MAX_CHARS = 6000;
+  const CANONICAL_MAX_DIRECTIVES = 40;
+
+  // Redirect files exist only to point Claude Code / Gemini CLI at AGENTS.md.
+  // They should stay tiny; this ceiling enforces redirect-shape post-migration.
+  const REDIRECT_MAX_CHARS = 1000;
+
+  const canonical = [
+    { name: 'AGENTS.md', content: readRoot('AGENTS.md') },
+    { name: '.junie/guidelines.md', content: readRoot('.junie/guidelines.md') },
+  ];
+
+  const redirects = [
+    { name: 'CLAUDE.md', content: readRoot('CLAUDE.md') },
+    { name: 'GEMINI.md', content: readRoot('GEMINI.md') },
+  ];
+
+  for (const { name, content } of canonical) {
+    it(`${name} is under ${CANONICAL_MAX_CHARS} characters`, () => {
+      expect(content.length).toBeLessThanOrEqual(CANONICAL_MAX_CHARS);
+    });
+
+    it(`${name} has fewer than ${CANONICAL_MAX_DIRECTIVES} directives`, () => {
+      const directives = content.split('\n').filter((l) => /^\s*[-*]\s|^\s*\d+\.\s/.test(l)).length;
+      expect(directives).toBeLessThanOrEqual(CANONICAL_MAX_DIRECTIVES);
+    });
+  }
+
+  for (const { name, content } of redirects) {
+    it(`${name} stays a redirect (under ${REDIRECT_MAX_CHARS} characters)`, () => {
+      expect(content.length).toBeLessThanOrEqual(REDIRECT_MAX_CHARS);
+    });
+  }
+});
+
+// ─── Cross-agent consistency ─────────────────────────
+
+describe('all agent instruction files share the same project rules', () => {
+  // Post ADR-038 migration: AGENTS.md + .claude/docs/* covers Claude Code (via redirect)
+  // and Gemini CLI (via redirect, no docs subdir — content lives in AGENTS.md proper
+  // plus .gemini/styleguide.md). Junie has its own self-contained .junie/guidelines.md.
+  // The test ensures shared rules don't drift between the cross-vendor canonical and
+  // the Junie canonical.
+  const agentsRoot = readRoot('AGENTS.md');
+  const claudeDocs = fs.existsSync(path.join(ROOT, '.claude', 'docs'))
+    ? fs
+        .readdirSync(path.join(ROOT, '.claude', 'docs'))
+        .filter((f) => f.endsWith('.md'))
+        .map((f) => fs.readFileSync(path.join(ROOT, '.claude', 'docs', f), 'utf-8'))
+        .join('\n')
+    : '';
+  const crossVendorCanonical = agentsRoot + '\n' + claudeDocs;
+  const junieGuidelines = readRoot('.junie/guidelines.md');
+
+  const SHARED_RULES = [
+    // Git
+    '`main` is protected',
+    'Never amend commits on feature branches',
+    'Use `Closes #NNN` in PR descriptions',
+    // Environment
+    'pnpm only',
+    'TypeScript strict mode',
+    'NEVER put secrets in config files',
+    // Code Style
+    '`kebab-case.ts`',
+    '`err` (never `error`)',
+    'no empty catches',
+    'Named constants for magic numbers',
+    'Zod at system boundaries',
+    '`pnpm run format`',
+    // Totem
+    'search_knowledge',
+    'NEVER use `git push --no-verify`',
+    // Publishing
+    '`pnpm run version`',
+    // Contributor Principles
+    'Update `AI_PROMPT_BLOCK` in `init.ts`',
+    'GCA decline',
+    'without a ticket',
+  ];
+
+  for (const rule of SHARED_RULES) {
+    it(`agent canonicals contain: "${rule}"`, () => {
+      expect(crossVendorCanonical).toContain(rule);
+      expect(junieGuidelines).toContain(rule);
+    });
+  }
+});
+
+// ─── MCP server drift ────────────────────────────────
+
+describe('consumer MCP scaffolding matches published package', () => {
+  it('buildNpxCommand references the correct MCP package name', () => {
+    const unix = buildNpxCommand(false);
+    const win = buildNpxCommand(true);
+    expect(unix.args).toContain('@mmnto/mcp');
+    expect(win.args).toContain('@mmnto/mcp');
+  });
+
+  it('MCP package.json main entrypoint exists', () => {
+    const mcpPkg = JSON.parse(readRoot('packages/mcp/package.json'));
+    const mainPath = path.join(ROOT, 'packages', 'mcp', mcpPkg.main);
+    expect(fs.existsSync(mainPath)).toBe(true);
+  });
+
+  it('dev .mcp.json points to the correct local MCP entrypoint', () => {
+    const mcpPath = path.join(ROOT, '.mcp.json');
+    if (!fs.existsSync(mcpPath)) return; // gitignored — skip in CI
+    const mcpJson = JSON.parse(fs.readFileSync(mcpPath, 'utf-8'));
+    const totemServer = mcpJson.mcpServers?.['totem-dev'];
+    expect(totemServer).toBeDefined();
+    expect(totemServer.args).toContain('./packages/mcp/dist/index.js');
+  });
+
+  it('consumer MCP server entry uses npx (not local path)', () => {
+    const unix = buildNpxCommand(false);
+    expect(unix.command).toBe('npx');
+    expect(unix.args).not.toContain('./packages/mcp/dist/index.js');
+  });
+
+  it('Windows consumer MCP entry uses cmd /c npx wrapper', () => {
+    const win = buildNpxCommand(true);
+    expect(win.command).toBe('cmd');
+    expect(win.args[0]).toBe('/c');
+    expect(win.args).toContain('npx');
+  });
+});
+
+// ─── Consumer init scaffolding accuracy ──────────────
+
+describe('totem init scaffolds correct paths for each agent', () => {
+  // These are the reflexFile paths that totem init writes into.
+  // If they don't match what the agent actually reads, the reflexes are dead.
+  it('Claude reflexFile targets CLAUDE.md (root)', () => {
+    // init.ts defines reflexFile: 'CLAUDE.md' for Claude Code
+    // Verify our actual file exists at that path
+    expect(fs.existsSync(path.join(ROOT, 'CLAUDE.md'))).toBe(true);
+  });
+
+  it('Gemini reflexFile should target GEMINI.md (root), not .gemini/gemini.md', () => {
+    // Gemini CLI reads uppercase GEMINI.md from project root by default.
+    // .gemini/gemini.md (lowercase) is NOT read by either GCA or Gemini CLI.
+    expect(fs.existsSync(path.join(ROOT, 'GEMINI.md'))).toBe(true);
+    // The old dead path should not exist
+    expect(fs.existsSync(path.join(ROOT, '.gemini', 'gemini.md'))).toBe(false);
+  });
+});
+
+// ─── Secrets hygiene ─────────────────────────────────
+
+describe('no secrets in tracked config files', () => {
+  const CONFIG_FILES = [
+    'AGENTS.md',
+    'CLAUDE.md',
+    'GEMINI.md',
+    '.junie/guidelines.md',
+    '.gemini/config.yaml',
+    '.gemini/styleguide.md',
+  ];
+
+  const SECRET_PATTERNS = [
+    /ghp_[a-zA-Z0-9]{36}/, // GitHub PAT (classic)
+    /github_pat_[a-zA-Z0-9_]+/, // GitHub PAT (fine-grained)
+    /sk-[a-zA-Z0-9]{20,}/, // OpenAI API key
+    /AIza[a-zA-Z0-9_-]{35}/, // Google API key
+    /sk-ant-[a-zA-Z0-9_-]{20,}/, // Anthropic API key
+  ];
+
+  for (const file of CONFIG_FILES) {
+    it(`${file} contains no hardcoded secrets`, () => {
+      const filePath = path.join(ROOT, file);
+      if (!fs.existsSync(filePath)) return; // Skip if file doesn't exist yet
+      const content = fs.readFileSync(filePath, 'utf-8');
+      for (const pattern of SECRET_PATTERNS) {
+        expect(content).not.toMatch(pattern);
+      }
+    });
+  }
+});

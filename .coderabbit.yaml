@@ -1,0 +1,106 @@
+language: en-US
+early_access: true
+tone_instructions: >-
+  Direct, technical. Flag real issues only. Totem is deterministic governance — Sensors not Actuators. Core engine (totem lint) is zero-LLM and offline. No statistical replacements, no coupling primitives, no cloud deps in enforcement. Tenets win.
+
+reviews:
+  # Trial: assertive cohort-wide (was chill) — mmnto-ai/totem-strategy#507 / #501. Keep until it annoys us.
+  profile: assertive
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  sequence_diagrams: true
+  estimate_code_review_effort: true
+  related_prs: true
+  related_issues: true
+  assess_linked_issues: true
+  review_details: true
+  poem: true
+
+  # auto_review is off (below), so CR posts a "Review skipped" status comment on
+  # EVERY PR — pure noise without auto-invocation, and the surface that has caused
+  # review-triage misses (the skip banner read as "CR didn't review"). Suppress it
+  # (CR's own remediation: reviews.review_status). On-demand `@coderabbitai review`
+  # is unaffected — it still posts the full review.
+  review_status: false
+
+  # On-demand only — operator ruling 2026-06-10 (mmnto-ai/totem-strategy#622):
+  # all three review bots (CR / GCA / Greptile) are opt-in per PR. Trigger
+  # stays `@coderabbitai review`. Doctrine: bot-protocols.md stack section
+  # (merged via mmnto-ai/totem-strategy#623); sensed by the `cr-on-demand`
+  # parity-manifest row.
+  auto_review:
+    enabled: false
+    auto_incremental_review: false
+    drafts: false
+
+  path_instructions:
+    - path: 'packages/core/**'
+      instructions: 'Core library — LanceDB store, compiler, rule engine. No CLI or MCP dependencies. All LanceDB interactions must stay in this package. Exported functions need TSDoc.'
+    - path: 'packages/mcp/**'
+      instructions: 'MCP server for AI agents. Sanitize all inputs. XML-wrap all responses. No shell: true on spawn calls.'
+    - path: 'packages/cli/**'
+      instructions: "CLI commands. All imports must be lazy-loaded (dynamic import). log.error() must use 'Totem Error' as the tag."
+    - path: '.totem/lessons/**'
+      instructions: "Lesson files. Heading text (after '## Lesson — ') must be ≤60 chars. Only lessons with **Pattern:** field are Pipeline 1 and require Engine/Severity. Lessons without Pattern are Pipeline 2 (prose only) — do not flag missing fields."
+    - path: '.claude/**'
+      instructions: 'Claude Code hooks and skills. Bash scripts must use [[ ]] glob matching, not echo|grep. CLAUDE.md must stay under 50 lines.'
+    - path: 'scripts/**'
+      instructions: 'Dev-only diagnostic scripts. Not production code. Empty catch blocks are acceptable here for resilience. Do not flag unused variables in throwaway scripts.'
+    - path: 'README.md'
+      instructions: 'User-facing documentation. No GitHub issue/PR references (#NNN). No internal jargon (Pipeline 1/2, ADR numbers). No marketing absolutes (guarantees, comprehensive). No emojis.'
+
+  path_filters:
+    - '!**/.lancedb/**'
+    - '!**/dist/**'
+    - '!**/node_modules/**'
+    # Generated artifact of `totem lesson compile` — every compile run rotates a
+    # subset of lessonHashes (axis-3/axis-4 compile-corpus drift per Proposal 278
+    # § Action 4 + Proposal 281-draft). The rotation is reproducible-given-fingerprint
+    # under the #1939 drift gate, but produces high-volume noise on PRs that add
+    # even a single Pipeline 1 lesson. Reviewers should focus on `.totem/lessons/`
+    # (the actual change surface) and `.totem/compile-manifest.json` (the drift
+    # gate's commitment).
+    - '!.totem/compiled-rules.json'
+
+  finishing_touches:
+    docstrings:
+      enabled: true
+    unit_tests:
+      enabled: true
+
+  pre_merge_checks:
+    docstrings:
+      mode: 'off'
+    title:
+      mode: 'warning'
+    description:
+      mode: 'warning'
+
+  tools:
+    ast-grep:
+      enabled: true
+      essential_rules: true
+    # ESLint is enforced authoritatively in CI ("Build & Lint" on macOS/Ubuntu/Windows,
+    # which blocks merge) and in the pre-push hook (`pnpm run lint`). CodeRabbit runs its
+    # own ESLint in an isolated sandbox that cannot install this repo's deps — the pnpm
+    # `workspace:*` protocol refs, the native `@lancedb/lancedb` binary, and ESLint 10 —
+    # so it emits a recurring, non-fatal "ESLint install failed" warning on every PR.
+    # Disabled as pure redundancy (no coverage loss); our ESLint gate is unchanged.
+    eslint:
+      enabled: false
+    shellcheck:
+      enabled: true
+    markdownlint:
+      enabled: true
+
+knowledge_base:
+  learnings:
+    scope: auto
+  code_guidelines:
+    enabled: true
+  pull_requests:
+    scope: auto
+  issues:
+    scope: auto
+  web_search:
+    enabled: true

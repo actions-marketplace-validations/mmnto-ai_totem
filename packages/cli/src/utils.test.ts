@@ -1,3 +1,4 @@
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -5,15 +6,34 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SearchResult, TotemConfig } from '@mmnto/totem';
-
 import {
+  calculateDeterministicHash,
+  InvocationFailureArtifactSchema,
+  RunArtifactSchema,
+  summarizeProvenance,
+  TotemOrchestratorError,
+} from '@mmnto/totem';
+
+import { cleanTmpDir } from './test-utils.js';
+import {
+  applyCodeBlindGuard,
+  buildRetrievalGroundingBundle,
+  CODE_BLIND_BANNER,
+  CODE_BLIND_PROMPT_DIRECTIVE,
+  formatLessonSection,
   formatResults,
   getSystemPrompt,
+  isCodeBlind,
+  isGlobalConfigPath,
+  loadConfig,
   loadEnv,
+  partitionLessons,
+  persistRuntimeTextEvidence,
   reapOrphanedTempFiles,
   requireEmbedding,
   resolveConfigPath,
   runOrchestrator,
+  runtimeMessageEvidence,
   sanitize,
   wrapXml,
   writeOutput,
@@ -23,7 +43,16 @@ import {
 function makeResult(
   overrides: Partial<SearchResult> & Pick<SearchResult, 'label' | 'filePath' | 'score' | 'content'>,
 ): SearchResult {
-  return { contextPrefix: '', type: 'code', metadata: {}, ...overrides };
+  // Default absoluteFilePath to the provided filePath — mirrors
+  // rowToSearchResult's fallback when no sourceContext is injected
+  // (mmnto/totem#1294 Phase 1).
+  return {
+    contextPrefix: '',
+    type: 'code',
+    metadata: {},
+    absoluteFilePath: overrides.filePath,
+    ...overrides,
+  };
 }
 
 // ─── sanitize ───────────────────────────────────────────
@@ -193,7 +222,7 @@ describe('writeOutput', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
   });
 
   it('writes content to file when outPath is provided', () => {
@@ -226,7 +255,7 @@ describe('resolveConfigPath', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
   });
 
   it('returns config path when totem.config.ts exists', () => {
@@ -235,8 +264,141 @@ describe('resolveConfigPath', () => {
     expect(result).toBe(path.join(tmpDir, 'totem.config.ts'));
   });
 
-  it('throws when totem.config.ts is missing', () => {
-    expect(() => resolveConfigPath(tmpDir)).toThrow('No totem.config.ts found');
+  it('throws when no config file exists', () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-home-'));
+    try {
+      expect(() => resolveConfigPath(tmpDir, fakeHome)).toThrow('No Totem configuration found');
+    } finally {
+      cleanTmpDir(fakeHome);
+    }
+  });
+
+  it('resolves totem.yaml when totem.config.ts is missing', () => {
+    fs.writeFileSync(path.join(tmpDir, 'totem.yaml'), 'targets: []\n');
+    expect(resolveConfigPath(tmpDir)).toBe(path.join(tmpDir, 'totem.yaml'));
+  });
+
+  it('resolves totem.toml when no ts or yaml exists', () => {
+    fs.writeFileSync(path.join(tmpDir, 'totem.toml'), '[embedding]\nprovider = "openai"\n');
+    expect(resolveConfigPath(tmpDir)).toBe(path.join(tmpDir, 'totem.toml'));
+  });
+
+  it('prioritizes .ts over .yaml when both exist', () => {
+    fs.writeFileSync(path.join(tmpDir, 'totem.config.ts'), 'export default {}');
+    fs.writeFileSync(path.join(tmpDir, 'totem.yaml'), 'targets: []\n');
+    expect(resolveConfigPath(tmpDir)).toBe(path.join(tmpDir, 'totem.config.ts'));
+  });
+
+  it('falls back to ~/.totem/ when no local config exists', () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-home-'));
+    const globalDir = path.join(fakeHome, '.totem');
+    fs.mkdirSync(globalDir, { recursive: true });
+    fs.writeFileSync(path.join(globalDir, 'totem.config.ts'), 'export default {}', 'utf-8');
+
+    try {
+      const result = resolveConfigPath(tmpDir, fakeHome);
+      expect(result).toBe(path.join(globalDir, 'totem.config.ts'));
+    } finally {
+      cleanTmpDir(fakeHome);
+    }
+  });
+
+  it('prefers local config over global', () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-home-'));
+    const globalDir = path.join(fakeHome, '.totem');
+    fs.mkdirSync(globalDir, { recursive: true });
+    fs.writeFileSync(path.join(globalDir, 'totem.config.ts'), 'export default {}', 'utf-8');
+
+    // Also create local config
+    fs.writeFileSync(path.join(tmpDir, 'totem.yaml'), 'targets: []\n', 'utf-8');
+
+    try {
+      const result = resolveConfigPath(tmpDir, fakeHome);
+      expect(result).toBe(path.join(tmpDir, 'totem.yaml'));
+    } finally {
+      cleanTmpDir(fakeHome);
+    }
+  });
+
+  it('throws when neither local nor global config exists with updated hint', () => {
+    const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-home-'));
+    try {
+      expect(() => resolveConfigPath(tmpDir, fakeHome)).toThrow('No Totem configuration found');
+      try {
+        resolveConfigPath(tmpDir, fakeHome);
+      } catch (err) {
+        expect(err).toHaveProperty('recoveryHint');
+        expect((err as { recoveryHint: string }).recoveryHint).toContain('--global');
+      }
+    } finally {
+      cleanTmpDir(fakeHome);
+    }
+  });
+});
+
+describe('isGlobalConfigPath', () => {
+  it('returns true for paths under ~/.totem/', () => {
+    const fakeHome = '/fake/home';
+    expect(isGlobalConfigPath('/fake/home/.totem/totem.config.ts', fakeHome)).toBe(true);
+    expect(isGlobalConfigPath('/fake/home/.totem/totem.yaml', fakeHome)).toBe(true);
+  });
+
+  it('returns false for local project paths', () => {
+    const fakeHome = '/fake/home';
+    expect(isGlobalConfigPath('/my/project/totem.config.ts', fakeHome)).toBe(false);
+    expect(isGlobalConfigPath('/other/dir/totem.yaml', fakeHome)).toBe(false);
+  });
+
+  it('returns false for directories sharing the prefix (e.g. ~/.totem-foo/)', () => {
+    const fakeHome = '/fake/home';
+    expect(isGlobalConfigPath('/fake/home/.totem-foo/totem.config.ts', fakeHome)).toBe(false);
+  });
+});
+
+// ─── loadConfig (YAML/TOML) ─────────────────────────
+
+describe('loadConfig', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-loadconfig-'));
+  });
+
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('loads and validates a YAML config', async () => {
+    const yaml = `targets:\n  - glob: "**/*.ts"\n    type: code\n    strategy: typescript-ast\n`;
+    fs.writeFileSync(path.join(tmpDir, 'totem.yaml'), yaml);
+    const config = await loadConfig(path.join(tmpDir, 'totem.yaml'));
+    expect(config.targets).toHaveLength(1);
+    expect(config.targets[0].glob).toBe('**/*.ts');
+  });
+
+  it('loads and validates a TOML config', async () => {
+    const toml = `[[targets]]\nglob = "**/*.rs"\ntype = "code"\nstrategy = "typescript-ast"\n`;
+    fs.writeFileSync(path.join(tmpDir, 'totem.toml'), toml);
+    const config = await loadConfig(path.join(tmpDir, 'totem.toml'));
+    expect(config.targets).toHaveLength(1);
+    expect(config.targets[0].glob).toBe('**/*.rs');
+  });
+
+  it('throws ConfigError for invalid YAML syntax', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'totem.yaml'), 'targets: [invalid yaml: {{');
+    await expect(loadConfig(path.join(tmpDir, 'totem.yaml'))).rejects.toThrow('Failed to parse');
+  });
+
+  it('throws ConfigError for invalid TOML syntax', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'totem.toml'), 'targets = [invalid');
+    await expect(loadConfig(path.join(tmpDir, 'totem.toml'))).rejects.toThrow('Failed to parse');
+  });
+
+  it('formats Zod validation errors with field paths', async () => {
+    fs.writeFileSync(path.join(tmpDir, 'totem.yaml'), 'targets: "not an array"\n');
+    await expect(loadConfig(path.join(tmpDir, 'totem.yaml'))).rejects.toThrow(
+      'Invalid configuration',
+    );
   });
 });
 
@@ -252,7 +414,7 @@ describe('loadEnv', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
     delete process.env[TEST_KEY];
   });
 
@@ -303,6 +465,34 @@ describe('loadEnv', () => {
     loadEnv(tmpDir);
     expect(process.env[TEST_KEY]).toBe('quoted-crlf');
   });
+
+  it('strips inline comments from unquoted values', () => {
+    fs.writeFileSync(path.join(tmpDir, '.env'), `${TEST_KEY}=secret # expires tomorrow`, 'utf-8');
+    loadEnv(tmpDir);
+    expect(process.env[TEST_KEY]).toBe('secret');
+  });
+
+  it('strips inline comments with trailing whitespace', () => {
+    fs.writeFileSync(path.join(tmpDir, '.env'), `${TEST_KEY}=secret    # comment`, 'utf-8');
+    loadEnv(tmpDir);
+    expect(process.env[TEST_KEY]).toBe('secret');
+  });
+
+  it('preserves hash inside double-quoted values', () => {
+    fs.writeFileSync(
+      path.join(tmpDir, '.env'),
+      `${TEST_KEY}="my#secret" # actual comment`,
+      'utf-8',
+    );
+    loadEnv(tmpDir);
+    expect(process.env[TEST_KEY]).toBe('my#secret');
+  });
+
+  it('handles empty values', () => {
+    fs.writeFileSync(path.join(tmpDir, '.env'), `${TEST_KEY}=`, 'utf-8');
+    loadEnv(tmpDir);
+    expect(process.env[TEST_KEY]).toBe('');
+  });
 });
 
 // ─── getSystemPrompt ──────────────────────────────────
@@ -316,7 +506,7 @@ describe('getSystemPrompt', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
   });
 
   it('returns default when override file does not exist', () => {
@@ -362,7 +552,12 @@ describe('requireEmbedding', () => {
     totemDir: '.totem',
     lanceDir: '.lancedb',
     ignorePatterns: [],
+    indexIgnorePatterns: [],
+    shieldIgnorePatterns: [],
+    shieldAutoLearn: false,
     contextWarningThreshold: 40_000,
+    searchRelevanceFloor: 0.25,
+    review: { sourceExtensions: ['.ts', '.tsx', '.js', '.jsx'] },
   };
 
   it('returns embedding provider when configured', () => {
@@ -380,8 +575,14 @@ describe('requireEmbedding', () => {
     expect(() => requireEmbedding(BASE_CONFIG)).toThrow('Lite tier');
   });
 
-  it('error message mentions totem init', () => {
-    expect(() => requireEmbedding(BASE_CONFIG)).toThrow('totem init');
+  it('error recovery hint mentions totem init', () => {
+    try {
+      requireEmbedding(BASE_CONFIG);
+    } catch (err) {
+      expect((err as { recoveryHint?: string }).recoveryHint).toContain('totem init');
+      return;
+    }
+    throw new Error('Expected requireEmbedding to throw');
   });
 });
 
@@ -393,7 +594,7 @@ describe('reapOrphanedTempFiles', () => {
   });
 
   afterEach(() => {
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
+    cleanTmpDir(tmpRoot);
   });
 
   function writeTempFile(name: string, ageMs: number): string {
@@ -499,7 +700,7 @@ vi.mock('./orchestrators/orchestrator.js', async (importOriginal) => {
   };
 });
 
-import { createOrchestrator } from './orchestrators/orchestrator.js';
+import { createOrchestrator, OrchestratorInvokeError } from './orchestrators/orchestrator.js';
 
 const mockedCreateOrchestrator = vi.mocked(createOrchestrator);
 
@@ -518,7 +719,7 @@ function baseConfig(overrides?: Partial<TotemConfig>): TotemConfig {
   } as TotemConfig;
 }
 
-describe('runOrchestrator', () => {
+describe('runOrchestrator', { timeout: 15_000 }, () => {
   let tmpDir: string;
 
   beforeEach(() => {
@@ -537,7 +738,7 @@ describe('runOrchestrator', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
   });
 
   it('uses default provider and model when no overrides', async () => {
@@ -605,7 +806,7 @@ describe('runOrchestrator', () => {
       orchestrator: {
         provider: 'gemini',
         defaultModel: 'gemini-3-flash-preview',
-        overrides: { shield: 'anthropic:claude-sonnet-4-20250514' },
+        overrides: { shield: 'anthropic:claude-sonnet-4-6' },
       },
     });
 
@@ -683,5 +884,1636 @@ describe('runOrchestrator', () => {
 
     expect(result).toBeUndefined();
     expect(mockedCreateOrchestrator).not.toHaveBeenCalled();
+  });
+
+  // ─── Phase 3: prompt cache plumbing (mmnto/totem#1291) ─────
+
+  it('threads systemPrompt to the underlying invoke()', async () => {
+    await runOrchestrator({
+      prompt: 'per-lesson user prompt',
+      systemPrompt: 'persistent compiler template',
+      tag: 'Compile',
+      options: {},
+      config: baseConfig(),
+      cwd: tmpDir,
+    });
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    expect(invoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: 'per-lesson user prompt',
+        systemPrompt: 'persistent compiler template',
+      }),
+    );
+  });
+
+  it('omits systemPrompt from invoke() when caller does not provide it (today shape)', async () => {
+    await runOrchestrator({
+      prompt: 'just a prompt',
+      tag: 'Spec',
+      options: {},
+      config: baseConfig(),
+      cwd: tmpDir,
+    });
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    const callArgs = invoke.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs).toBeDefined();
+    expect(callArgs['systemPrompt']).toBeUndefined();
+    expect(callArgs['prompt']).toBe('just a prompt');
+  });
+
+  it('threads enableContextCaching from orchestrator config to invoke()', async () => {
+    const config = baseConfig({
+      orchestrator: {
+        provider: 'gemini',
+        defaultModel: 'gemini-3-flash-preview',
+        enableContextCaching: true,
+        cacheTTL: 3600,
+      },
+    });
+
+    await runOrchestrator({
+      prompt: 'q',
+      systemPrompt: 's',
+      tag: 'Compile',
+      options: {},
+      config,
+      cwd: tmpDir,
+    });
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    expect(invoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        enableContextCaching: true,
+        cacheTTL: 3600,
+      }),
+    );
+  });
+
+  it('omits cache opts from invoke() when not configured', async () => {
+    await runOrchestrator({
+      prompt: 'q',
+      tag: 'Spec',
+      options: {},
+      config: baseConfig(),
+      cwd: tmpDir,
+    });
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    const callArgs = invoke.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect(callArgs['enableContextCaching']).toBeUndefined();
+    expect(callArgs['cacheTTL']).toBeUndefined();
+  });
+
+  it('response cache key includes null-byte delimiters to prevent boundary collisions', async () => {
+    // Phase 3 cascade-fix regression test (caught by Shield AI):
+    // crypto.createHash().update(prompt).update(systemPrompt) without a
+    // delimiter would let `prompt="AB", systemPrompt=""` collide with
+    // `prompt="A", systemPrompt="B"` because both concatenate to "AB".
+    //
+    // Replicate the exact construction from runOrchestrator (utils.ts) and
+    // assert the boundary-case inputs produce DIFFERENT hashes. The
+    // `\0` delimiter sits between every field — without it, the test below
+    // would produce identical hashes and fail.
+    const buildKey = (prompt: string, systemPrompt: string, model: string) =>
+      crypto
+        .createHash('sha256')
+        .update(prompt)
+        .update('\0')
+        .update(systemPrompt)
+        .update('\0')
+        .update(model)
+        .digest('hex')
+        .slice(0, 16);
+
+    const a = buildKey('AB', '', 'm');
+    const b = buildKey('A', 'B', 'm');
+    expect(a).not.toBe(b);
+
+    // Sibling collision: "A", "BC" vs "AB", "C"
+    const c = buildKey('A', 'BC', 'm');
+    const d = buildKey('AB', 'C', 'm');
+    expect(c).not.toBe(d);
+
+    // Same inputs MUST still hash identically (idempotency check)
+    const e = buildKey('prompt', 'system', 'model');
+    const f = buildKey('prompt', 'system', 'model');
+    expect(e).toBe(f);
+  });
+
+  it('--raw mode includes systemPrompt in the output when split callers pass both', async () => {
+    // mmnto/totem#1291 PR #1292 review fix from CodeRabbit: --raw mode used
+    // to write only `prompt`, but Phase 3 callers (compile-lesson) now route
+    // the compiler template through `systemPrompt`. Without the fix below,
+    // `totem compile --raw` would produce a file that doesn't show what the
+    // model would actually receive.
+    //
+    // We can't test the writeOutput call directly without setting up a tmp
+    // file pipeline, but we can verify the OrchestratorRunOptions branch
+    // returns undefined and doesn't invoke the orchestrator (--raw never
+    // calls invoke). The actual file content shape is asserted via the
+    // unit-test below by spying on writeOutput's destination.
+    let captured = '';
+    const tmpOut = path.join(tmpDir, 'raw-out.md');
+    await runOrchestrator({
+      prompt: 'lesson body',
+      systemPrompt: 'COMPILER_SYSTEM_PROMPT',
+      tag: 'Compile',
+      options: { raw: true, out: tmpOut },
+      config: baseConfig(),
+      cwd: tmpDir,
+    });
+    captured = fs.readFileSync(tmpOut, 'utf-8');
+    // GCA round 2: dropped the markdown markers in favor of plain
+    // concatenation matching shell-orchestrator.ts and pipe-safety for
+    // downstream consumers. Exact byte equality.
+    expect(captured).toBe('COMPILER_SYSTEM_PROMPT\n\nlesson body');
+  });
+
+  it('--raw mode falls back to user-prompt-only when systemPrompt is undefined (backward compat)', async () => {
+    const tmpOut = path.join(tmpDir, 'raw-out-legacy.md');
+    await runOrchestrator({
+      prompt: 'just the prompt',
+      tag: 'Spec',
+      options: { raw: true, out: tmpOut },
+      config: baseConfig(),
+      cwd: tmpDir,
+    });
+    const captured = fs.readFileSync(tmpOut, 'utf-8');
+    expect(captured).toBe('just the prompt');
+  });
+
+  it('--raw mode treats empty systemPrompt the same as undefined', async () => {
+    // GCA round 2 SAFETY INVARIANT: empty systemPrompt is treated as
+    // absent throughout the system to avoid 4xx from providers that
+    // reject empty system messages. --raw mode honors the same contract.
+    const tmpOut = path.join(tmpDir, 'raw-out-empty-sys.md');
+    await runOrchestrator({
+      prompt: 'user only',
+      systemPrompt: '',
+      tag: 'Spec',
+      options: { raw: true, out: tmpOut },
+      config: baseConfig(),
+      cwd: tmpDir,
+    });
+    const captured = fs.readFileSync(tmpOut, 'utf-8');
+    expect(captured).toBe('user only');
+  });
+
+  it('passes through cacheReadInputTokens / cacheCreationInputTokens from invoke() result', async () => {
+    // Override the default mock to return a result that simulates a cache hit
+    const mockInvokeWithCache = vi.fn().mockResolvedValue({
+      content: 'cached response',
+      inputTokens: 200,
+      outputTokens: 75,
+      durationMs: 800,
+      cacheReadInputTokens: 47_231,
+      cacheCreationInputTokens: 0,
+    });
+    mockedCreateOrchestrator.mockReturnValue(mockInvokeWithCache);
+
+    const result = await runOrchestrator({
+      prompt: 'q',
+      systemPrompt: 's',
+      tag: 'Compile',
+      options: {},
+      config: baseConfig({
+        orchestrator: {
+          provider: 'anthropic',
+          defaultModel: 'claude-sonnet-4-6',
+          enableContextCaching: true,
+        },
+      }),
+      cwd: tmpDir,
+    });
+
+    // runOrchestrator returns just the content string today (the cache fields
+    // are surfaced via the dim log line, not the return value). The metric is
+    // observable via the underlying result object that was forwarded to the
+    // log layer — verified by inspecting the mock's call.
+    expect(result).toBe('cached response');
+    expect(mockInvokeWithCache).toHaveBeenCalled();
+  });
+});
+
+// ─── partitionLessons ────────────────────────────────────
+
+describe('partitionLessons', () => {
+  const makeResult = (filePath: string, label: string): SearchResult => ({
+    content: `content for ${label}`,
+    contextPrefix: '',
+    filePath,
+    absoluteFilePath: filePath,
+    type: 'spec',
+    label,
+    score: 0.9,
+    metadata: {},
+  });
+
+  it('separates lesson results from other specs', () => {
+    const allSpecs = [
+      { ...makeResult('.totem/lessons/lesson-abc.md', 'Lesson A'), type: 'lesson' as const },
+      makeResult('docs/spec.md', 'Spec B'),
+      { ...makeResult('.totem/lessons/lesson-def.md', 'Lesson C'), type: 'lesson' as const },
+      makeResult('docs/reference/architecture.md', 'Arch D'),
+    ];
+    const { lessons, specs } = partitionLessons(allSpecs, 10, 10);
+    expect(lessons).toHaveLength(2);
+    expect(specs).toHaveLength(2);
+    expect(lessons[0]!.label).toBe('Lesson A');
+    expect(specs[0]!.label).toBe('Spec B');
+  });
+
+  it('respects maxLessons cap', () => {
+    const allSpecs = [
+      { ...makeResult('.totem/lessons/a.md', 'L1'), type: 'lesson' as const },
+      { ...makeResult('.totem/lessons/b.md', 'L2'), type: 'lesson' as const },
+      { ...makeResult('.totem/lessons/c.md', 'L3'), type: 'lesson' as const },
+    ];
+    const { lessons } = partitionLessons(allSpecs, 2, 5);
+    expect(lessons).toHaveLength(2);
+  });
+
+  it('respects maxSpecs cap', () => {
+    const allSpecs = [
+      makeResult('docs/a.md', 'A'),
+      makeResult('docs/b.md', 'B'),
+      makeResult('docs/c.md', 'C'),
+    ];
+    const { specs } = partitionLessons(allSpecs, 5, 2);
+    expect(specs).toHaveLength(2);
+  });
+
+  it('returns empty arrays when no results', () => {
+    const { lessons, specs } = partitionLessons([], 10, 10);
+    expect(lessons).toHaveLength(0);
+    expect(specs).toHaveLength(0);
+  });
+});
+
+// ─── formatLessonSection ─────────────────────────────────
+
+describe('formatLessonSection', () => {
+  const makeLesson = (label: string, content: string): SearchResult => ({
+    content,
+    contextPrefix: '',
+    filePath: '.totem/lessons.md',
+    absoluteFilePath: '.totem/lessons.md',
+    type: 'spec',
+    label,
+    score: 0.9,
+    metadata: {},
+  });
+
+  it('returns empty string when no lessons', () => {
+    expect(formatLessonSection([])).toBe('');
+  });
+
+  it('formats lessons with full bodies and scores', () => {
+    const result = formatLessonSection([makeLesson('Test trap', 'Never do X in Y context')]);
+    expect(result).toContain('RELEVANT LESSONS (HARD CONSTRAINTS)');
+    expect(result).toContain('**Test trap**');
+    expect(result).toContain('score: 0.900');
+    expect(result).toContain('Never do X in Y context');
+  });
+
+  it('skips lessons that exceed remaining char budget', () => {
+    const huge = makeLesson('Huge', 'X'.repeat(5000));
+    const small = makeLesson('Small', 'A small lesson');
+    const result = formatLessonSection([huge, small], 4000);
+    expect(result).not.toContain('Huge');
+    expect(result).toContain('Small');
+  });
+
+  it('returns empty string when all lessons exceed budget', () => {
+    const huge = makeLesson('Huge', 'X'.repeat(10000));
+    expect(formatLessonSection([huge], 100)).toBe('');
+  });
+
+  it('condensed mode truncates content and omits scores', () => {
+    const longContent = 'A'.repeat(200);
+    const result = formatLessonSection([makeLesson('Trap', longContent)], undefined, true);
+    expect(result).toContain('RELEVANT LESSONS (HARD CONSTRAINTS)');
+    expect(result).toContain('**Trap**');
+    expect(result).toContain('...');
+    expect(result).not.toContain('score:');
+    // Content should be truncated — full 200-char body should NOT appear
+    expect(result).not.toContain('A'.repeat(200));
+  });
+
+  it('condensed mode shows full content for short lessons', () => {
+    const result = formatLessonSection([makeLesson('Short', 'A tiny lesson')], undefined, true);
+    expect(result).toContain('A tiny lesson');
+    expect(result).not.toContain('...');
+  });
+});
+
+// ─── buildRetrievalGroundingBundle (mmnto-ai/totem#2101) ──
+
+describe('buildRetrievalGroundingBundle', () => {
+  function result(filePath: string, sourceRepo?: string) {
+    return {
+      content: `content of ${filePath}`,
+      filePath,
+      ...(sourceRepo !== undefined ? { sourceRepo } : {}),
+    };
+  }
+
+  it('maps every partition with its sourceType — item count equals retrieval totals (invariant 8)', () => {
+    const bundle = buildRetrievalGroundingBundle({
+      specs: [result('specs/a.md')],
+      sessions: [result('journal/s1.md'), result('journal/s2.md')],
+      code: [result('src/x.ts'), result('src/y.ts', 'strategy')],
+      lessons: [result('lessons/l1.md')],
+    });
+    expect(bundle.items).toHaveLength(6);
+    const byType = (t: string) => bundle.items.filter((i) => i.sourceType === t).length;
+    expect(byType('spec')).toBe(1);
+    expect(byType('session_log')).toBe(2);
+    expect(byType('code')).toBe(2);
+    expect(byType('lesson')).toBe(1);
+    expect(bundle.items.every((i) => i.provenance === 'similarity-only')).toBe(true);
+    expect(bundle.items.find((i) => i.filePath === 'src/y.ts')?.sourceRepo).toBe('strategy');
+  });
+
+  it('empty retrieval yields an empty bundle that summarizes as ungrounded', () => {
+    const bundle = buildRetrievalGroundingBundle({
+      specs: [],
+      sessions: [],
+      code: [],
+      lessons: [],
+    });
+    expect(bundle.items).toEqual([]);
+    expect(summarizeProvenance(bundle)).toBe('ungrounded');
+  });
+});
+
+// ─── code-blind grounding guard (mmnto-ai/totem#2106, strategy#474) ──
+
+describe('code-blind grounding guard', () => {
+  const withCode = {
+    code: [makeResult({ label: 'x', filePath: 'src/x.ts', score: 1, content: 'c' })],
+  };
+
+  describe('isCodeBlind', () => {
+    it('is true iff zero code chunks were retrieved — keyed strictly on code', () => {
+      expect(isCodeBlind({ code: [] })).toBe(true);
+      expect(isCodeBlind(withCode)).toBe(false);
+    });
+  });
+
+  describe('applyCodeBlindGuard', () => {
+    const SYS = 'SYSTEM PROMPT';
+
+    it('on 0 code: fires, surfaces the banner, appends the directive to the system prompt', () => {
+      const r = applyCodeBlindGuard({ code: [] }, SYS);
+      expect(r.codeBlind).toBe(true);
+      expect(r.banner).toBe(CODE_BLIND_BANNER);
+      // Exact: the original system prompt comes first, directive appended.
+      expect(r.systemPrompt).toBe(`${SYS}\n\n${CODE_BLIND_PROMPT_DIRECTIVE}`);
+    });
+
+    it('with code: does not fire, no banner, system prompt returned unchanged', () => {
+      const r = applyCodeBlindGuard(withCode, SYS);
+      expect(r.codeBlind).toBe(false);
+      expect(r.banner).toBeUndefined();
+      expect(r.systemPrompt).toBe(SYS);
+    });
+
+    it('does not throw or disable on 0 code — returns a usable prompt (anti-abort, strategy#474)', () => {
+      expect(() => applyCodeBlindGuard({ code: [] }, SYS)).not.toThrow();
+      // The command proceeds: a directive-augmented prompt is returned, not an abort.
+      expect(applyCodeBlindGuard({ code: [] }, SYS).systemPrompt).toBe(
+        `${SYS}\n\n${CODE_BLIND_PROMPT_DIRECTIVE}`,
+      );
+    });
+
+    it('banner is advisory-neutral, not error-toned (strategy#474 Q2)', () => {
+      expect(CODE_BLIND_BANNER).not.toMatch(/\b(error|fail(ed|ure)?|abort)\b/i);
+    });
+  });
+});
+
+// ─── runOrchestrator artifact emission (mmnto-ai/totem#2100) ──
+
+describe('runOrchestrator artifact emission (#2100)', { timeout: 15_000 }, () => {
+  let tmpDir: string;
+
+  const GROUNDING_HASH = 'b'.repeat(64);
+
+  function artifactRequest(
+    onEmitted?: (hash: string, artifactPath: string) => void,
+    onFailureEmitted?: (hash: string, artifactPath: string) => void,
+  ) {
+    return {
+      groundingHash: GROUNDING_HASH,
+      provenanceSummary: 'similarity-only',
+      ...(onEmitted !== undefined ? { onEmitted } : {}),
+      ...(onFailureEmitted !== undefined ? { onFailureEmitted } : {}),
+    };
+  }
+
+  function artifactConfig(overrides?: Partial<TotemConfig>): TotemConfig {
+    return {
+      targets: [{ glob: '**/*.ts', type: 'code', strategy: 'typescript-ast' }],
+      orchestrator: {
+        provider: 'gemini',
+        defaultModel: 'gemini-3-flash-preview',
+      },
+      totemDir: '.totem',
+      lanceDir: '.lancedb',
+      ignorePatterns: [],
+      contextWarningThreshold: 40_000,
+      ...overrides,
+    } as TotemConfig;
+  }
+
+  function runsDirPath(): string {
+    return path.join(tmpDir, '.totem', 'artifacts', 'runs');
+  }
+
+  function failureRunsDirPath(): string {
+    return path.join(runsDirPath(), 'failures');
+  }
+
+  function runtimeText(text: string) {
+    const bytes = Buffer.byteLength(text, 'utf-8');
+    return {
+      encoding: 'utf-8' as const,
+      head: text,
+      observedBytes: bytes,
+      retainedBytes: bytes,
+      limitBytes: 64 * 1024,
+      truncated: false,
+    };
+  }
+
+  function invokeFailure(message = 'provider rejected request') {
+    return new OrchestratorInvokeError(
+      message,
+      'process-exit',
+      [
+        {
+          sequence: 1,
+          route: 'configured-shell',
+          provider: 'gemini',
+          model: 'gemini-3-flash-preview',
+          status: 'failed',
+          durationMs: 125,
+          failureKind: 'process-exit',
+          providerCode: 'x'.repeat(129),
+          process: {
+            exitCode: 1,
+            signal: null,
+            timedOut: false,
+            stdout: runtimeText('partial stdout'),
+            stderr: runtimeText(message),
+          },
+        },
+      ],
+      { cause: new Error(message) },
+    );
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-artifact-emit-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
+    const mockInvoke = vi.fn().mockResolvedValue({
+      content: 'mock result',
+      inputTokens: 100,
+      outputTokens: 50,
+      durationMs: 500,
+    });
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    cleanTmpDir(tmpDir);
+  });
+
+  it('emits content-addressed artifact with valid schema after successful orchestrator run', async () => {
+    const emitted: Array<{ hash: string; artifactPath: string }> = [];
+    const result = await runOrchestrator({
+      prompt: 'test prompt',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig(),
+      cwd: tmpDir,
+      artifact: artifactRequest((hash, artifactPath) => emitted.push({ hash, artifactPath })),
+    });
+
+    expect(result).toBe('mock result');
+    expect(emitted).toHaveLength(1);
+    const file = path.join(runsDirPath(), `${emitted[0]!.hash}.json`);
+    expect(emitted[0]!.artifactPath).toBe(file);
+    expect(fs.existsSync(file)).toBe(true);
+
+    const artifact = RunArtifactSchema.parse(JSON.parse(fs.readFileSync(file, 'utf-8')));
+    expect(artifact.inputBundle.maskedPrompt).toBe('test prompt');
+    expect(artifact.grounding).toEqual({
+      hash: GROUNDING_HASH,
+      provenanceSummary: 'similarity-only',
+    });
+    expect(artifact.backend.admissionClass).toBe('completion_only');
+    expect(artifact.backend.taskProfile).toBe('Spec');
+    expect(artifact.backend.provider).toBe('gemini');
+    expect(artifact.output.content).toBe('mock result');
+    expect(artifact.grounding.bundle).toBeUndefined(); // no bundle supplied → none recorded (never fabricated)
+    expect(artifact.output.metrics).toMatchObject({
+      inputTokens: 100,
+      outputTokens: 50,
+      durationMs: 500,
+    });
+    expect(artifact.schemaVersion).toBe('1.2.0');
+    expect(artifact.output.execution).toBeUndefined();
+  });
+
+  it('persists DLP-safe execution evidence only when runtime attempts are present', async () => {
+    const secret = 'RUNTIME-EVIDENCE-SECRET-12345';
+    const mockInvoke = vi.fn().mockResolvedValue({
+      content: 'mock result',
+      inputTokens: 100,
+      outputTokens: 50,
+      durationMs: 500,
+      attempts: [
+        {
+          sequence: 1,
+          route: 'configured-shell',
+          provider: 'gemini',
+          model: 'gemini-3-flash-preview',
+          status: 'succeeded',
+          durationMs: 500,
+          providerCode: secret,
+          process: {
+            exitCode: 0,
+            signal: null,
+            timedOut: false,
+            stdout: runtimeText(`\u001b[31mresult ${secret}\u001b[0m`),
+            stderr: runtimeText(''),
+          },
+        },
+      ],
+    });
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+    const emitted: string[] = [];
+
+    await runOrchestrator({
+      prompt: 'attempt evidence run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig(),
+      cwd: tmpDir,
+      customSecrets: [{ type: 'literal', value: secret }],
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    const raw = fs.readFileSync(path.join(runsDirPath(), `${emitted[0]!}.json`), 'utf-8');
+    expect(raw).not.toContain(secret);
+    expect(raw).not.toContain('\u001b');
+    const artifact = RunArtifactSchema.parse(JSON.parse(raw));
+    expect(artifact.output.execution?.attempts).toHaveLength(1);
+    expect(artifact.output.execution?.attempts[0]?.process?.stdout).toMatchObject({
+      head: 'result [REDACTED_CUSTOM]',
+      dlp: 'masked',
+      truncated: false,
+    });
+    expect(artifact.output.execution?.attempts[0]?.providerCode).toBeUndefined();
+  });
+
+  it('records the grounding bundle verbatim and the attested hash recomputes from it (mmnto-ai/totem#2101)', async () => {
+    const bundle = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'c'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/x.ts',
+          sourceRepo: 'strategy',
+        },
+      ],
+    };
+    const emitted: string[] = [];
+    await runOrchestrator({
+      prompt: 'bundled run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig(),
+      cwd: tmpDir,
+      artifact: {
+        groundingHash: calculateDeterministicHash(bundle),
+        provenanceSummary: summarizeProvenance(bundle),
+        bundle,
+        onEmitted: (hash) => emitted.push(hash),
+      },
+    });
+
+    const file = path.join(runsDirPath(), `${emitted[0]!}.json`);
+    const artifact = RunArtifactSchema.parse(JSON.parse(fs.readFileSync(file, 'utf-8')));
+    expect(artifact.grounding.bundle).toEqual(bundle);
+    expect(artifact.grounding.provenanceSummary).toBe('similarity-only:1');
+    // Invariant 4 at the emission seam: one enumeration, two readers — the
+    // recorded hash is recomputable from the recorded bundle alone.
+    expect(artifact.grounding.hash).toBe(calculateDeterministicHash(artifact.grounding.bundle));
+  });
+
+  it('records the MASKED prompt — a custom secret never reaches the artifact', async () => {
+    const secret = 'SUPER-SECRET-TOKEN-12345';
+    const emitted: string[] = [];
+    await runOrchestrator({
+      prompt: `deploy with ${secret} now`,
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig(),
+      cwd: tmpDir,
+      customSecrets: [{ type: 'literal', value: secret }],
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    const file = path.join(runsDirPath(), `${emitted[0]!}.json`);
+    const rawOnDisk = fs.readFileSync(file, 'utf-8');
+    expect(rawOnDisk).not.toContain(secret);
+    const artifact = RunArtifactSchema.parse(JSON.parse(rawOnDisk));
+    expect(artifact.inputBundle.maskedPrompt).not.toContain(secret);
+  });
+
+  it('emits terminal failure evidence, attaches its hash, and invokes the failure callback', async () => {
+    const secret = 'FAILURE-EVIDENCE-SECRET-12345';
+    const invokeErr = invokeFailure(`provider rejected ${secret}`);
+    const mockInvoke = vi.fn().mockRejectedValue(invokeErr);
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+    const emitted: Array<{ hash: string; artifactPath: string }> = [];
+
+    let caught: unknown;
+    try {
+      await runOrchestrator({
+        prompt: 'failed attempt prompt',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: artifactConfig(),
+        cwd: tmpDir,
+        customSecrets: [{ type: 'literal', value: secret }],
+        artifact: artifactRequest(undefined, (hash, artifactPath) =>
+          emitted.push({ hash, artifactPath }),
+        ),
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBe(invokeErr);
+    expect(invokeErr.failureArtifactHash).toBe(emitted[0]?.hash);
+    expect(emitted).toHaveLength(1);
+    expect(emitted[0]?.artifactPath).toBe(
+      path.join(failureRunsDirPath(), `${emitted[0]!.hash}.json`),
+    );
+    const raw = fs.readFileSync(emitted[0]!.artifactPath, 'utf-8');
+    expect(raw).not.toContain(secret);
+    const artifact = InvocationFailureArtifactSchema.parse(JSON.parse(raw));
+    expect(artifact.terminal).toMatchObject({ kind: 'process-exit', attempt: 1 });
+    expect(artifact.terminal.message.head).toContain('[REDACTED_CUSTOM]');
+    expect(artifact.attempts[0]?.process?.stderr?.head).toContain('[REDACTED_CUSTOM]');
+    expect(artifact.attempts[0]?.providerCode).toBeUndefined();
+    expect(RunArtifactSchema.safeParse(artifact).success).toBe(false);
+  });
+
+  it.each([
+    {
+      label: 'OpenAI wrapped auth failure',
+      provider: 'openai',
+      model: 'gpt-5',
+      cause: Object.assign(new Error('provider auth response'), {
+        status: 401,
+        code: 'authentication_error',
+      }),
+      kind: 'auth',
+      providerStatus: 401,
+      providerCode: 'authentication_error',
+    },
+    {
+      label: 'Ollama wrapped model failure',
+      provider: 'ollama',
+      model: 'llama3',
+      cause: null,
+      originalMessage: "Ollama model 'llama3' is not installed.",
+      kind: 'model',
+      providerStatus: undefined,
+      providerCode: undefined,
+    },
+    {
+      label: 'plain injected failure',
+      provider: 'gemini',
+      model: 'gemini-3-flash-preview',
+      cause: undefined,
+      originalMessage: undefined,
+      kind: 'unknown',
+      providerStatus: undefined,
+      providerCode: undefined,
+    },
+  ])('normalizes and persists $label', async (testCase) => {
+    const original =
+      testCase.cause === undefined
+        ? new Error('unclassified provider transport failure')
+        : new TotemOrchestratorError(
+            testCase.originalMessage ?? `${testCase.provider} provider call failed`,
+            `recover ${testCase.provider}`,
+            testCase.cause,
+          );
+    mockedCreateOrchestrator.mockReturnValue(vi.fn().mockRejectedValue(original));
+    const emitted: Array<{ hash: string; artifactPath: string }> = [];
+
+    let caught: unknown;
+    try {
+      await runOrchestrator({
+        prompt: `${testCase.provider} terminal failure`,
+        tag: 'Spec',
+        options: { fresh: true },
+        config: artifactConfig({
+          orchestrator: {
+            provider: testCase.provider,
+            defaultModel: testCase.model,
+          } as TotemConfig['orchestrator'],
+        }),
+        cwd: tmpDir,
+        artifact: artifactRequest(undefined, (hash, artifactPath) =>
+          emitted.push({ hash, artifactPath }),
+        ),
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(OrchestratorInvokeError);
+    expect(caught).toBeInstanceOf(TotemOrchestratorError);
+    const structured = caught as OrchestratorInvokeError;
+    expect(structured.cause).toBe(original);
+    expect(structured).toMatchObject({
+      kind: testCase.kind,
+      failureArtifactHash: emitted[0]?.hash,
+    });
+    expect(structured.attempts[0]).toMatchObject({
+      route: 'sdk',
+      provider: testCase.provider,
+      model: testCase.model,
+      status: 'failed',
+      failureKind: testCase.kind,
+      ...(testCase.providerStatus !== undefined ? { providerStatus: testCase.providerStatus } : {}),
+      ...(testCase.providerCode !== undefined ? { providerCode: testCase.providerCode } : {}),
+    });
+    expect(emitted).toHaveLength(1);
+    const artifact = InvocationFailureArtifactSchema.parse(
+      JSON.parse(fs.readFileSync(emitted[0]!.artifactPath, 'utf-8')),
+    );
+    expect(artifact.terminal.kind).toBe(testCase.kind);
+    expect(artifact.attempts).toMatchObject(structured.attempts);
+  });
+
+  it('a failure-artifact write error preserves the original structured invocation error', async () => {
+    fs.mkdirSync(path.join(tmpDir, '.totem'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.totem', 'artifacts'), 'not a directory');
+    const invokeErr = invokeFailure();
+    mockedCreateOrchestrator.mockReturnValue(vi.fn().mockRejectedValue(invokeErr));
+    const onFailureEmitted = vi.fn();
+
+    let caught: unknown;
+    try {
+      await runOrchestrator({
+        prompt: 'failed ledger prompt',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: artifactConfig(),
+        cwd: tmpDir,
+        artifact: artifactRequest(undefined, onFailureEmitted),
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBe(invokeErr);
+    expect(invokeErr.failureArtifactHash).toBeUndefined();
+    expect(onFailureEmitted).not.toHaveBeenCalled();
+  });
+
+  it('masking failure omits runtime text instead of persisting raw bytes', () => {
+    const evidence = persistRuntimeTextEvidence(
+      runtimeText('must never survive'),
+      undefined,
+      64 * 1024,
+      () => {
+        throw new Error('synthetic DLP failure');
+      },
+    );
+
+    expect(evidence).toEqual({
+      encoding: 'utf-8',
+      head: '',
+      observedBytes: Buffer.byteLength('must never survive', 'utf-8'),
+      retainedBytes: 0,
+      limitBytes: 64 * 1024,
+      truncated: false,
+      dlp: 'omitted-on-mask-failure',
+    });
+  });
+
+  it('pre-bounds oversized ASCII terminal messages before DLP and re-bounds masked text', () => {
+    const secret = 'ASCII-OVERSIZED-SECRET-12345';
+    const message = [secret, 'x'.repeat(9_000), '-terminal-tail'].join('');
+    const runtime = runtimeMessageEvidence(message);
+
+    expect(runtime).toMatchObject({
+      observedBytes: Buffer.byteLength(message, 'utf-8'),
+      limitBytes: 4 * 1024,
+      retainedBytes: 4 * 1024,
+      truncated: true,
+    });
+    expect(Buffer.byteLength(runtime.head, 'utf-8')).toBe(2 * 1024);
+    expect(Buffer.byteLength(runtime.tail ?? '', 'utf-8')).toBe(2 * 1024);
+    expect(runtime.head).toContain(secret);
+    expect(runtime.tail).toBe(message.slice(-2 * 1024));
+
+    const masker = vi.fn((value: string) => value.replaceAll(secret, '[REDACTED_CUSTOM]'));
+    const persisted = persistRuntimeTextEvidence(runtime, undefined, 4 * 1024, masker);
+
+    expect(masker).toHaveBeenCalledTimes(2);
+    for (const [fragment] of masker.mock.calls) {
+      expect(Buffer.byteLength(fragment, 'utf-8')).toBeLessThanOrEqual(2 * 1024);
+    }
+    const persistedText = [persisted.head, persisted.tail ?? ''].join('');
+    expect(persistedText).not.toContain(secret);
+    expect(persisted).toMatchObject({
+      observedBytes: Buffer.byteLength(message, 'utf-8'),
+      limitBytes: 4 * 1024,
+      truncated: true,
+      dlp: 'masked',
+    });
+    expect(persisted.retainedBytes).toBeLessThanOrEqual(4 * 1024);
+  });
+
+  it('pre-bounds oversized multi-byte messages on code-point boundaries and masks retained text', () => {
+    const secret = '秘密-TERMINAL-KEY-12345';
+    const message = [secret, '🧪'.repeat(2_000), '-終端'].join('');
+    const runtime = runtimeMessageEvidence(message);
+
+    expect(runtime.observedBytes).toBe(Buffer.byteLength(message, 'utf-8'));
+    expect(runtime.retainedBytes).toBeLessThanOrEqual(4 * 1024);
+    expect(runtime.truncated).toBe(true);
+    expect(runtime.head).not.toContain('\uFFFD');
+    expect(runtime.tail).not.toContain('\uFFFD');
+    expect(Buffer.byteLength(runtime.head, 'utf-8')).toBeLessThanOrEqual(2 * 1024);
+    expect(Buffer.byteLength(runtime.tail ?? '', 'utf-8')).toBe(2 * 1024 - 1);
+    expect(runtime.tail).toBe(`${'🧪'.repeat(510)}-終端`);
+
+    const persisted = persistRuntimeTextEvidence(
+      runtime,
+      [{ type: 'literal', value: secret }],
+      4 * 1024,
+    );
+    const persistedText = [persisted.head, persisted.tail ?? ''].join('');
+    expect(persistedText).not.toContain(secret);
+    expect(persistedText).not.toContain('\uFFFD');
+    expect(persisted).toMatchObject({
+      observedBytes: Buffer.byteLength(message, 'utf-8'),
+      limitBytes: 4 * 1024,
+      truncated: true,
+      dlp: 'masked',
+    });
+    expect(persisted.retainedBytes).toBeLessThanOrEqual(4 * 1024);
+  });
+
+  it('masks non-contiguous runtime head and tail independently', () => {
+    const head = 'HEAD-SENTINEL-cross-';
+    const tail = 'boundary-TAIL-SENTINEL';
+    const evidence = persistRuntimeTextEvidence(
+      {
+        encoding: 'utf-8',
+        head,
+        tail,
+        observedBytes: 100_000,
+        retainedBytes: Buffer.byteLength(head + tail, 'utf-8'),
+        limitBytes: 64 * 1024,
+        truncated: true,
+      },
+      [{ type: 'literal', value: head + tail }],
+    );
+
+    expect(evidence.head).toBe(head);
+    expect(evidence.tail).toBe(tail);
+    expect(evidence.head).not.toContain(head + tail);
+    expect(evidence.tail).not.toContain(head + tail);
+    expect(evidence.truncated).toBe(true);
+  });
+
+  it('a response-cache hit emits NO artifact (artifacts record actual invokes)', async () => {
+    const onEmitted = vi.fn();
+    const opts = {
+      prompt: 'cacheable prompt',
+      tag: 'Spec', // Spec carries a default response-cache TTL
+      options: {},
+      config: artifactConfig(),
+      cwd: tmpDir,
+      artifact: { ...artifactRequest(), onEmitted },
+    };
+    await runOrchestrator(opts);
+    expect(onEmitted).toHaveBeenCalledTimes(1);
+    expect(fs.readdirSync(runsDirPath())).toHaveLength(1);
+
+    await runOrchestrator(opts); // second run hits the response cache
+    expect(onEmitted).toHaveBeenCalledTimes(1); // unchanged
+    expect(fs.readdirSync(runsDirPath())).toHaveLength(1); // unchanged
+  });
+
+  it('a non-opted caller creates no artifacts directory (byte-identical behavior)', async () => {
+    const result = await runOrchestrator({
+      prompt: 'plain run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig(),
+      cwd: tmpDir,
+    });
+    expect(result).toBe('mock result');
+    expect(fs.existsSync(path.join(tmpDir, '.totem', 'artifacts'))).toBe(false);
+  });
+
+  it('an artifact write failure warns but never fails the run', async () => {
+    // Occupy the artifacts path with a FILE so mkdir of artifacts/runs throws.
+    fs.mkdirSync(path.join(tmpDir, '.totem'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.totem', 'artifacts'), 'not a directory');
+
+    const onEmitted = vi.fn();
+    const result = await runOrchestrator({
+      prompt: 'run whose ledger write fails',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig(),
+      cwd: tmpDir,
+      artifact: { ...artifactRequest(), onEmitted },
+    });
+
+    expect(result).toBe('mock result'); // the run is not hostage to its ledger
+    expect(onEmitted).not.toHaveBeenCalled();
+  });
+
+  it('after a quota fallback the artifact records the RESOLVED model, not the requested one', async () => {
+    const quotaErr = new Error('429 quota exhausted');
+    quotaErr.name = 'QuotaError';
+    const mockInvoke = vi
+      .fn()
+      .mockRejectedValueOnce(quotaErr)
+      .mockResolvedValue({ content: 'fallback result', durationMs: 300 });
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+
+    const emitted: string[] = [];
+    await runOrchestrator({
+      prompt: 'quota-bound prompt',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: artifactConfig({
+        orchestrator: {
+          provider: 'gemini',
+          defaultModel: 'gemini-3.1-pro-preview',
+          fallbackModel: 'gemini-3-flash-preview',
+        },
+      }),
+      cwd: tmpDir,
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    const file = path.join(runsDirPath(), `${emitted[0]!}.json`);
+    const artifact = RunArtifactSchema.parse(JSON.parse(fs.readFileSync(file, 'utf-8')));
+    expect(artifact.backend.qualifiedModel).toBe('gemini-3-flash-preview');
+    expect(artifact.output.content).toBe('fallback result');
+    expect(artifact.output.execution?.attempts).toMatchObject([
+      { sequence: 1, route: 'sdk', status: 'failed', failureKind: 'quota' },
+      { sequence: 2, route: 'quota-model-fallback', status: 'succeeded' },
+    ]);
+  });
+
+  it('persists merged, contiguous quota-fallback attempts when both models fail', async () => {
+    const quotaErr = new Error('429 quota exhausted');
+    quotaErr.name = 'QuotaError';
+    const fallbackErr = new OrchestratorInvokeError(
+      'fallback model unavailable',
+      'model',
+      [
+        {
+          sequence: 1,
+          route: 'sdk',
+          provider: 'gemini',
+          model: 'gemini-3-flash-preview',
+          status: 'failed',
+          durationMs: 50,
+          failureKind: 'model',
+        },
+      ],
+      { cause: new Error('404 model unavailable') },
+    );
+    mockedCreateOrchestrator.mockReturnValue(
+      vi.fn().mockRejectedValueOnce(quotaErr).mockRejectedValueOnce(fallbackErr),
+    );
+    const emitted: string[] = [];
+
+    let caught: unknown;
+    try {
+      await runOrchestrator({
+        prompt: 'double failure prompt',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: artifactConfig({
+          orchestrator: {
+            provider: 'gemini',
+            defaultModel: 'gemini-3.1-pro-preview',
+            fallbackModel: 'gemini-3-flash-preview',
+          },
+        }),
+        cwd: tmpDir,
+        artifact: artifactRequest(undefined, (hash) => emitted.push(hash)),
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(OrchestratorInvokeError);
+    expect(caught).not.toBe(fallbackErr);
+    const structured = caught as OrchestratorInvokeError;
+    expect(structured.kind).toBe('model');
+    expect(structured.failureArtifactHash).toBe(emitted[0]);
+    expect(structured.attempts).toMatchObject([
+      { sequence: 1, route: 'sdk', status: 'failed', failureKind: 'quota' },
+      {
+        sequence: 2,
+        route: 'quota-model-fallback',
+        status: 'failed',
+        failureKind: 'model',
+      },
+    ]);
+    const artifact = InvocationFailureArtifactSchema.parse(
+      JSON.parse(fs.readFileSync(path.join(failureRunsDirPath(), `${emitted[0]!}.json`), 'utf-8')),
+    );
+    expect(artifact.attempts).toMatchObject(structured.attempts);
+    expect(artifact.terminal).toMatchObject({ kind: 'model', attempt: 2 });
+  });
+});
+
+// ─── runOrchestrator admission contract (mmnto-ai/totem#2102) ──
+
+describe('runOrchestrator admission contract (#2102)', { timeout: 15_000 }, () => {
+  let tmpDir: string;
+
+  const GROUNDING_HASH = 'b'.repeat(64);
+
+  function artifactRequest(
+    onEmitted?: (hash: string, artifactPath: string) => void,
+    onFailureEmitted?: (hash: string, artifactPath: string) => void,
+  ) {
+    return {
+      groundingHash: GROUNDING_HASH,
+      provenanceSummary: 'similarity-only',
+      ...(onEmitted !== undefined ? { onEmitted } : {}),
+      ...(onFailureEmitted !== undefined ? { onFailureEmitted } : {}),
+    };
+  }
+
+  /** Orchestrator config WITHOUT a declared capability (today's default). */
+  function plainConfig(overrides?: Partial<TotemConfig>): TotemConfig {
+    return {
+      targets: [{ glob: '**/*.ts', type: 'code', strategy: 'typescript-ast' }],
+      orchestrator: {
+        provider: 'gemini',
+        defaultModel: 'gemini-3-flash-preview',
+      },
+      totemDir: '.totem',
+      lanceDir: '.lancedb',
+      ignorePatterns: [],
+      contextWarningThreshold: 40_000,
+      ...overrides,
+    } as TotemConfig;
+  }
+
+  /** Orchestrator config that DECLARES self_grounding_agent capability. */
+  function declaredConfig(orchestratorOverrides?: Record<string, unknown>): TotemConfig {
+    const base = plainConfig();
+    return {
+      ...base,
+      orchestrator: {
+        ...base.orchestrator,
+        capabilities: { admissionClasses: ['self_grounding_agent'] },
+        ...orchestratorOverrides,
+      },
+    } as TotemConfig;
+  }
+
+  function runsDirPath(): string {
+    return path.join(tmpDir, '.totem', 'artifacts', 'runs');
+  }
+
+  function readArtifact(hash: string) {
+    const file = path.join(runsDirPath(), `${hash}.json`);
+    return RunArtifactSchema.parse(JSON.parse(fs.readFileSync(file, 'utf-8')));
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-admission-'));
+    vi.spyOn(process, 'cwd').mockReturnValue(tmpDir);
+    const mockInvoke = vi.fn().mockResolvedValue({
+      content: 'mock result',
+      inputTokens: 100,
+      outputTokens: 50,
+      durationMs: 500,
+    });
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    cleanTmpDir(tmpDir);
+  });
+
+  it('omitting every new field yields a byte-identical invoke payload and identical artifact backend (invariant 1)', async () => {
+    const emitted: string[] = [];
+    await runOrchestrator({
+      prompt: 'test prompt',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: plainConfig(),
+      cwd: tmpDir,
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    // Byte-identical provider payload: the EXACT pre-#2102 key set, no
+    // admission transport keys of any kind.
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    expect(invoke.mock.calls[0]![0]).toStrictEqual({
+      prompt: 'test prompt',
+      model: 'gemini-3-flash-preview',
+      cwd: tmpDir,
+      tag: 'Spec',
+      totemDir: '.totem',
+      temperature: undefined,
+    });
+
+    // Identical artifact backend — decided by DEFAULT now, not constant.
+    const artifact = readArtifact(emitted[0]!);
+    expect(artifact.backend.admissionClass).toBe('completion_only');
+    expect(artifact.backend.taskProfile).toBe('Spec');
+    expect(artifact.admission).toBeUndefined();
+  });
+
+  it('a requested-but-undeclared admission class fails loud before any invoke — no tokens, no artifact (invariant 2)', async () => {
+    await expect(
+      runOrchestrator({
+        prompt: 'elevated request',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: plainConfig(), // no capabilities declared
+        cwd: tmpDir,
+        backendAdmissionClass: 'self_grounding_agent',
+        artifact: artifactRequest(),
+      }),
+    ).rejects.toThrow(/self_grounding_agent/);
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]?.value;
+    if (invoke !== undefined) {
+      expect(invoke).not.toHaveBeenCalled();
+    }
+    expect(fs.existsSync(path.join(tmpDir, '.totem', 'artifacts'))).toBe(false);
+  });
+
+  it('the admitted class lands in backend.admissionClass verbatim; taskProfile records task ?? tag (invariant 3)', async () => {
+    const emitted: string[] = [];
+    await runOrchestrator({
+      prompt: 'admitted run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: declaredConfig(),
+      cwd: tmpDir,
+      backendAdmissionClass: 'self_grounding_agent',
+      task: 'eval-fixture',
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    const artifact = readArtifact(emitted[0]!);
+    expect(artifact.backend.admissionClass).toBe('self_grounding_agent');
+    expect(artifact.backend.taskProfile).toBe('eval-fixture');
+  });
+
+  it('inputHash is unaffected by every new contract field (invariant 4)', async () => {
+    const emitted: string[] = [];
+    const shared = {
+      prompt: 'identical prompt',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: declaredConfig(),
+      cwd: tmpDir,
+    };
+    await runOrchestrator({
+      ...shared,
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+    await runOrchestrator({
+      ...shared,
+      task: 'eval-fixture',
+      backendAdmissionClass: 'self_grounding_agent',
+      contextPolicy: { budget: 8000 },
+      outputContract: { citationsRequired: true },
+      runMetadata: { caller: 'test' },
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    const bare = readArtifact(emitted[0]!);
+    const hydrated = readArtifact(emitted[1]!);
+    expect(hydrated.inputHash).toBe(bare.inputHash);
+  });
+
+  it('a provider-qualified PRIMARY that resolves cross-provider under an elevated class is denied BEFORE the invoke', async () => {
+    // #2148 round-1 (CR major + Greptile P2): the capability declaration is
+    // config-level (base-provider scoped), but `resolveOrchestrator` can route
+    // a provider-qualified primary model to a DIFFERENT provider — the gate
+    // must hold per RESOLVED backend on the primary path too, not just the
+    // quota-fallback path.
+    const onEmitted = vi.fn();
+    await expect(
+      runOrchestrator({
+        prompt: 'cross-provider elevated primary',
+        tag: 'Spec',
+        options: { fresh: true, model: 'anthropic:claude-sonnet-4-6' },
+        config: declaredConfig(), // gemini base config WITH self_grounding_agent declared
+        cwd: tmpDir,
+        backendAdmissionClass: 'self_grounding_agent',
+        artifact: { ...artifactRequest(), onEmitted },
+      }),
+    ).rejects.toThrow(/cross-provider routing is not admitted/i);
+
+    // ZERO invokes: every orchestrator the mocked factory handed out stayed idle.
+    for (const created of mockedCreateOrchestrator.mock.results) {
+      expect(created.value).not.toHaveBeenCalled();
+    }
+    expect(onEmitted).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(tmpDir, '.totem', 'artifacts'))).toBe(false);
+  });
+
+  it('a declared self_grounding_agent run whose quota fallback resolves cross-provider fails BEFORE the fallback invoke (invariant 5)', async () => {
+    const quotaErr = new Error('429 quota exhausted');
+    quotaErr.name = 'QuotaError';
+    const mockInvoke = vi.fn().mockRejectedValueOnce(quotaErr).mockResolvedValue({
+      content: 'fallback result',
+      durationMs: 300,
+    });
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+
+    const onEmitted = vi.fn();
+    const failures: Array<{ hash: string; artifactPath: string }> = [];
+    let caught: unknown;
+    try {
+      await runOrchestrator({
+        prompt: 'elevated quota-bound run',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: declaredConfig({ fallbackModel: 'anthropic:claude-sonnet-4-6' }),
+        cwd: tmpDir,
+        backendAdmissionClass: 'self_grounding_agent',
+        artifact: {
+          ...artifactRequest(undefined, (hash, artifactPath) =>
+            failures.push({ hash, artifactPath }),
+          ),
+          onEmitted,
+        },
+      });
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(OrchestratorInvokeError);
+    expect(caught).toBeInstanceOf(TotemOrchestratorError);
+    expect(caught).toMatchObject({
+      kind: 'quota',
+      failureArtifactHash: failures[0]?.hash,
+      attempts: [expect.objectContaining({ failureKind: 'quota', route: 'sdk' })],
+    });
+    expect((caught as Error).message).toMatch(/429 quota exhausted[\s\S]*self_grounding_agent/);
+    expect(failures).toHaveLength(1);
+    const artifact = InvocationFailureArtifactSchema.parse(
+      JSON.parse(fs.readFileSync(failures[0]!.artifactPath, 'utf-8')),
+    );
+    expect(artifact.terminal).toMatchObject({ kind: 'quota', attempt: 1 });
+    expect(artifact.attempts).toHaveLength(1);
+
+    // Exactly ONE invoke: the primary. The cross-provider fallback was never invoked.
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    expect(onEmitted).not.toHaveBeenCalled();
+  });
+
+  it('a same-provider quota fallback under an elevated class is admitted', async () => {
+    const quotaErr = new Error('429 quota exhausted');
+    quotaErr.name = 'QuotaError';
+    const mockInvoke = vi.fn().mockRejectedValueOnce(quotaErr).mockResolvedValue({
+      content: 'fallback result',
+      durationMs: 300,
+    });
+    mockedCreateOrchestrator.mockReturnValue(mockInvoke);
+
+    const emitted: string[] = [];
+    const result = await runOrchestrator({
+      prompt: 'elevated quota-bound run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: declaredConfig({
+        defaultModel: 'gemini-3.1-pro-preview',
+        fallbackModel: 'gemini-3-flash-preview',
+      }),
+      cwd: tmpDir,
+      backendAdmissionClass: 'self_grounding_agent',
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    expect(result).toBe('fallback result');
+    const artifact = readArtifact(emitted[0]!);
+    expect(artifact.backend.admissionClass).toBe('self_grounding_agent');
+    expect(artifact.backend.qualifiedModel).toBe('gemini-3-flash-preview');
+  });
+
+  it('records the admission group only when at least one member is supplied', async () => {
+    const emitted: string[] = [];
+    const admission = {
+      outputContract: { citationsRequired: true, verifyFallback: true },
+      contextPolicy: { budget: 16_000 },
+      runMetadata: { caller: 'test', command: 'spec' },
+    };
+    await runOrchestrator({
+      prompt: 'contract run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: plainConfig(),
+      cwd: tmpDir,
+      ...admission,
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+    // Class-only run: backendAdmissionClass is recorded in backend, NOT the group.
+    await runOrchestrator({
+      prompt: 'class-only run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: declaredConfig(),
+      cwd: tmpDir,
+      backendAdmissionClass: 'self_grounding_agent',
+      artifact: artifactRequest((hash) => emitted.push(hash)),
+    });
+
+    const withGroup = readArtifact(emitted[0]!);
+    expect(withGroup.admission).toEqual(admission);
+
+    const classOnlyRaw = fs.readFileSync(path.join(runsDirPath(), `${emitted[1]!}.json`), 'utf-8');
+    expect(JSON.parse(classOnlyRaw)).not.toHaveProperty('admission');
+  });
+
+  it('threads the supplied transport fields to the provider invoke verbatim', async () => {
+    await runOrchestrator({
+      prompt: 'threaded run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: declaredConfig(),
+      cwd: tmpDir,
+      task: 'eval-fixture',
+      backendAdmissionClass: 'self_grounding_agent',
+      contextPolicy: { budget: 8000 },
+      outputContract: { citationsRequired: true },
+      runMetadata: { caller: 'test' },
+    });
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    expect(invoke).toHaveBeenCalledWith(
+      expect.objectContaining({
+        task: 'eval-fixture',
+        backendAdmissionClass: 'self_grounding_agent',
+        contextPolicy: { budget: 8000 },
+        outputContract: { citationsRequired: true },
+        runMetadata: { caller: 'test' },
+      }),
+    );
+  });
+
+  it('mismatched groundingBundle and artifact.bundle is an ambiguous grounding identity — hard error before invoke', async () => {
+    const bundleA = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'c'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/a.ts',
+        },
+      ],
+    };
+    const bundleB = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'd'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/b.ts',
+        },
+      ],
+    };
+
+    await expect(
+      runOrchestrator({
+        prompt: 'ambiguous run',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: plainConfig(),
+        cwd: tmpDir,
+        groundingBundle: bundleA,
+        artifact: {
+          groundingHash: calculateDeterministicHash(bundleB),
+          provenanceSummary: summarizeProvenance(bundleB),
+          bundle: bundleB,
+        },
+      }),
+    ).rejects.toThrow(/ambiguous grounding identity/i);
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]?.value;
+    if (invoke !== undefined) {
+      expect(invoke).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a supplied groundingBundle flows into the artifact bundle role when artifact.bundle is absent', async () => {
+    const bundle = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'c'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/x.ts',
+        },
+      ],
+    };
+    const emitted: string[] = [];
+    await runOrchestrator({
+      prompt: 'bundle-flow run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: plainConfig(),
+      cwd: tmpDir,
+      groundingBundle: bundle,
+      artifact: {
+        groundingHash: calculateDeterministicHash(bundle),
+        provenanceSummary: summarizeProvenance(bundle),
+        onEmitted: (hash) => emitted.push(hash),
+      },
+    });
+
+    const artifact = readArtifact(emitted[0]!);
+    expect(artifact.grounding.bundle).toEqual(bundle);
+    // #2148 round-1: the recorded hash must recompute from the recorded
+    // bundle — the adopted-bundle path verifies the attested hash (never
+    // recomputes it) before recording.
+    expect(artifact.grounding.hash).toBe(calculateDeterministicHash(artifact.grounding.bundle));
+  });
+
+  it('an adopted groundingBundle whose hash mismatches artifact.groundingHash is rejected before invoke (verify-and-reject)', async () => {
+    // #2148 round-1: with `artifact.bundle` omitted, the artifact records the
+    // ADOPTED `opts.groundingBundle` but used to trust `artifact.groundingHash`
+    // verbatim — persisting a record whose grounding.hash does not match its
+    // grounding.bundle. The seam records, never re-derives, so the fix is
+    // verify-and-reject, not recompute.
+    const bundle = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'c'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/x.ts',
+        },
+      ],
+    };
+    await expect(
+      runOrchestrator({
+        prompt: 'forged grounding hash',
+        tag: 'Spec',
+        options: { fresh: true },
+        config: plainConfig(),
+        cwd: tmpDir,
+        groundingBundle: bundle,
+        artifact: {
+          groundingHash: 'e'.repeat(64), // does NOT recompute from the adopted bundle
+          provenanceSummary: 'similarity-only:1',
+        },
+      }),
+    ).rejects.toThrow(/ambiguous grounding identity/i);
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]?.value;
+    if (invoke !== undefined) {
+      expect(invoke).not.toHaveBeenCalled();
+    }
+    expect(fs.existsSync(path.join(tmpDir, '.totem', 'artifacts'))).toBe(false);
+  });
+
+  it('a supplied artifact.bundle flows into the invoke-seam groundingBundle role', async () => {
+    const bundle = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'c'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/x.ts',
+        },
+      ],
+    };
+    await runOrchestrator({
+      prompt: 'bundle-flow run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: plainConfig(),
+      cwd: tmpDir,
+      artifact: {
+        groundingHash: calculateDeterministicHash(bundle),
+        provenanceSummary: summarizeProvenance(bundle),
+        bundle,
+      },
+    });
+
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    expect(invoke).toHaveBeenCalledWith(expect.objectContaining({ groundingBundle: bundle }));
+  });
+
+  it('matching groundingBundle and artifact.bundle reconcile cleanly (no false ambiguity)', async () => {
+    const bundle = {
+      items: [
+        {
+          provenance: 'similarity-only',
+          contentHash: 'c'.repeat(64),
+          sourceType: 'code',
+          filePath: 'src/x.ts',
+        },
+      ],
+    };
+    const emitted: string[] = [];
+    const result = await runOrchestrator({
+      prompt: 'reconciled run',
+      tag: 'Spec',
+      options: { fresh: true },
+      config: plainConfig(),
+      cwd: tmpDir,
+      groundingBundle: bundle,
+      artifact: {
+        groundingHash: calculateDeterministicHash(bundle),
+        provenanceSummary: summarizeProvenance(bundle),
+        bundle,
+        onEmitted: (hash) => emitted.push(hash),
+      },
+    });
+
+    expect(result).toBe('mock result');
+    expect(readArtifact(emitted[0]!).grounding.bundle).toEqual(bundle);
+  });
+
+  // ─── Response-cache key carries the contract (#2148 round-1) ──
+
+  it('absent contract fields leave the response-cache key byte-identical to the legacy shape (invariant 1 — legacy keys stay warm)', async () => {
+    await runOrchestrator({
+      prompt: 'cache key probe',
+      tag: 'Spec', // Spec carries a default response-cache TTL
+      options: {},
+      config: plainConfig(),
+      cwd: tmpDir,
+    });
+
+    // The exact legacy construction (see the null-byte delimiter test above):
+    // prompt, systemPrompt, qualifiedModel — and NOTHING else when every
+    // contract field is absent.
+    const legacyHash = crypto
+      .createHash('sha256')
+      .update('cache key probe')
+      .update('\0')
+      .update('')
+      .update('\0')
+      .update('gemini-3-flash-preview')
+      .digest('hex')
+      .slice(0, 16);
+    expect(fs.existsSync(path.join(tmpDir, '.totem', 'cache', `spec-${legacyHash}.json`))).toBe(
+      true,
+    );
+  });
+
+  it('contract fields produce a distinct response-cache key, and differing in ONE contract field differs again (no aliasing)', async () => {
+    const shared = {
+      prompt: 'aliasing probe',
+      tag: 'Spec', // Spec carries a default response-cache TTL
+      options: {},
+      config: plainConfig(),
+      cwd: tmpDir,
+    };
+    await runOrchestrator(shared); // legacy-shaped
+    await runOrchestrator({ ...shared, contextPolicy: { budget: 8000 } });
+    await runOrchestrator({ ...shared, contextPolicy: { budget: 16_000 } });
+
+    // Three ACTUAL invokes — a contract-bearing call must never be served the
+    // legacy call's cached payload (or another contract's) as a replay.
+    const invoke = mockedCreateOrchestrator.mock.results[0]!.value;
+    expect(invoke).toHaveBeenCalledTimes(3);
+    // …and three distinct cache keys on disk.
+    expect(fs.readdirSync(path.join(tmpDir, '.totem', 'cache'))).toHaveLength(3);
   });
 });

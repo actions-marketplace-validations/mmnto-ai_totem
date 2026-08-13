@@ -1,14 +1,20 @@
-import { execFileSync } from 'node:child_process';
-
 import { describe, expect, it, vi } from 'vitest';
+
+import { safeExec } from '@mmnto/totem';
 
 import { GitHubCliPrAdapter } from './github-cli-pr.js';
 
-vi.mock('node:child_process', () => ({
-  execFileSync: vi.fn(),
-}));
+// Mock safeExec at the @mmnto/totem boundary (mmnto/totem#1329).
+// See gh-utils.test.ts for the full rationale.
+vi.mock('@mmnto/totem', async () => {
+  const actual = await vi.importActual<typeof import('@mmnto/totem')>('@mmnto/totem');
+  return {
+    ...actual,
+    safeExec: vi.fn(),
+  };
+});
 
-const mockedExec = vi.mocked(execFileSync);
+const mockedExec = vi.mocked(safeExec);
 
 describe('GitHubCliPrAdapter', () => {
   const adapter = new GitHubCliPrAdapter('/test/cwd');
@@ -17,14 +23,14 @@ describe('GitHubCliPrAdapter', () => {
     it('returns mapped PR list items', () => {
       mockedExec.mockReturnValue(
         JSON.stringify([
-          { number: 1, title: 'feat: add stuff', headRefName: 'feat/add-stuff' },
-          { number: 2, title: 'fix: bug', headRefName: 'fix/bug' },
+          { number: 1, title: 'feat: add stuff', headRefName: 'feat/add-stuff', isDraft: false },
+          { number: 2, title: 'fix: bug', headRefName: 'fix/bug', isDraft: true },
         ]),
       );
       const result = adapter.fetchOpenPRs();
       expect(result).toEqual([
-        { number: 1, title: 'feat: add stuff', headRefName: 'feat/add-stuff' },
-        { number: 2, title: 'fix: bug', headRefName: 'fix/bug' },
+        { number: 1, title: 'feat: add stuff', headRefName: 'feat/add-stuff', isDraft: false },
+        { number: 2, title: 'fix: bug', headRefName: 'fix/bug', isDraft: true },
       ]);
     });
 
@@ -110,6 +116,7 @@ describe('GitHubCliPrAdapter', () => {
           diffHunk: '@@ -1,3 +1,4 @@',
           inReplyToId: undefined,
           createdAt: '2026-03-01T00:00:00Z',
+          pullRequestReviewId: null,
         },
         {
           id: 101,
@@ -119,8 +126,218 @@ describe('GitHubCliPrAdapter', () => {
           diffHunk: '@@ -1,3 +1,4 @@',
           inReplyToId: 100,
           createdAt: '2026-03-01T01:00:00Z',
+          pullRequestReviewId: null,
         },
       ]);
+    });
+  });
+
+  describe('fetchReviews', () => {
+    it('maps gh API output to StandardPrReviewSubmission with commit_id + submitted_at', () => {
+      // First call: getRepoNwo
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      // Second call: paginated reviews
+      mockedExec.mockReturnValueOnce(
+        JSON.stringify([
+          {
+            id: 100,
+            user: { login: 'coderabbitai[bot]' },
+            commit_id: 'sha-A',
+            submitted_at: '2026-04-29T01:00:00Z',
+            state: 'COMMENTED',
+            body: 'Round 1 review.',
+          },
+          {
+            id: 101,
+            user: null, // deleted/ghost account — surfaces as null user_login
+            commit_id: 'sha-B',
+            submitted_at: '2026-04-29T02:00:00Z',
+            state: 'COMMENTED',
+            body: '',
+          },
+          {
+            id: 102,
+            user: { login: 'human-reviewer' },
+            commit_id: null,
+            submitted_at: null,
+            state: 'PENDING',
+            body: null,
+          },
+        ]),
+      );
+
+      const result = adapter.fetchReviews(42);
+      expect(result).toEqual([
+        {
+          id: 100,
+          user_login: 'coderabbitai[bot]',
+          commit_id: 'sha-A',
+          submitted_at: '2026-04-29T01:00:00Z',
+          state: 'COMMENTED',
+          body: 'Round 1 review.',
+        },
+        {
+          id: 101,
+          user_login: null,
+          commit_id: 'sha-B',
+          submitted_at: '2026-04-29T02:00:00Z',
+          state: 'COMMENTED',
+          body: '',
+        },
+        {
+          id: 102,
+          user_login: 'human-reviewer',
+          commit_id: undefined,
+          submitted_at: undefined,
+          state: 'PENDING',
+          body: '',
+        },
+      ]);
+    });
+
+    it('returns empty array when no reviews', () => {
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      mockedExec.mockReturnValueOnce('[]');
+      expect(adapter.fetchReviews(99)).toEqual([]);
+    });
+  });
+
+  describe('fetchIssueComments', () => {
+    it('maps gh API output to StandardIssueComment, preserving the [bot] suffix + user.type', () => {
+      // First call: getRepoNwo
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      // Second call: paginated issue comments
+      mockedExec.mockReturnValueOnce(
+        JSON.stringify([
+          {
+            id: 200,
+            user: { login: 'greptile-apps[bot]', type: 'Bot' },
+            body: '<h3>Greptile Summary</h3>...',
+            created_at: '2026-06-24T00:18:06Z',
+          },
+          {
+            id: 201,
+            user: { login: 'satur8d', type: 'User' },
+            body: '/gemini review',
+            created_at: '2026-06-24T00:20:00Z',
+          },
+          {
+            id: 202,
+            user: null, // deleted/ghost account — surfaces as '' author
+            body: 'orphaned',
+          },
+        ]),
+      );
+
+      const result = adapter.fetchIssueComments(42);
+      expect(result).toEqual([
+        {
+          author: 'greptile-apps[bot]',
+          authorType: 'Bot',
+          body: '<h3>Greptile Summary</h3>...',
+          createdAt: '2026-06-24T00:18:06Z',
+        },
+        {
+          author: 'satur8d',
+          authorType: 'User',
+          body: '/gemini review',
+          createdAt: '2026-06-24T00:20:00Z',
+        },
+        { author: '', authorType: '', body: 'orphaned', createdAt: undefined },
+      ]);
+    });
+
+    it('uses the paginated issues/{n}/comments endpoint', () => {
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      mockedExec.mockReturnValueOnce('[]');
+      adapter.fetchIssueComments(7);
+      // safeExec('gh', args, opts) — args array is the 2nd positional. Last call
+      // is the API fetch. Assert the issues-comments endpoint + --paginate via a
+      // substring (the mocked nwo is untrimmed, unlike the real trimmed safeExec).
+      const lastCallArgs = mockedExec.mock.calls.at(-1)?.[1] as string[];
+      expect(lastCallArgs.some((a) => a.includes('issues/7/comments'))).toBe(true);
+      expect(lastCallArgs).toContain('--paginate');
+    });
+
+    it('returns empty array when no issue comments', () => {
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      mockedExec.mockReturnValueOnce('[]');
+      expect(adapter.fetchIssueComments(99)).toEqual([]);
+    });
+  });
+
+  describe('fetchCodeScanningAlerts', () => {
+    it('maps gh API output to StandardCodeScanAlert format', () => {
+      // First call: getRepoNwo
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      // Second call: code scanning alerts
+      mockedExec.mockReturnValueOnce(
+        JSON.stringify([
+          {
+            number: 10,
+            rule: { id: 'js/unused-variable', severity: 'warning', description: 'Unused var' },
+            state: 'fixed',
+            dismissed_reason: null,
+            html_url: 'https://github.com/mmnto-ai/totem/security/code-scanning/10',
+            most_recent_instance: {
+              ref: 'refs/heads/feat/fix-stuff',
+              location: { path: 'src/utils.ts', start_line: 42, end_line: 42 },
+              message: { text: 'Unused variable tmp' },
+              classifications: [],
+            },
+            created_at: '2026-03-01T00:00:00Z',
+            tool: { name: 'CodeQL' },
+          },
+        ]),
+      );
+
+      const result = adapter.fetchCodeScanningAlerts(42);
+      expect(result).toEqual([
+        {
+          number: 10,
+          rule_id: 'js/unused-variable',
+          state: 'fixed',
+          dismissed_reason: undefined,
+          html_url: 'https://github.com/mmnto-ai/totem/security/code-scanning/10',
+          most_recent_instance: {
+            location: { path: 'src/utils.ts', start_line: 42 },
+            message: { text: 'Unused variable tmp' },
+          },
+        },
+      ]);
+    });
+
+    it('handles extra fields via passthrough (lenient schema)', () => {
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      mockedExec.mockReturnValueOnce(
+        JSON.stringify([
+          {
+            number: 20,
+            rule: { id: 'sql/injection', severity: 'error', tags: ['security'] },
+            state: 'open',
+            html_url: 'https://github.com/mmnto-ai/totem/security/code-scanning/20',
+            most_recent_instance: {
+              location: { path: 'src/db.ts', start_line: 5, end_column: 30 },
+              message: { text: 'SQL injection risk' },
+              extra_field: 'should be ignored',
+            },
+            unknown_top_level: true,
+          },
+        ]),
+      );
+
+      const result = adapter.fetchCodeScanningAlerts(99);
+      expect(result).toHaveLength(1);
+      expect(result[0]!.rule_id).toBe('sql/injection');
+      expect(result[0]!.state).toBe('open');
+    });
+
+    it('returns empty array when no alerts', () => {
+      mockedExec.mockReturnValueOnce('mmnto-ai/totem\n');
+      mockedExec.mockReturnValueOnce('[]');
+
+      const result = adapter.fetchCodeScanningAlerts(99);
+      expect(result).toEqual([]);
     });
   });
 });

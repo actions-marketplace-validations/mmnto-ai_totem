@@ -1,88 +1,86 @@
-import * as path from 'node:path';
+import type {
+  ContentType,
+  LanceStore,
+  SearchResult,
+  TotemConfigError as TotemConfigErrorClass,
+} from '@mmnto/totem';
 
-import type { ContentType, SearchResult } from '@mmnto/totem';
-import { createEmbedder, LanceStore } from '@mmnto/totem';
-
-import { GitHubCliAdapter } from '../adapters/github-cli.js';
 import type { StandardIssue } from '../adapters/issue-adapter.js';
-import { log } from '../ui.js';
-import {
-  formatResults,
-  getSystemPrompt,
-  loadConfig,
-  loadEnv,
-  requireEmbedding,
-  resolveConfigPath,
-  runOrchestrator,
-  wrapXml,
-  writeOutput,
-} from '../utils.js';
+import { SYSTEM_PROMPT } from './spec-templates.js';
 
 // ─── Constants ──────────────────────────────────────────
 
 const TAG = 'Spec';
 const QUERY_BODY_TRUNCATE = 500;
 const MAX_INPUTS = 5;
+export const MAX_LESSONS = 10;
+export const MAX_LESSON_CHARS = 8_000;
+const SPEC_SEARCH_POOL = 20;
+const MAX_SPECS = 5;
+const MAX_SESSIONS = 5;
+const MAX_CODE_RESULTS = 3;
 
 // ─── System prompt ──────────────────────────────────────
 
-const SYSTEM_PROMPT = `# Spec System Prompt — Pre-Work Briefing
-
-## Identity & Role
-You are a Staff-Level Software Architect. You do not write the implementation code yourself; your job is to guide developers. You design system interactions, define data contracts, identify architectural traps, and ensure the proposed plan aligns with existing project patterns.
-
-## Core Mission
-Produce a structured, highly technical pre-work briefing for a task before implementation begins, drawing heavily on provided Totem knowledge to ensure architectural consistency.
-
-## Critical Rules
-- **No Implementation Generation:** Do not write the final code. Provide architectural guidance, sequence logic, and structural plans.
-- **Define Contracts:** Explicitly define data contracts (e.g., Zod schemas, DB migrations, API interfaces) needed for the feature.
-- **Pessimistic Edge Cases:** Actively search for edge cases the issue description failed to mention (e.g., race conditions, missing indexes).
-- **Grounded Reality:** File paths must reference actual files from the context provided. When multiple approaches exist, list trade-offs with a firm recommendation.
-
-## Output Format
-Respond with ONLY the sections below. No preamble, no closing remarks.
-
-### Problem Statement
-[1-2 sentences restating the issue in concrete implementation terms. What exactly needs to change?]
-
-### Architectural Context
-[Relevant sessions, PRs, decisions, or past traps from the provided Totem knowledge. If nothing relevant, say "None found in provided context."]
-
-### Files to Examine
-[Ordered list of files the developer should read before starting. Most critical first. Format: \`path/to/file.ts\` — reason to examine]
-
-### Technical Approach & Contracts
-[Recommended implementation approach. Include concrete steps, sequence logic, and required data contract changes (e.g., schemas, types). If multiple valid approaches exist, list trade-offs with a clear recommendation.]
-
-### Edge Cases & Traps
-[Things the issue description missed. Include race conditions, existing patterns that MUST be followed, and potential architectural regressions.]
-
-### Test Plan
-[Specific test scenarios needed to prove the feature works and edge cases are handled. Reference existing test file patterns when applicable.]
-`;
+export { SPEC_SYSTEM_PROMPT } from './spec-templates.js';
 
 // ─── Issue helpers ──────────────────────────────────────
 
 // ─── LanceDB retrieval ─────────────────────────────────
 
-interface RetrievedContext {
+export interface RetrievedContext {
   specs: SearchResult[];
   sessions: SearchResult[];
   code: SearchResult[];
+  lessons: SearchResult[];
 }
 
-async function retrieveContext(query: string, store: LanceStore): Promise<RetrievedContext> {
-  const search = (typeFilter: ContentType, maxResults: number) =>
-    store.search({ query, typeFilter, maxResults });
+export async function retrieveContext(
+  query: string,
+  store: LanceStore,
+  linkedStores?: LanceStore[],
+): Promise<RetrievedContext> {
+  const { log } = await import('../ui.js');
+  const { partitionLessons } = await import('../utils.js');
+  const search = (s: LanceStore, typeFilter: ContentType, maxResults: number) =>
+    s.search({ query, typeFilter, maxResults });
 
-  const [specs, sessions, code] = await Promise.all([
-    search('spec', 5),
-    search('session_log', 5),
-    search('code', 3),
+  // Fetch from primary store
+  const [allSpecs, sessions, code] = await Promise.all([
+    search(store, 'spec', SPEC_SEARCH_POOL),
+    search(store, 'session_log', MAX_SESSIONS),
+    search(store, 'code', MAX_CODE_RESULTS),
   ]);
 
-  return { specs, sessions, code };
+  // Fetch specs from linked stores (cross-totem knowledge)
+  if (linkedStores && linkedStores.length > 0) {
+    const linkedResults = await Promise.all(
+      linkedStores.map((ls) =>
+        search(ls, 'spec', MAX_SPECS).catch((err) => {
+          // Network/connection failures → graceful degradation (return empty)
+          // Config/parse errors → surface to user so they can fix their setup
+          const msg = err instanceof Error ? err.message : String(err);
+          if (
+            msg.includes('ECONNREFUSED') ||
+            msg.includes('ENOTFOUND') ||
+            msg.includes('FetchError')
+          ) {
+            return [] as SearchResult[];
+          }
+          log.warn(TAG, `Linked store query failed: ${msg}`);
+          return [] as SearchResult[];
+        }),
+      ),
+    );
+    allSpecs.push(...linkedResults.flat());
+    // Re-sort by score after merging
+    allSpecs.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+  }
+
+  // Partition: lessons come from lessons.md, everything else is a spec/ADR
+  const { lessons, specs } = partitionLessons(allSpecs, MAX_LESSONS, MAX_SPECS);
+
+  return { specs, sessions, code, lessons };
 }
 
 function buildSearchQuery(issue: StandardIssue): string {
@@ -91,20 +89,34 @@ function buildSearchQuery(issue: StandardIssue): string {
   return `${issue.title} ${labels} ${bodySnippet}`.trim();
 }
 
+const TEST_KEYWORD_RE =
+  /\b(test(?:s|ing)?|verif(?:y|ies|ication)|example(?:s)?|fixture(?:s)?|hits|misses|rule-?tester)\b/i;
+const TEST_EXPANSION = ' test testing infrastructure fixture verification testRule rule-tester';
+
+/**
+ * Expand a spec search query with test-infrastructure keywords when the
+ * original query mentions testing concepts.  This helps the vector search
+ * surface existing helpers like `rule-tester.ts`.
+ */
+export function expandSpecQuery(query: string): string {
+  return TEST_KEYWORD_RE.test(query) ? query + TEST_EXPANSION : query;
+}
+
 // ─── Input types ────────────────────────────────────────
 
-interface ParsedInput {
+export interface ParsedInput {
   issue: StandardIssue | null;
   freeText: string | null;
 }
 
 // ─── Prompt assembly ────────────────────────────────────
 
-function assemblePrompt(
+export async function assemblePrompt(
   inputs: ParsedInput[],
   context: RetrievedContext,
   systemPrompt: string,
-): string {
+): Promise<string> {
+  const { formatLessonSection, formatResults, wrapXml } = await import('../utils.js');
   const sections: string[] = [systemPrompt];
 
   for (const { issue, freeText } of inputs) {
@@ -136,22 +148,119 @@ function assemblePrompt(
     if (codeSection) sections.push(codeSection);
   }
 
+  // Lessons — full bodies, capped by total character budget
+  const lessonSection = formatLessonSection(context.lessons, MAX_LESSON_CHARS);
+  if (lessonSection) sections.push(lessonSection);
+
+  // Prior art concierge (#1015): inject shared helper signatures
+  const { formatSharedHelpers, getSharedHelpers } = await import('@mmnto/totem');
+  const helperSection = formatSharedHelpers(getSharedHelpers());
+  if (helperSection) {
+    sections.push('\n' + helperSection);
+  }
+
   return sections.join('\n');
 }
 
-// ─── Main command ───────────────────────────────────────
+// ─── Output routing (mmnto-ai/totem#1555) ──────────────
 
 export interface SpecOptions {
   raw?: boolean;
   out?: string;
+  stdout?: boolean;
   model?: string;
   fresh?: boolean;
 }
 
+/**
+ * mmnto-ai/totem#1555: validate that --stdout and --out are not used together.
+ * Run before any LLM call so a user-error surfaces in <50ms with no API cost.
+ */
+export function validateOutputOptions(
+  options: Pick<SpecOptions, 'out' | 'stdout'>,
+  TotemConfigErrorCtor: typeof TotemConfigErrorClass,
+): void {
+  if (options.stdout && options.out) {
+    throw new TotemConfigErrorCtor(
+      '--stdout and --out cannot be used together.',
+      'Pick one: --out <path> writes to a specific file; --stdout writes to standard output.',
+      'CONFIG_INVALID',
+    );
+  }
+}
+
+/**
+ * Sanitize a free-form topic string for use as a filename stem. Replaces any
+ * character outside `[a-zA-Z0-9_-]` with a single dash, collapses runs, and
+ * trims leading/trailing dashes. Returns `''` for inputs that sanitize to
+ * nothing — caller decides the fallback.
+ */
+export function sanitizeSpecFilename(input: string): string {
+  return input.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+}
+
+export interface ResolveSpecPathDeps {
+  resolveGitRoot: (cwd: string) => string | null;
+  pathJoin: (...parts: string[]) => string;
+}
+
+/**
+ * Derive the default spec output path under `<gitRoot>/.totem/specs/<stem>.md`.
+ * Returns `null` for ambiguous cases (multi-input, empty topic) — the caller
+ * falls back to stdout with a hint.
+ */
+export function resolveDefaultSpecPath(
+  parsedInputs: ParsedInput[],
+  cwd: string,
+  deps: ResolveSpecPathDeps,
+): string | null {
+  if (parsedInputs.length !== 1) return null;
+  const first = parsedInputs[0]!;
+  let stem: string;
+  if (first.issue) {
+    stem = String(first.issue.number);
+  } else if (first.freeText) {
+    stem = sanitizeSpecFilename(first.freeText);
+    if (!stem) return null;
+  } else {
+    return null;
+  }
+  const root = deps.resolveGitRoot(cwd) ?? cwd;
+  return deps.pathJoin(root, '.totem', 'specs', `${stem}.md`);
+}
+
+// ─── Main command ───────────────────────────────────────
+
 export async function specCommand(inputs: string[], options: SpecOptions): Promise<void> {
+  const path = await import('node:path');
+  const {
+    createEmbedder,
+    LanceStore: LanceStoreImpl,
+    resolveGitRoot,
+    sanitizeForTerminal,
+    TotemConfigError,
+  } = await import('@mmnto/totem');
+  const { log } = await import('../ui.js');
+  const {
+    applyCodeBlindGuard,
+    getSystemPrompt,
+    loadConfig,
+    loadEnv,
+    requireEmbedding,
+    resolveConfigPath,
+    runOrchestrator,
+    writeOutput,
+  } = await import('../utils.js');
+
+  validateOutputOptions(options, TotemConfigError);
+
   const unique = [...new Set(inputs)];
   if (unique.length > MAX_INPUTS) {
-    throw new Error(`[Totem Error] Too many inputs (${unique.length}). Maximum is ${MAX_INPUTS}.`);
+    throw new TotemConfigError(
+      `Too many inputs (${unique.length}). Maximum is ${MAX_INPUTS}.`,
+      `Pass at most ${MAX_INPUTS} inputs at a time.`,
+      'CONFIG_INVALID',
+    );
   }
 
   const cwd = process.cwd();
@@ -162,25 +271,74 @@ export async function specCommand(inputs: string[], options: SpecOptions): Promi
   // Connect to LanceDB
   const embedding = requireEmbedding(config);
   const embedder = createEmbedder(embedding);
-  const store = new LanceStore(path.join(cwd, config.lanceDir), embedder);
+  const store = new LanceStoreImpl(path.join(cwd, config.lanceDir), embedder, {
+    absolutePathRoot: cwd,
+  });
   await store.connect();
 
+  // Connect to linked indexes (cross-totem knowledge)
+  const linkedStores: LanceStore[] = [];
+  if (config.linkedIndexes && config.linkedIndexes.length > 0) {
+    for (const linkedPath of config.linkedIndexes) {
+      try {
+        const resolvedPath = path.resolve(cwd, linkedPath);
+        const linkedConfigPath = resolveConfigPath(resolvedPath);
+        const linkedConfig = await loadConfig(linkedConfigPath);
+        const linkedEmbedding = linkedConfig.embedding;
+        if (!linkedEmbedding) continue; // Linked totem has no embedder — skip
+        const linkedEmbedder = createEmbedder(linkedEmbedding);
+        // Derive a link name for sourceContext — basename of the resolved
+        // path with leading dot stripped, matching the MCP server's
+        // `deriveLinkName` convention (mmnto/totem#1295).
+        const linkName = path.basename(resolvedPath).replace(/^\./, '');
+        const linkedStore = new LanceStoreImpl(
+          path.join(resolvedPath, linkedConfig.lanceDir),
+          linkedEmbedder,
+          { sourceRepo: linkName, absolutePathRoot: resolvedPath },
+        );
+        await linkedStore.connect();
+        linkedStores.push(linkedStore);
+        log.dim(TAG, `Linked index: ${linkedPath}`);
+      } catch (err) {
+        log.warn(
+          TAG,
+          `Could not connect to linked index at ${linkedPath} — skipping. ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+  }
+
   // Parse and fetch all inputs sequentially
-  const adapter = new GitHubCliAdapter(cwd);
+  const { createIssueAdapter } = await import('../adapters/create-issue-adapter.js');
+  const adapter = await createIssueAdapter(cwd, config);
   const parsed: ParsedInput[] = [];
   const queryParts: string[] = [];
 
   for (const input of unique) {
-    const urlMatch = input.match(/^https?:\/\/github\.com\/[^/]+\/[^/]+\/issues\/(\d+)/);
+    // Match GitHub, GitLab, or any URL ending in /issues/<number> or /-/issues/<number>
+    const urlMatch = input.match(/^https?:\/\/[^/]+\/.*\/(?:-\/)?issues\/(\d+)/);
+    // Support owner/repo#123 format for multi-repo disambiguation
+    const hashIdx = input.indexOf('#');
+    const isQualified =
+      hashIdx > 0 && input.includes('/') && /^\d+$/.test(input.slice(hashIdx + 1));
+    const qualifiedRepo = isQualified ? input.slice(0, hashIdx) : null;
+    const qualifiedNum = isQualified ? parseInt(input.slice(hashIdx + 1), 10) : null;
+
     const issueNumber = /^\d+$/.test(input)
       ? parseInt(input, 10)
       : urlMatch
         ? parseInt(urlMatch[1]!, 10)
-        : null;
+        : qualifiedNum;
 
     if (issueNumber) {
+      // If qualified with owner/repo, create a repo-specific adapter
+      let fetchAdapter = adapter;
+      if (qualifiedRepo) {
+        const { GitHubCliAdapter } = await import('../adapters/github-cli.js');
+        fetchAdapter = new GitHubCliAdapter(cwd, qualifiedRepo);
+      }
       log.info(TAG, `Fetching issue #${issueNumber}...`);
-      const issue = adapter.fetchIssue(issueNumber);
+      const issue = fetchAdapter.fetchIssue(issueNumber);
       log.info(TAG, `Title: ${issue.title}`);
       parsed.push({ issue, freeText: null });
       queryParts.push(buildSearchQuery(issue));
@@ -192,25 +350,105 @@ export async function specCommand(inputs: string[], options: SpecOptions): Promi
   }
 
   // Retrieve context from LanceDB
-  const query = queryParts.join(' ');
+  const query = expandSpecQuery(queryParts.join(' '));
   log.info(TAG, 'Querying Totem index...');
-  const context = await retrieveContext(query, store);
-  const totalResults = context.specs.length + context.sessions.length + context.code.length;
+  const context = await retrieveContext(
+    query,
+    store,
+    linkedStores.length > 0 ? linkedStores : undefined,
+  );
+  const totalResults =
+    context.specs.length + context.sessions.length + context.code.length + context.lessons.length;
   log.info(
     TAG,
-    `Found: ${context.specs.length} specs, ${context.sessions.length} sessions, ${context.code.length} code chunks`,
+    `Found: ${context.specs.length} specs, ${context.sessions.length} sessions, ${context.code.length} code, ${context.lessons.length} lessons`,
   );
 
   // Resolve system prompt (allow .totem/prompts/spec.md override)
   const systemPrompt = getSystemPrompt('spec', SYSTEM_PROMPT, cwd, config.totemDir);
 
+  // Code-blind grounding guard (mmnto-ai/totem#2106): 0 code retrieved → surface
+  // an advisory banner + fold a suppression directive into the prompt; never
+  // disables (strategy#474 interim ruling).
+  const codeBlindGuard = applyCodeBlindGuard(context, systemPrompt);
+  if (codeBlindGuard.banner) log.warn(TAG, codeBlindGuard.banner);
+
   // Assemble prompt
-  const prompt = assemblePrompt(parsed, context, systemPrompt);
+  const prompt = await assemblePrompt(parsed, context, codeBlindGuard.systemPrompt);
   log.dim(TAG, `Prompt: ${(prompt.length / 1024).toFixed(0)}KB`);
 
-  const content = await runOrchestrator({ prompt, tag: TAG, options, config, cwd, totalResults });
-  if (content != null) {
+  // Grounded run artifact (mmnto-ai/totem#2100): always-on for spec — every
+  // run is a future eval fixture. Per-item provenance bundle (mmnto-ai/totem#2101): every
+  // retrieved item enters classed similarity-only; hash + summary are DERIVED
+  // from the bundle, so the attested hash is recomputable from the artifact
+  // surface alone.
+  const { ADMISSION_COMPLETION_ONLY, calculateDeterministicHash, summarizeProvenance } =
+    await import('@mmnto/totem');
+  const { buildRetrievalGroundingBundle } = await import('../utils.js');
+  const groundingBundle = buildRetrievalGroundingBundle(context);
+  const content = await runOrchestrator({
+    prompt,
+    tag: TAG,
+    options,
+    config,
+    cwd,
+    // Anchor cache + artifacts at the config dir, not the invocation cwd —
+    // without this, a `totem spec` from a subdirectory writes artifacts to
+    // `<cwd>/.totem/` where the `totem artifact` verbs (which resolve from
+    // the config path) can never find them (Greptile P1 on #2114).
+    configRoot: path.dirname(configPath),
+    totalResults,
+    // Admission contract (mmnto-ai/totem#2102): the same value the slice-1
+    // constant recorded, now caller-supplied — spec is factually completion-only.
+    backendAdmissionClass: ADMISSION_COMPLETION_ONLY,
+    runMetadata: { caller: 'spec', codeBlind: codeBlindGuard.codeBlind },
+    artifact: {
+      groundingHash: calculateDeterministicHash(groundingBundle),
+      provenanceSummary: summarizeProvenance(groundingBundle),
+      bundle: groundingBundle,
+    },
+  });
+  if (content == null) return;
+
+  // Query-before-derive instrumentation (mmnto-ai/totem#2510): spec synthesis is
+  // a derive-class action. Recorded here — after synthesis actually produced
+  // content, before the write forks three ways (stdout / --out / derived path) —
+  // so every successful synthesis is counted exactly once.
+  //
+  // This row is written whether or not a query preceded it. An uncorrelated
+  // derive is the observation the metric exists to make, so it must land in the
+  // denominator (#2510 falsifier 1: denominator gaming).
+  {
+    const { recordQbdDerive } = await import('./qbd-seam.js');
+    const report = await recordQbdDerive(cwd, 'spec', (msg) => {
+      log.warn(TAG, msg);
+    });
+    if (report.note !== undefined) log.dim(TAG, report.note);
+  }
+
+  if (options.stdout) {
+    writeOutput(content);
+    return;
+  }
+  if (options.out) {
     writeOutput(content, options.out);
-    if (options.out) log.success(TAG, `Written to ${options.out}`);
+    const safeOut = sanitizeForTerminal(options.out).replace(/[\n\t]+/g, ' ');
+    log.success(TAG, `Written to ${safeOut}`);
+    return;
+  }
+  const defaultPath = resolveDefaultSpecPath(parsed, cwd, {
+    resolveGitRoot,
+    pathJoin: path.join,
+  });
+  if (defaultPath) {
+    writeOutput(content, defaultPath);
+    const safeRelativePath = sanitizeForTerminal(path.relative(cwd, defaultPath)).replace(
+      /[\n\t]+/g,
+      ' ',
+    );
+    log.success(TAG, `Spec saved to ${safeRelativePath}`);
+  } else {
+    log.dim(TAG, 'No default save path — writing to stdout. Use --out <path> to save.');
+    writeOutput(content);
   }
 }

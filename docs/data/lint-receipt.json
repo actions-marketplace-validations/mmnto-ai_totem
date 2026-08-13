@@ -1,0 +1,17 @@
+{
+  "baseSha": "c14e90abefe25b6a334e6ac796dfcc3af3024a44",
+  "headSha": "ba8c591da7993451ecb08bc31d271ba3974e4eef",
+  "filesChanged": 41,
+  "rules": 387,
+  "errors": 0,
+  "warnings": 20,
+  "llmCalls": 0,
+  "astParseMode": "lenient",
+  "targetMismatchGuardWarning": true,
+  "apiKeysStripped": true,
+  "elapsedMs": 3908,
+  "platform": "win32-x64",
+  "node": "24.16.0",
+  "cliVersion": "1.112.0",
+  "generatedAt": "2026-08-06T03:35:34.671Z"
+}

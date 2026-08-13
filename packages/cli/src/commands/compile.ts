@@ -1,93 +1,41 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-
-import {
-  type CompiledRule,
-  exportLessons,
-  hashLesson,
-  loadCompiledRules,
-  parseCompilerResponse,
-  parseLessonsFile,
-  saveCompiledRules,
-  validateRegex,
+import type {
+  CompiledRule,
+  CompiledRulesFile,
+  LayerTraceEvent,
+  LessonInput,
+  NonCompilableEntry,
+  NonCompilableReasonCode,
 } from '@mmnto/totem';
-
-import { log } from '../ui.js';
-import { loadConfig, loadEnv, resolveConfigPath, runOrchestrator } from '../utils.js';
 
 // ─── Constants ──────────────────────────────────────
 
 const TAG = 'Compile';
 const COMPILED_RULES_FILE = 'compiled-rules.json';
+const DEFAULT_CONCURRENCY = 5;
+const MAX_CONCURRENCY = 20;
+const CLOUD_CONCURRENCY = 50;
 
-// ─── Compiler prompt ────────────────────────────────
+// ─── Types ──────────────────────────────────────────
 
-const COMPILER_SYSTEM_PROMPT = `# Lesson Compiler — Regex Rule Extraction
+/**
+ * Terminal outcome of a `--upgrade <hash>` run, returned by `compileCommand`
+ * so callers (like `totem doctor --pr` self-healing) can distinguish an actual
+ * rule replacement from a noop / skipped / failed outcome and only report real
+ * upgrades in their summaries.
+ *
+ * - `replaced`: compilation produced a fresh rule that replaced the stale copy
+ * - `skipped`:  LLM decided the lesson is non-compilable; rule moved to
+ *               nonCompilable and removed from active rules
+ * - `noop`:     compile returned with no change (rare — cache hit path)
+ * - `failed`:   transient error (network, rate limit, parser failure); old
+ *               rule is preserved untouched
+ */
+export type UpgradeStatus = 'replaced' | 'skipped' | 'noop' | 'failed';
 
-## Identity
-You are a deterministic rule compiler. Your job is to read a single natural-language lesson and determine whether it can be expressed as a regex pattern that catches violations in source code diffs.
-
-## Rules
-- Output ONLY valid JSON — no markdown, no explanation, no preamble.
-- The regex will be tested against individual lines added in a git diff (lines starting with \`+\`).
-- The regex should catch **violations** (code that breaks the lesson's rule), NOT conformance.
-- Use JavaScript RegExp syntax.
-- Keep patterns simple and precise — avoid overly broad matches that cause false positives.
-- If the lesson describes an architectural principle, design philosophy, or conceptual guideline that cannot be expressed as a line-level regex, set \`compilable\` to \`false\`.
-- **File scoping:** Include a \`fileGlobs\` array to limit where the rule runs. Scope rules as tightly as possible:
-  - **By file type:** \`["*.sh", "*.yml"]\` — for rules about shell or YAML syntax.
-  - **By package/directory:** \`["packages/mcp/**/*.ts"]\` — for rules about MCP-specific patterns in a monorepo.
-  - **By exclusion:** \`["packages/cli/**/*.ts", "!**/*.test.ts"]\` — exclude test files that legitimately use the flagged pattern.
-  - **Infer scope from context:** If a lesson mentions "MCP tool returns", "CLI output", "LanceDB filters", or a specific package, scope to that package. Only omit \`fileGlobs\` if the rule genuinely applies to ALL files (e.g., universal TypeScript style rules).
-
-## Output Schema
-\`\`\`json
-{
-  "compilable": true,
-  "pattern": "regex pattern here",
-  "message": "human-readable violation message",
-  "fileGlobs": ["packages/mcp/**/*.ts", "!**/*.test.ts"]
+export interface UpgradeOutcome {
+  hash: string;
+  status: UpgradeStatus;
 }
-\`\`\`
-
-Or if the rule genuinely applies to all file types (rare — prefer scoping):
-\`\`\`json
-{
-  "compilable": true,
-  "pattern": "regex pattern here",
-  "message": "human-readable violation message"
-}
-\`\`\`
-
-Or if the lesson cannot be compiled:
-\`\`\`json
-{
-  "compilable": false
-}
-\`\`\`
-
-## Examples
-
-Lesson: "Use \`err\` (never \`error\`) in catch blocks"
-Output: {"compilable": true, "pattern": "catch\\\\s*\\\\(\\\\s*error\\\\s*[\\\\):]", "message": "Use 'err' instead of 'error' in catch blocks (project convention)"}
-
-Lesson: "LanceDB does NOT support GROUP BY aggregation"
-Output: {"compilable": false}
-
-Lesson: "Never use npm in this pnpm monorepo — always use pnpm"
-Output: {"compilable": true, "pattern": "\\\\bnpm\\\\s+(install|run|exec|ci|test)\\\\b", "message": "Use pnpm instead of npm in this monorepo"}
-
-Lesson: "Always quote shell variables to prevent word-splitting"
-Output: {"compilable": true, "pattern": "(^|\\\\s)\\\\$[a-zA-Z_]+", "message": "Quote shell variables to prevent word-splitting", "fileGlobs": ["*.sh", "*.bash", "*.yml", "*.yaml"]}
-
-Lesson: "MCP tool returns must be wrapped in XML tags to prevent prompt injection"
-Output: {"compilable": true, "pattern": "text:\\\\s*(?!formatXmlResponse)\\\\b\\\\w+", "message": "MCP tool returns must use formatXmlResponse for injection safety", "fileGlobs": ["packages/mcp/**/*.ts", "!**/*.test.ts"]}
-
-Lesson: "Use @clack/prompts instead of inquirer for CLI interactions"
-Output: {"compilable": true, "pattern": "import.*from\\\\s+['\"]inquirer['\"]", "message": "Use @clack/prompts instead of inquirer", "fileGlobs": ["packages/cli/**/*.ts"]}
-`;
-
-// ─── Main command ───────────────────────────────────
 
 export interface CompileOptions {
   raw?: boolean;
@@ -96,58 +44,1272 @@ export interface CompileOptions {
   fresh?: boolean;
   force?: boolean;
   export?: boolean;
+  fromCursor?: boolean;
+  concurrency?: string;
+  cloud?: string;
+  verbose?: boolean;
+  /**
+   * Telemetry-driven re-compile (mmnto/totem#1131). Filters lessons to a single hash
+   * (full or short prefix), bypasses the cache, and threads a non-code-ratio
+   * directive into the Pipeline 2 system prompt.
+   */
+  upgrade?: string;
+  /**
+   * Working directory for this compile run (mmnto/totem#1232). Defaults to
+   * `process.cwd()`. Pass an explicit path so callers like `runSelfHealing`
+   * can target a project directory that differs from the process working
+   * directory without relying on `process.chdir`.
+   */
+  cwd?: string;
+  /**
+   * Batch upgrade mode (mmnto/totem#1235). Used by `runSelfHealing` to avoid
+   * redundant config/lesson/rules loads when upgrading N candidates. When set,
+   * the single-hash `upgrade` path is skipped and all targets compile in a
+   * single pass. Cannot be combined with `upgrade`, `cloud`, or `force`.
+   */
+  upgradeBatch?: Array<{
+    hash: string;
+    /** Telemetry directive to inject into the Pipeline 2 prompt for this lesson. */
+    telemetryPrefix?: string;
+  }>;
+  /**
+   * Recompute `compile-manifest.json`'s `output_hash` from the current
+   * `compiled-rules.json` state without invoking the LLM or touching any
+   * lessons (mmnto-ai/totem#1587). Exists to support the postmerge
+   * inline-archive workflow where a curation script mutates
+   * `status: 'archived'` on a rule directly; `--refresh-manifest` is the
+   * blessed way to re-sync the manifest afterwards. Cannot combine with
+   * `--force`.
+   */
+  refreshManifest?: boolean;
 }
 
-export async function compileCommand(options: CompileOptions): Promise<void> {
-  const cwd = process.cwd();
+// ─── Telemetry directive (mmnto/totem#1131) ────────────────────
+
+/**
+ * Build the directive injected into the Sonnet system prompt for `--upgrade`.
+ *
+ * `unknown` is excluded from both the numerator and the denominator because it
+ * holds historical / unclassified telemetry (pre-context-aware hits, or events
+ * where the rule runner did not provide an `astContext`). Including it would
+ * dilute the classified signal and produce misleading ratios.
+ */
+export function buildTelemetryPrefix(contextCounts: {
+  code: number;
+  string: number;
+  comment: number;
+  regex: number;
+  unknown: number;
+}): string {
+  const classifiedTotal =
+    contextCounts.code + contextCounts.string + contextCounts.comment + contextCounts.regex;
+  const nonCode = contextCounts.string + contextCounts.comment + contextCounts.regex;
+  const pct = classifiedTotal > 0 ? Math.round((nonCode / classifiedTotal) * 100) : 0;
+  const unknownNote =
+    contextCounts.unknown > 0
+      ? ` Unclassified (historical) matches: ${contextCounts.unknown}.`
+      : '';
+  return [
+    `This rule was flagged because ${pct}% of its classified matches occur in non-code contexts`,
+    `(strings: ${contextCounts.string}, comments: ${contextCounts.comment}, regex literals: ${contextCounts.regex}). Please prefer an ast-grep`,
+    `structural pattern that only matches executable code, not string or comment content.${unknownNote}`,
+  ].join(' ');
+}
+
+// ─── Non-compilable cache helpers ───────────────────
+
+/**
+ * Value side of the in-memory `nonCompilableMap`. Carries the title plus the
+ * machine-readable reasonCode (mmnto-ai/totem#1481) so prune / serialize
+ * steps round-trip the full 4-tuple without a lookup.
+ */
+export interface NonCompilableMapValue {
+  title: string;
+  reasonCode: NonCompilableReasonCode;
+  reason?: string;
+}
+
+/**
+ * Filter stale entries from a non-compilable map against the current set of
+ * lesson hashes. Returns the fresh 4-tuple list and a count of how many
+ * entries were drained.
+ *
+ * Extracted for mmnto/totem#1281 so the no-op compile path can drain stale
+ * entries too — previously the prune only ran when `toCompile.length > 0`,
+ * leaving stale entries stranded on no-op runs (e.g. after a lesson was
+ * removed or after a parser-bug fix invalidated old non-compilable hashes).
+ * Pure function; does not mutate the input map.
+ *
+ * mmnto-ai/totem#1481: preserves `reasonCode` and `reason` through the
+ * prune so ledger entries stay 4-tuple-shaped on disk. Dropping them back
+ * to 2-tuple would silently reintroduce `'legacy-unknown'` on the next
+ * load via the Read transform.
+ */
+export function pruneStaleNonCompilable(
+  nonCompilableMap: Map<string, NonCompilableMapValue>,
+  currentHashes: Set<string>,
+): { fresh: NonCompilableEntry[]; drained: number } {
+  const fresh: NonCompilableEntry[] = [];
+  for (const [hash, value] of nonCompilableMap) {
+    if (currentHashes.has(hash)) {
+      const entry: NonCompilableEntry = {
+        hash,
+        title: value.title,
+        reasonCode: value.reasonCode,
+      };
+      if (value.reason !== undefined) entry.reason = value.reason;
+      fresh.push(entry);
+    }
+  }
+  return { fresh, drained: nonCompilableMap.size - fresh.length };
+}
+
+/**
+ * Filter stale compiled rules whose source lesson has been removed from the
+ * project. Returns the fresh rule list (same object references preserved to
+ * keep audit lineage intact) and a count of how many rules were dropped.
+ *
+ * Symmetrical counterpart to `pruneStaleNonCompilable` — both helpers are
+ * used by the no-op compile path (mmnto/totem#1281) so lesson removals drain
+ * the compiled rule AND any stale non-compilable entry in the same run.
+ * Pure function; does not mutate the input array.
+ */
+export function pruneStaleRules(
+  rules: readonly CompiledRule[],
+  currentHashes: Set<string>,
+): { fresh: CompiledRule[]; pruned: number } {
+  const fresh = rules.filter((r) => currentHashes.has(r.lessonHash));
+  return { fresh, pruned: rules.length - fresh.length };
+}
+
+/**
+ * Replace-by-lessonHash if an entry with the same hash is already in the
+ * array; otherwise append. Preserves array order for existing entries so
+ * the compile loop's output stays stable across runs.
+ *
+ * Used by the --force durability path (mmnto-ai/totem#1587) and the
+ * non-force add-new-rule path: all success-side pushes go through this
+ * helper so transient compile failures leave old rules intact and
+ * repeated successes do not double-insert.
+ */
+export function upsertRule(rules: CompiledRule[], rule: CompiledRule): void {
+  const idx = rules.findIndex((r) => r.lessonHash === rule.lessonHash);
+  if (idx >= 0) {
+    rules[idx] = rule;
+  } else {
+    rules.push(rule);
+  }
+}
+
+/**
+ * Remove the first rule matching `lessonHash` from `rules`, in place.
+ * No-op when no match. Used on the `--force` / upgrade skipped paths in
+ * both local and cloud workers: when a lesson transitions to
+ * non-compilable, any pre-existing rule for the same hash must be evicted
+ * from the active set, otherwise --force leaves the old rule alive while
+ * also marking the hash non-compilable (mmnto-ai/totem#1629 CR finding).
+ */
+export function removeRuleByHash(rules: CompiledRule[], lessonHash: string): void {
+  const idx = rules.findIndex((r) => r.lessonHash === lessonHash);
+  if (idx >= 0) rules.splice(idx, 1);
+}
+
+// ─── Verbose trace renderer (mmnto-ai/totem#1482) ──
+
+/**
+ * Map a numeric layer from a trace event to its pipeline label. Tolerates
+ * unknown values so a future ADR-088 phase can introduce new layers without
+ * breaking the renderer.
+ */
+function pipelineLabel(layer: number): string {
+  switch (layer) {
+    case 1:
+      return 'Pipeline 1 (manual)';
+    case 2:
+      return 'Pipeline 2 (example-based)';
+    case 3:
+      return 'Pipeline 3 (LLM + verify-retry)';
+    default:
+      return `Layer ${layer}`;
+  }
+}
+
+/**
+ * Format a lesson's trace array into a single multi-line block for the
+ * `--verbose` renderer. Returns a string (no trailing newline — caller
+ * controls that). Output shape:
+ *
+ *   lesson-<hash8> "<heading>":
+ *     Layer <N> (<pipeline label>) -> <outcome> (<patternHash?>)
+ *       verify on example: <outcome>
+ *       retry N: scheduled
+ *     result: <status> (<reasonCode or detail>)
+ *
+ * The renderer is defensive: malformed / unknown layer numbers render as
+ * "(unknown)" rather than throwing.
+ */
+export function formatVerboseTraceBlock(
+  lesson: { heading: string; hash: string },
+  status: 'compiled' | 'skipped' | 'failed' | 'noop',
+  reasonCode: NonCompilableReasonCode | undefined,
+  trace: readonly LayerTraceEvent[] | undefined,
+): string {
+  const lines: string[] = [];
+  const shortHash = lesson.hash.slice(0, 8);
+  lines.push(`lesson-${shortHash} "${lesson.heading}":`);
+
+  if (!trace || trace.length === 0) {
+    lines.push(`  (no trace events recorded)`);
+    const resultSuffix = reasonCode ? ` (${reasonCode})` : '';
+    lines.push('  result: ' + status + resultSuffix);
+    return lines.join('\n');
+  }
+
+  // Separate events into prelude (generate / verify / retry) and terminal
+  // (result). The terminal lives on its own line with full framing.
+  let retryCounter = 0;
+  let sawResult = false;
+  for (const ev of trace) {
+    const label = pipelineLabel(ev.layer);
+    if (ev.action === 'generate') {
+      const detail = ev.patternHash ? ` (patternHash=${ev.patternHash})` : '';
+      lines.push(`  Layer ${ev.layer} (${label}) -> ` + ev.outcome + detail);
+    } else if (ev.action === 'verify') {
+      lines.push(`    verify on example: ${ev.outcome}`);
+    } else if (ev.action === 'retry') {
+      retryCounter++;
+      lines.push(`    retry ${retryCounter}: ${ev.outcome}`);
+    } else if (ev.action === 'result') {
+      const detail = ev.reasonCode ? ` (${ev.reasonCode})` : '';
+      lines.push('  result: ' + ev.outcome + detail);
+      sawResult = true;
+    } else {
+      lines.push(`  (unknown) ${String(ev.action)}: ${String(ev.outcome)}`);
+    }
+  }
+
+  // Defense in depth: if the trace somehow never emitted a terminal result
+  // event, synthesize one from the caller-supplied `status` so the verbose
+  // block always carries a final line. `compileLesson` pushes a result
+  // event on every return path, but a future refactor could regress that;
+  // this guard keeps the rendered block well-formed regardless. We use
+  // `status` directly rather than the last event's outcome because that
+  // outcome is an intermediate marker like 'MATCH' or 'attempt-1', not the
+  // lesson's final state.
+  if (!sawResult) {
+    const resultSuffix = reasonCode ? ` (${reasonCode})` : '';
+    lines.push('  result: ' + status + resultSuffix);
+  }
+
+  return lines.join('\n');
+}
+
+// ─── Logging helpers ────────────────────────────────
+
+function logCompiledRule(
+  log: { success: (tag: string, msg: string) => void },
+  lesson: LessonInput,
+  rule: CompiledRule,
+): void {
+  const engine = rule.engine;
+  const severity = rule.severity ?? 'warning';
+  if (engine === 'ast-grep') {
+    log.success(
+      TAG,
+      `[${lesson.heading}] Compiled (ast-grep, ${severity}): ${rule.astGrepPattern}`,
+    ); // totem-ignore
+  } else if (engine === 'ast') {
+    log.success(TAG, `[${lesson.heading}] Compiled (ast, ${severity}): ${rule.astQuery}`); // totem-ignore
+  } else if (rule.manual === true || rule.lessonHeading === rule.message) {
+    // Manual pattern — `manual: true` flag (post-mmnto/totem#1265) or legacy heading=message heuristic.
+    // The legacy heuristic only worked when manual rules had no rich message; the explicit
+    // flag is the reliable post-mmnto/totem#1265 signal.
+    const manualEngine = rule.engine;
+    log.success(
+      TAG,
+      `[${lesson.heading}] Compiled (manual ${manualEngine}, ${severity}): ${rule.pattern}`,
+    ); // totem-ignore
+  } else {
+    log.success(TAG, `[${lesson.heading}] Compiled (regex, ${severity}): /${rule.pattern}/`); // totem-ignore
+  }
+}
+
+// ─── Test fixture lookup (ADR-065) ──────────────────
+
+function getTestedHashes(
+  testsDir: string,
+  fs: typeof import('node:fs'),
+  path: typeof import('node:path'),
+): Set<string> {
+  const hashes = new Set<string>();
+  try {
+    if (!fs.existsSync(testsDir)) return hashes;
+    for (const file of fs.readdirSync(testsDir)) {
+      if (!file.endsWith('.md')) continue;
+      const content = fs.readFileSync(path.join(testsDir, file), 'utf-8');
+      const match = content.match(/^rule:\s*(\S+)/m);
+      if (match) hashes.add(match[1]);
+    }
+  } catch {
+    // tests dir unreadable
+  }
+  return hashes;
+}
+
+// ─── Auto-scaffold (ADR-065 / #854) ─────────────────
+
+export interface AutoScaffoldDeps {
+  fs: typeof import('node:fs');
+  path: typeof import('node:path');
+  testsDir: string;
+  cwd: string;
+  testedHashes: Set<string>;
+  log: { info: (tag: string, msg: string) => void };
+  extractRuleExamples: typeof import('@mmnto/totem').extractRuleExamples;
+  deriveVirtualFilePath: typeof import('@mmnto/totem').deriveVirtualFilePath;
+  scaffoldFixture: typeof import('@mmnto/totem').scaffoldFixture;
+  scaffoldFixturePath: typeof import('@mmnto/totem').scaffoldFixturePath;
+}
+
+/** Returns true if the fixture was written, false on failure. */
+export function autoScaffoldFixture(
+  lesson: LessonInput,
+  rule: CompiledRule,
+  deps: AutoScaffoldDeps,
+): boolean {
+  try {
+    const examples = deps.extractRuleExamples(lesson.body);
+    const virtualPath = deps.deriveVirtualFilePath(rule);
+    const content = deps.scaffoldFixture({
+      ruleHash: lesson.hash,
+      filePath: virtualPath,
+      failLines: examples?.hits,
+      passLines: examples?.misses,
+      heading: lesson.heading,
+    });
+    const fixturePath = deps.scaffoldFixturePath(deps.testsDir, lesson.hash);
+    deps.fs.mkdirSync(deps.path.dirname(fixturePath), { recursive: true });
+    deps.fs.writeFileSync(fixturePath, content, { encoding: 'utf8', flag: 'wx' });
+    deps.testedHashes.add(lesson.hash);
+    deps.log.info(
+      TAG,
+      `[${lesson.heading}] Auto-scaffolded test fixture → ${deps.path.relative(deps.cwd, fixturePath)}`,
+    );
+    return true;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    deps.log.info(TAG, `[${lesson.heading}] Failed to scaffold fixture (non-fatal): ${msg}`);
+    return false;
+  }
+}
+
+// ─── Main command ───────────────────────────────────
+
+export async function compileCommand(
+  options: CompileOptions,
+): Promise<UpgradeOutcome | UpgradeOutcome[] | void> {
+  const { TotemConfigError, TotemError } = await import('@mmnto/totem');
+  const { COMPILER_SYSTEM_PROMPT, PIPELINE3_COMPILER_PROMPT } =
+    await import('./compile-templates.js');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const url = await import('node:url');
+  const { log } = await import('../ui.js');
+  const { isGlobalConfigPath, loadConfig, loadEnv, resolveConfigPath, runOrchestrator } =
+    await import('../utils.js');
+  const {
+    buildCompiledRule,
+    buildManualRule,
+    compileLesson: compileLessonCore,
+    deriveVirtualFilePath,
+    exportLessons,
+    extractManualPattern,
+    extractRuleExamples,
+    formatExampleFailure,
+    generateInputHash,
+    generateOutputHash,
+    hashLesson,
+    LEDGER_RETRY_PENDING_CODES,
+    loadCompiledRulesFile,
+    parseCompilerResponse,
+    parseDeclaredSeverity,
+    parseStage4BaselineDirectives,
+    readAllLessons,
+    readCompileManifest,
+    resolveStage4Baseline,
+    appendLedgerEvent,
+    buildCacheEntry,
+    composeLessonSourceForHash,
+    computeCompileWorkerFingerprint,
+    computeLessonSourceHash,
+    lookupCacheEntry,
+    modelStripsTemperature,
+    readPromptTemplateContentHash,
+    readSessionId,
+    safeExec,
+    sanitizeForTerminal,
+    saveCompiledRulesFile,
+    scaffoldFixture,
+    scaffoldFixturePath,
+    shouldWriteToLedger,
+    STAGE4_MANIFEST_EXCLUSIONS,
+    verifyAgainstCodebase,
+    verifyRuleExamples,
+    writeCacheEntry,
+    writeCompileManifest,
+  } = await import('@mmnto/totem');
+
+  // Compile-worker fingerprint resolved relative to the running compile.js.
+  // import.meta.url points to dist/commands/compile.js at runtime; the
+  // sibling compile-templates.js is the prompt source-of-truth — both
+  // `totem compile` and `totem verify-manifest` resolve against the same
+  // dist file, so the fingerprint is internally consistent across the
+  // drift-surveillance surface. Phase 1 hashes the built .js; per
+  // Proposal 278 § Action 3 Path A the .ts source and built .js move in
+  // lockstep through tsc, so drift surfaces either way.
+  const computeFingerprintForManifest = (): string | undefined => {
+    // Phase 1 anthropic-only per Proposal 278 § Phase 1 scope. Other
+    // providers leave the fingerprint undefined; verify-manifest's drift
+    // check no-ops when either side is undefined. Shell-orchestrator
+    // capture lands in Phase 2.
+    if (config.orchestrator?.provider !== 'anthropic') return undefined;
+    const model = options.model ?? config.orchestrator.defaultModel ?? 'unknown';
+    // Intent-not-reality (Tenet 19): the fingerprint records what the
+    // worker is *configured* to send, not what the API accepts. compile.ts
+    // hardcodes temperature: 0 in the runOrchestrator call below — for
+    // models that reject sampling params (Opus 4.7+), the fingerprint
+    // records absence even though the runtime call still passes 0.
+    // mmnto-ai/totem#1476 tracks the latent SDK fix for the 7 sites.
+    const temperature = modelStripsTemperature(model) ? undefined : 0;
+    // import.meta.url points to compile.js in built/installed CLI, compile.ts
+    // when running via tsx / ts-node in dev. Resolve the sibling template
+    // with the same extension so both paths succeed without hardcoding .js.
+    const compilePath = url.fileURLToPath(import.meta.url);
+    const ext = path.extname(compilePath); // '.js' in built CLI, '.ts' under tsx
+    const promptTemplatePath = path.resolve(path.dirname(compilePath), `compile-templates${ext}`);
+    const promptTemplateContentHash = readPromptTemplateContentHash(promptTemplatePath);
+    return computeCompileWorkerFingerprint({
+      model,
+      ...(temperature !== undefined ? { temperature } : {}),
+      // seed: omitted — Anthropic does not expose seed on the messages API.
+      // Advisory slot reserved for Phase 2 providers (OpenAI, Ollama).
+      promptTemplateContentHash,
+    });
+  };
+
+  // Emit a single compile_run ledger event after manifest write. Fire-and-forget
+  // per the writer contract (lesson-b1bae311 — telemetry is a sensor, not an
+  // actuator). source: 'lint' (compile is part of the lint command family);
+  // activity_name carries the provider so audit consumers can group by worker
+  // type. session_id is read best-effort from `.totem/ledger/.session-id` so
+  // SessionStart-hook'd runs get cross-event correlation; CI / hookless runs
+  // emit without it (matches `logMcpCall` in packages/mcp/src/ledger-writer.ts).
+  // agent_source is intentionally omitted — compile.ts has no reliable way to
+  // attribute its caller to a seat (seat-id ∪ {human}, amended ADR-078) until
+  // A.3.c wires the orchestrator → telemetry correlation. Schema (compile_run)
+  // shipped in Proposal 278 § Action 3 (vi).
+  const logCompileRun = (totemDir: string): void => {
+    try {
+      const provider = config.orchestrator?.provider ?? 'unknown';
+      const sessionId = readSessionId(totemDir);
+      appendLedgerEvent(totemDir, {
+        timestamp: new Date().toISOString(),
+        type: 'compile_run',
+        activity_name: provider,
+        source: 'lint',
+        justification: '',
+        ...(sessionId !== undefined ? { session_id: sessionId } : {}),
+      });
+      // totem-context: fire-and-forget telemetry; ledger write failure must not crash compile (lesson-b1bae311)
+    } catch (err) {
+      void err;
+    }
+  };
+
+  // Guard: throw a specific NO_LESSONS_DIR error instead of a generic
+  // TotemParseError when lessonsDir is absent or is not a directory.
+  // Called before both generateInputHash sites so both branches get the
+  // same explicit error with the same recovery hint.
+  const ensureLessonsDir = (dir: string): void => {
+    if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+      throw new TotemError(
+        'NO_LESSONS_DIR',
+        `Lessons directory not found: ${dir}`,
+        'Run `totem lesson extract <pr>` to create lessons, or create .totem/lessons/ manually.',
+      );
+    }
+  };
+
+  const cwd = options.cwd ?? process.cwd();
   const configPath = resolveConfigPath(cwd);
+  if (isGlobalConfigPath(configPath)) {
+    throw new TotemConfigError(
+      'Cannot compile rules without a local project.',
+      "Run 'totem init' to create a local .totem/ directory first.",
+      'CONFIG_MISSING',
+    );
+  }
   loadEnv(cwd);
   const config = await loadConfig(configPath);
 
-  const totemDir = path.join(cwd, config.totemDir);
-  const lessonsPath = path.join(totemDir, 'lessons.md');
+  // Engine boot (mmnto-ai/totem#1794). The compile-time smoke gate
+  // (compiler.ts) executes ast-grep against each rule's `badExample`,
+  // which dispatches `extensionToLanguage()` and depends on
+  // pack-contributed language registrations being in place. Wire here
+  // — single seal covers the worker fan-out (Promise.all in same
+  // process inherits module state, no fork).
+  const { bootstrapEngine } = await import('../utils/bootstrap-engine.js');
+  const configRoot = path.dirname(configPath);
+  await bootstrapEngine(config, configRoot);
+
+  const totemDir = path.join(configRoot, config.totemDir);
   const rulesPath = path.join(totemDir, COMPILED_RULES_FILE);
 
-  if (!fs.existsSync(lessonsPath)) {
-    log.warn(TAG, 'No lessons.md found. Nothing to compile.');
+  // mmnto-ai/totem#1656: shared helper for severity-override telemetry.
+  // Closes over the per-invocation `totemDir` (configRoot-relative per
+  // mmnto-ai/totem#1796) so records land next to the lessons + compiled
+  // rules whether compile runs from the repo root or a monorepo
+  // sub-directory. Called from both the
+  // local compile path (via the `onSeverityOverride` callback on
+  // CompileLessonDeps) and the cloud compile path (inline when
+  // buildCompiledRule reports a severityOverride on the cloud result).
+  const writeSeverityOverrideTelemetry = (
+    lesson: { heading: string; hash: string },
+    event: { from: 'error' | 'warning' | undefined; to: 'error' | 'warning' },
+  ): void => {
+    try {
+      const tempDir = path.join(totemDir, 'temp');
+      fs.mkdirSync(tempDir, { recursive: true });
+      const entry = {
+        type: 'severity-override' as const,
+        timestamp: new Date().toISOString(),
+        lessonHash: lesson.hash,
+        lessonHeading: lesson.heading,
+        from: event.from,
+        to: event.to,
+      };
+      fs.appendFileSync(
+        path.join(tempDir, 'telemetry.jsonl'),
+        JSON.stringify(entry) + '\n',
+        'utf-8',
+      ); // totem-context: intentional best-effort telemetry sink — severity-override records are a prompt-tuning signal, not correctness-critical. Sink failures (disk full, permissions, concurrent writer) must not interfere with compile results (mmnto-ai/totem#1656).
+    } catch (err) {
+      log.warn(
+        TAG,
+        `Failed to write severity-override telemetry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
+  // mmnto-ai/totem#1665: scope-override telemetry, mirroring the
+  // severity-override helper above. Records lessons where author-declared
+  // **Scope:** in the lesson body diverged from the LLM's emitted fileGlobs.
+  // Frequent fires mean the LLM is dropping or hallucinating Scope entries
+  // and the prompt directive needs sharpening.
+  const writeScopeOverrideTelemetry = (
+    lesson: { heading: string; hash: string },
+    event: { from: string[] | undefined; to: string[] },
+  ): void => {
+    // totem-context: intentional cleanup — telemetry sink failures (disk full,
+    // permissions, concurrent writer) must not block compile correctness.
+    // Mirrors writeSeverityOverrideTelemetry's posture (mmnto-ai/totem#1656).
+    try {
+      const tempDir = path.join(totemDir, 'temp');
+      fs.mkdirSync(tempDir, { recursive: true });
+      const entry = {
+        type: 'scope-override' as const,
+        timestamp: new Date().toISOString(),
+        lessonHash: lesson.hash,
+        lessonHeading: lesson.heading,
+        from: event.from,
+        to: event.to,
+      };
+      fs.appendFileSync(
+        path.join(tempDir, 'telemetry.jsonl'),
+        JSON.stringify(entry) + '\n',
+        'utf-8',
+      );
+    } catch (err) {
+      log.warn(
+        TAG,
+        `Failed to write scope-override telemetry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Best-effort sink: swallow expected IO failures (disk full, permissions,
+      // concurrent writer races) so telemetry never blocks compile. Unexpected
+      // errors propagate per Tenet 4 — silently swallowing TypeErrors or
+      // assertion failures would mask real bugs in the telemetry shape.
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      const expectedIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOSPC', 'EBUSY', 'EROFS']);
+      if (!(err instanceof Error) || !code || !expectedIoCodes.has(code)) {
+        throw err;
+      }
+    }
+  };
+
+  // mmnto-ai/totem#1682: Stage 4 telemetry sink. Records the four-outcome
+  // verifier verdict per lesson so prompt-tuning workflows can spot
+  // patterns of out-of-scope archives or candidate-debt clusters. Same
+  // best-effort discipline as severity-override / scope-override above —
+  // sink failures must not interfere with compile correctness.
+  const writeStage4Telemetry = (
+    lesson: { heading: string; hash: string },
+    result: import('@mmnto/totem').Stage4VerificationResult,
+  ): void => {
+    try {
+      const tempDir = path.join(totemDir, 'temp');
+      fs.mkdirSync(tempDir, { recursive: true });
+      const entry = {
+        type: 'stage4-verify' as const,
+        timestamp: new Date().toISOString(),
+        lessonHash: lesson.hash,
+        // Lesson heading is user-authored prose. CR mmnto-ai/totem#1757 R2
+        // — same vector class as the path sample below; sanitize to keep
+        // `.totem/temp/telemetry.jsonl` safe to tail in a terminal.
+        lessonHeading: sanitizeForTerminal(lesson.heading),
+        outcome: result.outcome,
+        baselineMatchCount: result.baselineMatches.length,
+        inScopeMatchCount: result.inScopeMatches.length,
+        candidateDebtCount: result.candidateDebtLines.length,
+        // Sample only — full path lists can be reconstructed by re-running
+        // the verifier; the telemetry record is for aggregate signal, not
+        // forensic recovery. `baselineMatches` is `readonly string[]`
+        // (repo-relative paths, not source code per
+        // `Stage4VerificationResult.baselineMatches` in
+        // `packages/core/src/stage4-verifier.ts:78`). Sanitize even so —
+        // a hostile filename could plant CSI bytes that survive into
+        // `.totem/temp/telemetry.jsonl` and re-emerge when the file is
+        // tailed in a terminal (CR mmnto-ai/totem#1757 R1, mirrors the
+        // #1743 R4-R7 sanitization wave).
+        baselineMatchSample: result.baselineMatches.slice(0, 5).map(sanitizeForTerminal),
+      };
+      fs.appendFileSync(
+        path.join(tempDir, 'telemetry.jsonl'),
+        JSON.stringify(entry) + '\n',
+        'utf-8',
+      );
+    } catch (err) {
+      log.warn(
+        TAG,
+        `Failed to write stage4-verify telemetry: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      const code = (err as NodeJS.ErrnoException | undefined)?.code;
+      const expectedIoCodes = new Set(['ENOENT', 'EACCES', 'EPERM', 'ENOSPC', 'EBUSY', 'EROFS']);
+      if (!(err instanceof Error) || !code || !expectedIoCodes.has(code)) {
+        throw err;
+      }
+    }
+  };
+
+  // mmnto-ai/totem#1682: Stage 4 verifier filesystem callbacks. Lazily
+  // initialized once per compile run so the file enumeration is cached
+  // across all lessons compiled in this batch (T1 walks per-rule; T5 in
+  // mmnto-ai/totem#1686 introduces cross-rule batching). The callbacks
+  // resolve to the consumer's local working tree via the git enumeration
+  // adapter (`safeExec` call below), which gives us the canonical project
+  // file set with `.gitignore` already applied; falling back to a
+  // recursive walk would scan `node_modules/` and other non-project trees.
+  //
+  // CR mmnto-ai/totem#1757 R1: anchor enumeration AND file reads at the
+  // git repository root, not `cwd`. When `compileCommand` is invoked with
+  // a nested `cwd` (e.g. `compileCommand({ cwd: './packages/cli' })`),
+  // `git ls-files --recurse-submodules` from that nested directory returns
+  // paths relative to that directory. But every compiled rule's
+  // `fileGlobs` is repo-relative by construction (lessons declare scopes
+  // like `packages/**/*.ts`), so a nested-relative file list breaks
+  // `fileMatchesGlobs()` in `stage4-verifier.ts` and silently
+  // misclassifies in-scope hits as `'no-matches'`. Resolve to the repo
+  // top-level once via `git rev-parse --show-toplevel` and use it for both
+  // the file enumeration and the working-tree `readFile`.
+  let stage4RepoRootCache: string | undefined;
+  let stage4FilesCache: readonly string[] | undefined;
+  // CR mmnto-ai/totem#1757 R3: cache file CONTENTS across rules in the
+  // batch, not just file paths. The verifier runs per Pipeline 2/3 rule;
+  // without this, every rule re-reads the same on-disk files, so total
+  // disk I/O is O(rules × files). Lazy `Promise<string>` map keeps the
+  // memory footprint bounded to files actually inspected by ANY rule —
+  // no upfront slurp of the whole tree. Cache lifetime is one compile
+  // run (function-local) and is GC'd when `compileCommand` returns.
+  // T5 (mmnto-ai/totem#1686) owns bounded LRU eviction + streaming
+  // short-circuit if a million-file monorepo ever runs into the
+  // "files-actually-touched" memory bound.
+  const stage4ReadFileCache = new Map<string, Promise<string>>();
+  // mmnto-ai/totem#1683: resolved baseline cached once per compile run so
+  // every rule in the batch sees the same composed defaults + .totemignore
+  // directives + config overrides. Read happens lazily in
+  // `buildStage4Verifier` because `cwd`/`repoRoot` are only safe to resolve
+  // once the verifier is actually invoked (compile may bail out earlier).
+  let stage4BaselineCache: import('@mmnto/totem').Stage4Baseline | undefined;
+  // Manifest exclusions (mmnto-ai/totem#1765): exclude the manifest file
+  // from the corpus before rules run, so a regex rule's own `badExample`
+  // text in the manifest doesn't self-match and route every regex rule
+  // to `outcome: 'out-of-scope'` regardless of real codebase risk.
+  //
+  // The default `.totem/compiled-rules.json` ships in
+  // `STAGE4_MANIFEST_EXCLUSIONS`. Consumers who override `config.totemDir`
+  // (e.g. `.my-totem`) put their manifest at `<totemDir>/compiled-rules.json`,
+  // which doesn't match the default — so we ALSO add the active manifest
+  // path computed from config. CR mmnto-ai/totem#1766 R1 catch.
+  //
+  // mmnto-ai/totem#1814 (GCA HIGH on auto-VP PR for mmnto-ai/totem#1796): the
+  // comparison is against the manifest scan output (line 705), which is
+  // repo-root-relative. When `cwd != configRoot != repoRoot` (monorepo
+  // subpackage invocation), joining `config.totemDir` alone produces e.g.
+  // `.totem/compiled-rules.json` while the scan returns
+  // `packages/sub/.totem/compiled-rules.json`. Resolution: compute
+  // `activeManifestPath` lazily AFTER `repoRoot` is resolved, then use
+  // `path.relative(repoRoot, …)` so the exclusion key matches the
+  // repo-relative paths from the scan. Mirrors the canonical pattern at
+  // `first-lint-promote-runner.ts:99`.
+  const buildStage4Verifier = () => {
+    return async (rule: import('@mmnto/totem').CompiledRule) => {
+      if (stage4RepoRootCache === undefined) {
+        // `safeExec` is synchronous (sync `spawnSync` wrapper at
+        // `packages/core/src/sys/exec.ts:48`) and returns the trimmed
+        // stdout string directly — no `await`, no `.stdout` unwrap.
+        // Fail-loud if `cwd` is not inside a git repo.
+        const repoRoot: string = safeExec('git', ['rev-parse', '--show-toplevel'], {
+          cwd,
+          env: { ...process.env, LC_ALL: 'C' },
+        });
+        stage4RepoRootCache = repoRoot;
+      }
+      const repoRoot = stage4RepoRootCache;
+      if (stage4FilesCache === undefined) {
+        // Compute repo-relative manifest path now that `repoRoot` is
+        // resolved (mmnto-ai/totem#1814). The exclusion set is built
+        // once per compile run alongside `stage4FilesCache`; subsequent
+        // rule invocations reuse the cached file list.
+        const activeManifestPath = path
+          .relative(repoRoot, path.join(totemDir, COMPILED_RULES_FILE))
+          .replace(/\\/g, '/');
+        const stage4ManifestExclusionSet = new Set<string>([
+          ...STAGE4_MANIFEST_EXCLUSIONS,
+          activeManifestPath,
+        ]);
+        // Single git invocation per compile run; reused across all rules
+        // in the batch. `LC_ALL=C` keeps output stable across locales.
+        // Fail-loud if git is unavailable — this gate is the ADR-091
+        // substrate's load-bearing invariant.
+        //
+        // `-z` (NUL-separator) is load-bearing: without it, git C-quotes
+        // filenames containing non-ASCII bytes, control characters, or
+        // whitespace (e.g. `"src/\303\244.ts"` for `src/ä.ts`), which
+        // breaks `path.join(repoRoot, file)` with ENOENT. `-z` emits
+        // raw bytes separated by NUL with NO escaping, so split on `\0`.
+        // (Sonnet pre-push review on the F2 fix.)
+        const lsOutput: string = safeExec('git', ['ls-files', '-z', '--recurse-submodules'], {
+          cwd: repoRoot,
+          env: { ...process.env, LC_ALL: 'C' },
+        });
+        stage4FilesCache = lsOutput
+          .split('\0')
+          .filter((line) => line.length > 0 && !stage4ManifestExclusionSet.has(line));
+      }
+      if (stage4BaselineCache === undefined) {
+        // mmnto-ai/totem#1683: load consumer overrides once per compile run.
+        // `.totemignore` is optional — missing file is treated as no
+        // directives. Read failures other than ENOENT propagate (a
+        // permission error or corrupt file is a real environment issue,
+        // not a silent-skip case).
+        const ignorePath = path.join(repoRoot, '.totemignore');
+        let ignoreContent = '';
+        try {
+          ignoreContent = await fs.promises.readFile(ignorePath, 'utf-8');
+        } catch (err) {
+          const code = (err as NodeJS.ErrnoException).code;
+          if (code !== 'ENOENT') throw err;
+        }
+        const ignoreDirectives = parseStage4BaselineDirectives(ignoreContent);
+        const configOverrides = config.review?.stage4Baseline;
+        stage4BaselineCache = resolveStage4Baseline({
+          ignoreDirectives,
+          configExtend: configOverrides?.extend,
+          configExclude: configOverrides?.exclude,
+        });
+      }
+      return verifyAgainstCodebase(rule, stage4BaselineCache, {
+        listFiles: async () => stage4FilesCache!,
+        readFile: (file: string) => {
+          // Read from the working tree, anchored at the repo root so the
+          // repo-relative paths returned by the
+          // `git ls-files --recurse-submodules` enumeration above
+          // resolve correctly even when `compileCommand` was invoked with
+          // a nested `cwd`. Throws on missing file (Tenet 4 fail-loud) —
+          // the verifier wraps the error with the offending filename in
+          // its own throw site. The pending Promise is cached so
+          // subsequent rules in the same batch share the read.
+          let pending = stage4ReadFileCache.get(file);
+          if (!pending) {
+            pending = fs.promises.readFile(path.join(repoRoot, file), 'utf-8');
+            stage4ReadFileCache.set(file, pending);
+          }
+          return pending;
+        },
+        workingDirectory: repoRoot,
+      });
+    };
+  };
+
+  // ─── --refresh-manifest primitive (mmnto-ai/totem#1587) ─────────
+  // No-LLM path that recomputes `output_hash` from current
+  // `compiled-rules.json` state. Supports the postmerge inline-archive
+  // workflow where a curation script mutates `status: 'archived'` on a
+  // rule directly. Preflights the manifest read before any write
+  // (mmnto-ai/totem#1601 CR pattern): missing/corrupt manifest fails
+  // loud without side effects.
+  if (options.refreshManifest) {
+    if (options.force) {
+      throw new TotemConfigError(
+        '--refresh-manifest cannot be combined with --force.',
+        '--refresh-manifest is a no-LLM primitive that only recomputes output_hash. Use one or the other, not both.',
+        'CONFIG_INVALID',
+      );
+    }
+    const manifestPath = path.join(totemDir, 'compile-manifest.json');
+    if (!fs.existsSync(rulesPath)) {
+      throw new TotemError(
+        'NO_RULES',
+        `No compiled-rules.json at ${rulesPath}.`,
+        "Run 'totem lesson compile' first to generate the rules file.",
+      );
+    }
+    // Validate compiled-rules.json by parsing it through the schema
+    // BEFORE refreshing the manifest. Without this, a corrupt rules file
+    // gets its new byte-level hash written to the manifest and
+    // verify-manifest stops surfacing the corruption — silent drift.
+    // loadCompiledRulesFile throws TotemParseError on malformed JSON or
+    // schema violations (CR finding on PR mmnto-ai/totem#1629).
+    const compiledRulesFile = loadCompiledRulesFile(rulesPath);
+    const compileManifest = readCompileManifest(manifestPath);
+    const freshOutputHash = generateOutputHash(rulesPath);
+    if (compileManifest.output_hash === freshOutputHash) {
+      log.info(TAG, 'Manifest already fresh — no changes.');
+      return;
+    }
+    compileManifest.output_hash = freshOutputHash;
+    compileManifest.compiled_at = new Date().toISOString();
+    compileManifest.rule_count = compiledRulesFile.rules.length;
+    writeCompileManifest(manifestPath, compileManifest);
+    log.success(TAG, `Manifest refreshed: output_hash ${freshOutputHash.slice(0, 8)}…`);
     return;
   }
 
-  const content = fs.readFileSync(lessonsPath, 'utf-8');
-  const lessons = parseLessonsFile(content);
+  const lessons = readAllLessons(totemDir);
+
+  // Ingest cursor instructions if --from-cursor
+  if (options.fromCursor) {
+    const { scanCursorInstructions } = await import('@mmnto/totem');
+    const cursorInstructions = scanCursorInstructions(cwd);
+    if (cursorInstructions.length > 0) {
+      log.info(TAG, `Found ${cursorInstructions.length} Cursor instruction(s)`); // totem-ignore
+      for (const instr of cursorInstructions) {
+        const body = instr.body + (instr.globs ? `\n\nFile scope: ${instr.globs.join(', ')}` : '');
+        lessons.push({
+          index: lessons.length,
+          heading: `[cursor] ${instr.heading}`,
+          tags: ['cursor', 'ingested'],
+          body,
+          raw: `## Lesson — [cursor] ${instr.heading}\n\n**Tags:** cursor, ingested\n\n${body}`,
+          sourcePath: instr.source,
+        });
+      }
+    } else {
+      log.dim(TAG, 'No .cursorrules or .cursor/rules/*.mdc files found.');
+    }
+  }
 
   if (lessons.length === 0) {
-    log.warn(TAG, 'No lessons found in lessons.md.');
-    return;
+    throw new TotemError(
+      'NO_LESSONS',
+      'No lessons found. Nothing to compile.',
+      'Add lessons with `totem extract <pr>` or create .totem/lessons/*.md files manually.',
+    );
   }
 
-  log.info(TAG, `Found ${lessons.length} lessons in lessons.md`);
+  log.info(TAG, `Found ${lessons.length} lessons`); // totem-ignore
+
+  // ─── Telemetry-driven re-compile (mmnto/totem#1131, mmnto/totem#1235) ──
+  // Both `--upgrade` (single hash) and `upgradeBatch` (array of hashes) narrow
+  // `lessonsInScope` to only the target lessons, bypass the cache for those
+  // targets, and thread per-lesson telemetry directives into Pipeline 2 prompts.
+  // All other rules pass through unchanged.
+  //
+  // Internally both paths produce `upgradeTargets`: a Map from hash to the
+  // optional telemetry prefix for that lesson. The compile loop uses this map
+  // instead of the old `upgradeTargetHash` scalar so batch mode works without
+  // duplicating the cache-bypass / outcome-tracking / stale-splice logic.
+  //
+  // `lessonsInScope` is what we validate and iterate for compilation. It starts
+  // as the full lesson set (default behavior) and is narrowed to just the
+  // target lesson(s) so that:
+  //   1. An unrelated invalid lesson can't abort the upgrade (validateLessons)
+  //   2. An unrelated cache-miss lesson doesn't leak into the compile batch
+  //   3. `totem doctor --pr` branches stay scoped to the flagged rules only
+  // The full `lessons` array is still used for `currentHashes` pruning so the
+  // other compiled rules remain in newRules.
+
+  // Validate that incompatible option combos are rejected up front.
+  if (options.upgradeBatch) {
+    if (options.upgrade) {
+      throw new TotemConfigError(
+        '--upgrade cannot be combined with upgradeBatch.',
+        'Use one or the other, not both.',
+        'CONFIG_INVALID',
+      );
+    }
+    if (options.cloud) {
+      throw new TotemError(
+        'UPGRADE_CLOUD_UNSUPPORTED',
+        'upgradeBatch is not supported with --cloud.',
+        'Run upgradeBatch without --cloud. The cloud worker cannot thread per-lesson telemetry directives yet (mmnto/totem#1221).',
+      );
+    }
+    if (options.force) {
+      throw new TotemConfigError(
+        'upgradeBatch cannot be combined with --force.',
+        'The upgrade path already bypasses the cache for target rules only.',
+        'CONFIG_INVALID',
+      );
+    }
+  }
+
+  // upgradeTargets: hash -> optional telemetry prefix. Set for both single and batch modes.
+  let upgradeTargets: Map<string, string | undefined> | undefined;
+  let lessonsInScope: typeof lessons = lessons;
+
+  if (options.upgrade) {
+    if (options.cloud) {
+      throw new TotemError(
+        'UPGRADE_CLOUD_UNSUPPORTED',
+        '--upgrade is not supported with --cloud.',
+        'Run `totem compile --upgrade <hash>` without --cloud. The cloud worker cannot thread a per-lesson telemetry directive yet (mmnto/totem#1221).',
+      );
+    }
+    if (options.force) {
+      // --force empties the cache before scoped eviction runs, silently turning
+      // --upgrade into a full recompile. Reject the combo so intent is explicit.
+      throw new TotemConfigError(
+        '--upgrade cannot be combined with --force.',
+        'Run `totem compile --upgrade <hash>` without --force. The upgrade path already bypasses the cache for the target rule only, preserving every other compiled rule.',
+        'CONFIG_INVALID',
+      );
+    }
+
+    const target = options.upgrade.toLowerCase();
+    const matches = lessons.filter((l) => {
+      const lessonHash = hashLesson(l.heading, l.body).toLowerCase();
+      return lessonHash === target || lessonHash.startsWith(target);
+    });
+
+    if (matches.length === 0) {
+      throw new TotemError(
+        'UPGRADE_HASH_NOT_FOUND',
+        `No lesson matches hash '${options.upgrade}'.`,
+        'Run `totem doctor` to see flagged upgrade candidates, then re-run with the printed hash.',
+      );
+    }
+    if (matches.length > 1) {
+      const found = matches
+        .map((m) => `${hashLesson(m.heading, m.body)} (${m.heading})`)
+        .join(', ');
+      throw new TotemError(
+        'UPGRADE_HASH_AMBIGUOUS',
+        `Hash prefix '${options.upgrade}' matches ${matches.length} lessons: ${found}`,
+        'Use the full hash to disambiguate.',
+      );
+    }
+
+    const upgradeTargetHash = hashLesson(matches[0]!.heading, matches[0]!.body);
+    lessonsInScope = [matches[0]!];
+    log.info(TAG, `--upgrade: targeting ${upgradeTargetHash} (${matches[0]!.heading})`);
+
+    // Load existing telemetry to build the directive
+    let telemetryPrefix: string | undefined;
+    try {
+      const { loadRuleMetrics } = await import('@mmnto/totem');
+      const metricsFile = loadRuleMetrics(totemDir);
+      const metric = metricsFile.rules[upgradeTargetHash];
+      if (metric?.contextCounts) {
+        telemetryPrefix = buildTelemetryPrefix(metric.contextCounts);
+        log.dim(TAG, `--upgrade: telemetry directive prepared (${telemetryPrefix.length} chars)`);
+      } else {
+        log.warn(
+          TAG,
+          `--upgrade: no telemetry found for ${upgradeTargetHash}; recompiling without directive.`,
+        );
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn(TAG, `--upgrade: failed to load telemetry — ${msg}`);
+    }
+    upgradeTargets = new Map([[upgradeTargetHash, telemetryPrefix]]);
+  } else if (options.upgradeBatch) {
+    upgradeTargets = new Map(
+      options.upgradeBatch.map((e) => [e.hash.toLowerCase(), e.telemetryPrefix]), // totem-context: hash normalization, not a file path filter
+    );
+    // Narrow lessons to those matching the batch hashes. hashLesson output is
+    // already lowercase hex so no extra normalization needed.
+    lessonsInScope = lessons.filter((l) => upgradeTargets!.has(hashLesson(l.heading, l.body)));
+    const matchedHashes = new Set(lessonsInScope.map((l) => hashLesson(l.heading, l.body)));
+    const missingHashes = [...upgradeTargets.keys()].filter((hash) => !matchedHashes.has(hash));
+    if (missingHashes.length > 0) {
+      throw new TotemError(
+        'UPGRADE_HASH_NOT_FOUND',
+        `No lesson matches hash(es): ${missingHashes.join(', ')}.`,
+        'Regenerate upgrade candidates or remove stale hashes from upgradeBatch.',
+      );
+    }
+    log.info(TAG, `upgradeBatch: targeting ${lessonsInScope.length} lesson(s)`);
+  }
+
+  // ─── Pre-compilation gate: validate Pipeline 1 metadata ──
+  // For --upgrade, scope validation to the target so unrelated invalid lessons
+  // cannot block the upgrade (mmnto/totem#1234 CR finding).
+  {
+    const { validateLessons } = await import('@mmnto/totem');
+    const lintResult = validateLessons(lessonsInScope);
+    const errors = lintResult.diagnostics.filter((d) => d.severity === 'error');
+    const warnings = lintResult.diagnostics.filter((d) => d.severity === 'warning');
+    for (const d of warnings) {
+      log.warn(TAG, `${d.lessonHeading}: [${d.field}] ${d.message}`);
+    }
+    if (errors.length > 0) {
+      for (const d of errors) {
+        log.error('Totem Error', `${d.lessonHeading}: [${d.field}] ${d.message}`);
+      }
+      throw new TotemError(
+        'LINT_LESSONS_FAILED',
+        `${errors.length} lesson(s) have invalid metadata. Fix them before compiling.`,
+        'Run `totem lint-lessons` for details.',
+      );
+    }
+  }
+
+  // ─── Test fixture lookup (ADR-065) ──
+  const testsDir = path.join(totemDir, 'tests');
+  const testedHashes = getTestedHashes(testsDir, fs, path);
+
+  const scaffoldDeps: AutoScaffoldDeps = {
+    fs,
+    path,
+    testsDir,
+    cwd,
+    testedHashes,
+    log,
+    extractRuleExamples,
+    deriveVirtualFilePath,
+    scaffoldFixture,
+    scaffoldFixturePath,
+  };
+
+  // Track the terminal outcome per upgrade target. For single --upgrade, the
+  // map has one entry. For upgradeBatch, it has one entry per target. Default
+  // 'noop' covers the case where a target was never enqueued.
+  const upgradeOutcomes = new Map<string, UpgradeStatus>(
+    upgradeTargets ? [...upgradeTargets.keys()].map((h) => [h, 'noop' as UpgradeStatus]) : [],
+  );
 
   // ─── Phase 1: Regex compilation (requires orchestrator) ──
   if (config.orchestrator) {
-    const existingRules = options.force ? [] : loadCompiledRules(rulesPath);
+    // Always load the existing file so lifecycle fields (status,
+    // archivedReason, archivedAt) survive --force recompile (mmnto-ai/
+    // totem#1587). The cache-skip logic below gates on !options.force so
+    // every lesson still goes through the compile loop under --force;
+    // buildCompiledRule then pulls the lifecycle fields from `existing`
+    // onto the new rule via preserveLifecycleFields.
+    const existingFile: CompiledRulesFile = loadCompiledRulesFile(rulesPath);
+    const existingRules = existingFile.rules;
     const existingByHash = new Map(existingRules.map((r) => [r.lessonHash, r]));
+    // mmnto/totem#1280 + mmnto-ai/totem#1481: in-memory nonCompilable is
+    // `Map<hash, {title, reasonCode, reason?}>` so every write path carries
+    // the full 4-tuple. The schema's Read transform normalizes legacy
+    // strings and 2-tuples to the 4-tuple shape (reasonCode:
+    // 'legacy-unknown') before we reach this block, so existingFile.
+    // nonCompilable is always 4-tuple-shaped here.
+    //
+    // --force resets the nonCompilable ledger so previously-failed
+    // lessons get re-attempted with whatever prompt improvements landed.
+    // Failures that happen this pass re-populate the map.
+    const nonCompilableMap = new Map<string, NonCompilableMapValue>(
+      options.force
+        ? []
+        : (existingFile.nonCompilable ?? []).map((entry) => [
+            entry.hash,
+            { title: entry.title, reasonCode: entry.reasonCode, reason: entry.reason },
+          ]),
+    );
 
-    const toCompile: Array<{ index: number; heading: string; body: string; hash: string }> = [];
+    // Note: we do NOT delete the --upgrade target from existingByHash here.
+    // buildCompiledRule in @mmnto/totem looks up the old entry to preserve
+    // metadata (createdAt, audit lineage). Deleting would make the upgraded
+    // rule look brand-new and break garbage-collection heuristics. Instead,
+    // we bypass the cache check for the target inside the loop below.
 
-    for (const lesson of lessons) {
+    const toCompile: LessonInput[] = [];
+
+    // For --upgrade / upgradeBatch, iterate only the target lesson(s) so
+    // unrelated cache-miss lessons don't leak into the compile batch
+    // (mmnto/totem#1234 CR finding). Upgrade targets always bypass the cache --
+    // the telemetry directive may unlock a pattern the compiler couldn't
+    // produce on the first pass.
+    for (const lesson of lessonsInScope) {
       const hash = hashLesson(lesson.heading, lesson.body);
-      if (!existingByHash.has(hash)) {
-        toCompile.push({ index: lesson.index, heading: lesson.heading, body: lesson.body, hash });
+      if (!upgradeTargets?.has(hash)) {
+        // --force bypasses both caches: every lesson re-enters the
+        // compile loop so pattern regenerates, while buildCompiledRule
+        // pulls lifecycle fields forward from the existingByHash lookup
+        // (mmnto-ai/totem#1587).
+        if (!options.force && existingByHash.has(hash)) continue; // already compiled
+        if (!options.force && nonCompilableMap.has(hash)) continue; // cached as non-compilable
       }
+      toCompile.push({ index: lesson.index, heading: lesson.heading, body: lesson.body, hash });
     }
 
     if (toCompile.length === 0) {
-      log.success(TAG, `All ${lessons.length} lessons already compiled. Use --force to recompile.`); // totem-ignore
-    } else {
-      log.info(
+      // mmnto/totem#1281: even with no lessons to compile, stale entries left
+      // over from a previous run still need to be drained. Two cases share
+      // this no-op stall:
+      //  1. Stale `nonCompilable` entries from lessons that were edited or
+      //     removed (the original ticket scope).
+      //  2. Stale compiled rules whose source lesson has been removed
+      //     entirely — pointed out by GCA on PR #1331 review. Same
+      //     inconsistency vs. the active-compile branch, same fix.
+      // Without this, stale entries survive forever until some future compile
+      // run happens to have real work to do. Both counts flow into the
+      // success log so the reported state matches disk state.
+      let reportedNonCompilable = nonCompilableMap.size;
+      let reportedCompiled = existingRules.length;
+      if (!options.raw) {
+        const currentHashes = new Set(lessons.map((l) => hashLesson(l.heading, l.body)));
+        const { fresh: freshRules, pruned: rulesPruned } = pruneStaleRules(
+          existingRules,
+          currentHashes,
+        );
+        const { fresh: freshNonCompilable, drained } = pruneStaleNonCompilable(
+          nonCompilableMap,
+          currentHashes,
+        );
+
+        // mmnto/totem#1337: detect "pure input-hash drift" — the case where
+        // a lesson file was added or removed but produced no rule/nonCompilable
+        // churn (e.g. a user deleted a lesson whose rule was already manually
+        // removed, or added a lesson that never got compiled). Both rulesPruned
+        // and drained will be zero, so the pre-1.14.3 refresh guard would skip
+        // the manifest write, leaving verify-manifest to fail on the next
+        // git push. Fix: refresh the manifest on drift even when the rules
+        // file is untouched.
+        //
+        // Carefully partition the writes:
+        //   - compiled-rules.json is rewritten ONLY when something was pruned
+        //   - compile-manifest.json is rewritten when EITHER something was
+        //     pruned OR the input_hash drifted
+        // Rewriting the rules file on pure drift would be a spurious touch
+        // that invalidates mtime-based caches downstream.
+        const lessonsDir = path.join(totemDir, 'lessons');
+        const manifestPath = path.join(totemDir, 'compile-manifest.json');
+        ensureLessonsDir(lessonsDir);
+        // Pass cwd so the producer hashes the same git-tracked set the
+        // consumers (verify-manifest/lint/status) check — keeps producer and
+        // consumer symmetric even when compile runs with an untracked lesson
+        // present (mmnto-ai/totem#2051 / mmnto-ai/totem#2055).
+        const currentInputHash = generateInputHash(lessonsDir, cwd);
+        let existingManifestInputHash: string | null = null;
+        try {
+          existingManifestInputHash = readCompileManifest(manifestPath).input_hash;
+        } catch (err) {
+          // ONLY swallow "manifest does not exist" (ENOENT) — everything else
+          // bubbles up so the user sees a loud failure rather than silently
+          // having their file overwritten (Tenet 4: Fail Loud, Never Drift).
+          //
+          // readCompileManifest wraps ENOENT from readJsonSafe into a
+          // TotemParseError with code 'PARSE_FAILED', preserving the original
+          // NodeJS.ErrnoException in `.cause`. Checking the cause chain
+          // (rather than err.code or a message-substring match) correctly
+          // distinguishes missing-file from:
+          //   - corrupted JSON (cause is a SyntaxError with no `.code`)
+          //   - schema mismatch (cause is a ZodError with no `.code`)
+          //   - permission errors (cause is ErrnoException with code='EACCES'
+          //     or 'EPERM', which are NOT 'ENOENT')
+          //
+          // The message-substring approach GCA proposed on PR review would
+          // couple us to error string wording that could drift in future
+          // refactors; walking the cause chain is the structurally correct
+          // check. Bounded depth prevents pathological infinite cycles.
+          let causeWalker: unknown = err;
+          let isMissingFile = false;
+          for (let depth = 0; depth < 8 && causeWalker instanceof Error; depth++) {
+            if ((causeWalker as NodeJS.ErrnoException).code === 'ENOENT') {
+              isMissingFile = true;
+              break;
+            }
+            causeWalker = (causeWalker as Error & { cause?: unknown }).cause;
+          }
+          if (!isMissingFile) throw err;
+        }
+        const manifestStale = existingManifestInputHash !== currentInputHash;
+
+        if (rulesPruned > 0 || drained > 0) {
+          saveCompiledRulesFile(rulesPath, {
+            version: 1,
+            rules: freshRules,
+            nonCompilable: freshNonCompilable,
+          });
+          if (rulesPruned > 0) {
+            log.dim(
+              TAG,
+              `Pruned ${rulesPruned} stale rule${rulesPruned === 1 ? '' : 's'} (lessons removed)`,
+            ); // totem-context: log only fires when actual draining happens
+          }
+          if (drained > 0) {
+            log.dim(
+              TAG,
+              `Pruned ${drained} stale non-compilable entr${drained === 1 ? 'y' : 'ies'} (lessons edited or removed)`,
+            ); // totem-context: log only fires when actual draining happens
+          }
+        }
+
+        if (rulesPruned > 0 || drained > 0 || manifestStale) {
+          // CR finding on PR mmnto/totem#1331: keep the compile manifest in sync
+          // with the rewritten on-disk state. Post-mmnto/totem#1337, this block
+          // also fires on pure input-hash drift — rewriting only the manifest,
+          // leaving the rules file untouched.
+          const outputHash = generateOutputHash(rulesPath);
+          const postPruneFingerprint = computeFingerprintForManifest();
+          writeCompileManifest(manifestPath, {
+            compiled_at: new Date().toISOString(),
+            model: options.model ?? config.orchestrator?.defaultModel ?? 'unknown',
+            input_hash: currentInputHash,
+            output_hash: outputHash,
+            rule_count: freshRules.length,
+            ...(postPruneFingerprint !== undefined
+              ? { compile_worker_fingerprint: postPruneFingerprint }
+              : {}),
+          });
+          logCompileRun(totemDir);
+          log.dim(TAG, `Manifest: ${currentInputHash.slice(0, 8)}…→${outputHash.slice(0, 8)}…`); // totem-context: provenance trace matches active-compile branch
+          reportedNonCompilable = freshNonCompilable.length;
+          reportedCompiled = freshRules.length;
+        }
+      }
+      log.success(
         TAG,
-        `${toCompile.length} lessons need compilation (${existingRules.length} already compiled)`,
-      );
+        `All ${lessonsInScope.length} lesson(s) in scope already processed (${reportedCompiled} compiled, ${reportedNonCompilable} non-compilable). Use --force to recompile.`,
+      ); // totem-context: success log reports post-prune counts
+    } else {
+      const { createSpinner } = await import('../ui.js');
+      const spinner = await createSpinner(TAG, 'Compiling...');
 
       let compiled = 0;
       let skipped = 0;
       let failed = 0;
+      const skippedLessons: { heading: string; reason?: string }[] = [];
+      // Always initialize newRules from existingRules so transient compile
+      // failures (network/rate-limit/manual reject/example-verification/
+      // cloud parse) under --force do NOT silently drop rules. Each push
+      // site uses upsertRule below to replace-by-lessonHash on successful
+      // compile, so the old rule survives when a new rule fails to
+      // produce (CR finding on PR mmnto-ai/totem#1629). Dangling-archive guard still
+      // runs via the currentHashes filter below.
       const newRules: CompiledRule[] = [...existingRules];
 
       const currentHashes = new Set(lessons.map((l) => hashLesson(l.heading, l.body)));
@@ -159,79 +1321,654 @@ export async function compileCommand(options: CompileOptions): Promise<void> {
       newRules.length = 0;
       newRules.push(...freshRules);
 
-      for (const lesson of toCompile) {
-        const prompt = `${COMPILER_SYSTEM_PROMPT}\n\n## Lesson to Compile\n\nHeading: ${lesson.heading}\n\n${lesson.body}`;
+      // --upgrade: the stale copy is NOT pre-filtered here. If we removed it now
+      // and compilation failed (network error, LLM refusal, parser failure), the
+      // rule would be silently deleted from compiled-rules.json. Instead, we
+      // splice the stale copy inside the `case 'compiled':` handler below, so
+      // the fresh rule only replaces the old one on a successful re-compile.
 
-        const response = await runOrchestrator({
-          prompt,
-          tag: TAG,
-          options,
-          config,
-          cwd,
-        });
+      const coreDeps = {
+        parseCompilerResponse,
+        // mmnto/totem#1291 Phase 3: thread the optional systemPrompt from
+        // compileLesson through to runOrchestrator so the static compiler
+        // template gets cached server-side by Anthropic instead of being
+        // re-billed at full input-token cost on every lesson.
+        runOrchestrator: (prompt: string, systemPrompt?: string) =>
+          runOrchestrator({
+            prompt,
+            systemPrompt,
+            tag: TAG,
+            options,
+            config,
+            cwd,
+            temperature: 0,
+          }),
+        existingByHash,
+        pipeline3Prompt: PIPELINE3_COMPILER_PROMPT,
+        // mmnto-ai/totem#1682: ADR-091 Stage 4 verifier — runs after Layer 3
+        // produces a compiled rule (Pipeline 2 / Pipeline 3 only) and routes
+        // the rule into one of four outcomes based on a deterministic walk
+        // of the consumer's local working tree. Cloud-compile and
+        // pack-build paths leave this absent; consumer-side `totem lint`
+        // runs the verifier later via the pending-verification flow shipped
+        // in T3 (mmnto-ai/totem#1684). The closure caches the file
+        // enumeration across all rules in this batch.
+        verifyStage4: buildStage4Verifier(),
+        callbacks: {
+          onWarn: (heading: string, msg: string) => log.warn(TAG, `[${heading}] ${msg}`),
+          onDim: (heading: string, msg: string) => log.dim(TAG, `[${heading}] ${msg}`),
+          // mmnto-ai/totem#1656: append severity-override telemetry when the
+          // post-LLM override in buildCompiledRule changes the emitted
+          // severity. Uses totemDir (cwd-aware) so records land next to
+          // other telemetry artifacts when compile runs from a sub-directory.
+          // Best-effort — sink failures do not interfere with compile results.
+          onSeverityOverride: writeSeverityOverrideTelemetry,
+          // mmnto-ai/totem#1665: append scope-override telemetry when the
+          // source-Scope override changes the emitted fileGlobs. Same
+          // best-effort discipline as severity above.
+          onScopeOverride: writeScopeOverrideTelemetry,
+          // mmnto-ai/totem#1682: append Stage 4 telemetry tagged
+          // `type: 'stage4-verify'`. Records the four-outcome verdict per
+          // lesson so prompt-tuning can spot out-of-scope-archive clusters
+          // or candidate-debt drift. Same best-effort discipline as the
+          // sibling sinks.
+          onStage4Outcome: writeStage4Telemetry,
+        },
+      };
 
-        if (response == null) {
-          continue;
+      // ─── Cloud compilation (Proposal 188 Phase 2) ───
+      if (options.cloud) {
+        const cloudUrl = options.cloud;
+
+        // Compile manual patterns locally first (zero LLM, instant)
+        const cloudLessons: LessonInput[] = [];
+        for (const lesson of toCompile) {
+          const manualResult = buildManualRule(lesson, existingByHash);
+          if (manualResult.rule) {
+            // Verify rule against inline Example Hit/Miss lines
+            const testResult = verifyRuleExamples(manualResult.rule, lesson.body);
+            if (testResult && !testResult.passed) {
+              log.warn(TAG, `[${lesson.heading}] ${formatExampleFailure(testResult)}`);
+              failed++;
+              continue;
+            }
+            // ADR-065: Pipeline 1 error rules require a test fixture
+            if (manualResult.rule.severity === 'error' && !testedHashes.has(lesson.hash)) {
+              if (options.raw || !autoScaffoldFixture(lesson, manualResult.rule, scaffoldDeps)) {
+                manualResult.rule.severity = 'warning';
+                log.warn(
+                  TAG,
+                  `[${lesson.heading}] Downgraded to warning — no test fixture (ADR-065)`,
+                );
+              }
+            }
+            upsertRule(newRules, manualResult.rule);
+            compiled++;
+            logCompiledRule(log, lesson, manualResult.rule);
+          } else if (manualResult.rejectReason) {
+            log.warn(TAG, `[${lesson.heading}] ${manualResult.rejectReason}`);
+            failed++;
+          } else {
+            cloudLessons.push(lesson);
+          }
         }
 
-        const parsed = parseCompilerResponse(response);
+        // Skip cloud call if all lessons were manual
+        if (cloudLessons.length === 0) {
+          spinner.succeed(
+            `${newRules.length} rules — ${compiled} compiled${failed > 0 ? `, ${failed} failed` : ''} (all manual, no cloud call needed)`,
+          );
+        } else {
+          // Tenet-16 corollary (mmnto-ai/totem-strategy#800 item 1): the model
+          // sent to the cloud worker must come from the caller or config —
+          // never a hardcoded vendor default (the three manifest-provenance
+          // sibling sites fall back to 'unknown'; this one is a live request
+          // parameter, so absence fails loud instead).
+          const cloudModel = options.model ?? config.orchestrator?.defaultModel;
+          if (!cloudModel) {
+            throw new TotemConfigError(
+              'No model specified for cloud compile.',
+              "Provide one with --model, or set a 'defaultModel' in your orchestrator config.",
+              'CONFIG_INVALID',
+            );
+          }
 
-        if (!parsed) {
-          log.warn(TAG, `[${lesson.heading}] Failed to parse LLM response — skipping`); // totem-ignore
-          failed++;
-          continue;
+          log.info(TAG, `Cloud compile: ${cloudLessons.length} lessons → ${cloudUrl}`);
+
+          // Resolve auth token for Cloud Run (uses gcloud identity token or TOTEM_CLOUD_TOKEN env)
+          const cloudToken =
+            process.env['TOTEM_CLOUD_TOKEN'] ??
+            (await (async () => {
+              try {
+                const { safeExec } = await import('@mmnto/totem');
+                return safeExec('gcloud', ['auth', 'print-identity-token']);
+              } catch {
+                return undefined;
+              }
+            })());
+
+          // DLP: scrub secrets from lesson content before sending off-machine
+          const { maskSecrets } = await import('@mmnto/totem');
+          const scrubbedLessons = cloudLessons.map((l) => ({
+            heading: maskSecrets(l.heading),
+            body: maskSecrets(l.body),
+            hash: l.hash,
+          }));
+
+          const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+          if (cloudToken) headers['Authorization'] = `Bearer ${cloudToken}`;
+
+          const response = await fetch(`${cloudUrl}/compile`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify({
+              lessons: scrubbedLessons,
+              prompt: COMPILER_SYSTEM_PROMPT,
+              model: cloudModel,
+              concurrency: CLOUD_CONCURRENCY,
+            }),
+          });
+
+          if (!response.ok) {
+            const text = await response.text();
+            throw new TotemError(
+              'COMPILE_FAILED',
+              `Cloud compile failed: ${text}`,
+              'Check the cloud endpoint.',
+            );
+          }
+
+          const data = (await response.json()) as {
+            results: { hash: string; response: string | null; err?: string }[];
+            stats: { elapsed_seconds: number; succeeded: number; failed: number };
+          };
+
+          log.info(
+            TAG,
+            `Cloud: ${data.stats.succeeded} succeeded, ${data.stats.failed} failed in ${data.stats.elapsed_seconds}s`,
+          );
+
+          for (const cloudResult of data.results) {
+            if (!cloudResult.response) {
+              failed++;
+              continue;
+            }
+
+            const lesson = toCompile.find((l) => l.hash === cloudResult.hash);
+            if (!lesson) continue;
+
+            const parsed = parseCompilerResponse(cloudResult.response!);
+            if (!parsed) {
+              failed++;
+              continue;
+            }
+            if (!parsed.compilable) {
+              // mmnto/totem#1280: capture title alongside hash for observability.
+              // mmnto-ai/totem#1481: the cloud worker defaults compilable:false
+              // outcomes to out-of-scope. Granular cloud-side reasonCodes track
+              // via mmnto/totem#1221.
+              //
+              // mmnto-ai/totem#1598 + mmnto-ai/totem#1634: respect the LLM's
+              // narrow classifier signal (`context-required` or
+              // `semantic-analysis-required`) on the cloud path the same way
+              // local Pipeline 2 / 3 routing in core/compile-lesson.ts does.
+              // Mirroring keeps downstream ledger triage consistent whether
+              // the compile ran locally or through the cloud worker.
+              //
+              // Under --force / upgrade, evict any stale active-rule entry so
+              // we don't leave the old rule alive while also marking the same
+              // hash non-compilable (mmnto-ai/totem#1629 CR finding — symmetry
+              // with the local skipped path).
+              if (upgradeTargets?.has(lesson.hash) || options.force) {
+                removeRuleByHash(newRules, lesson.hash);
+              }
+              const reasonCode: NonCompilableReasonCode = parsed.reasonCode ?? 'out-of-scope';
+              // mmnto-ai/totem#1627: cloud !compilable responses reach this
+              // block only with a permanent classifier code today — the
+              // cloud worker never forwards smoke-gate retry-pending codes
+              // through the `!compilable` branch (those surface on the
+              // `buildCompiledRule` path below, which already returns a
+              // failed/skipped result distinct from the ledger write). The
+              // guard is defense in depth: if a future cloud-worker change
+              // started emitting retry-pending codes here, we would not
+              // silently pollute the ledger.
+              if (shouldWriteToLedger(reasonCode)) {
+                nonCompilableMap.set(lesson.hash, {
+                  title: lesson.heading,
+                  reasonCode,
+                  reason: parsed.reason,
+                });
+              }
+              skippedLessons.push({ heading: lesson.heading, reason: parsed.reason });
+              skipped++;
+              continue;
+            }
+
+            // mmnto-ai/totem#1656: declared severity from lesson prose wins
+            // over the LLM's emission. Post-LLM override is deterministic;
+            // the prompt directive reduces the frequency of mismatch but
+            // the override guarantees correctness on the cloud path too.
+            // mmnto-ai/totem#1665: same posture for source-declared Scope —
+            // author intent overrides LLM emission on the cloud path too.
+            const declaredSeverity = parseDeclaredSeverity(lesson.body);
+            const ruleResult = buildCompiledRule(parsed, lesson, existingByHash, {
+              declaredSeverityOverride: declaredSeverity,
+              lessonBody: lesson.body,
+            });
+            if (ruleResult.severityOverride) {
+              writeSeverityOverrideTelemetry(
+                { heading: lesson.heading, hash: lesson.hash },
+                ruleResult.severityOverride,
+              );
+            }
+            if (ruleResult.scopeOverride) {
+              writeScopeOverrideTelemetry(
+                { heading: lesson.heading, hash: lesson.hash },
+                ruleResult.scopeOverride,
+              );
+            }
+            if (ruleResult.rule) {
+              // Verify rule against inline Example Hit/Miss lines
+              const testResult = verifyRuleExamples(ruleResult.rule, lesson.body);
+              if (testResult && !testResult.passed) {
+                log.warn(TAG, `[${lesson.heading}] ${formatExampleFailure(testResult)}`);
+                failed++;
+                continue;
+              }
+              // Upgrade/force sweep: clear any stale ledger entry (including
+              // permanent classifier codes) when the user is deliberately
+              // re-compiling via --upgrade or --force. Mirrors the local
+              // compiled branch's upgrade-target prune for cloud parity
+              // (GCA mmnto-ai/totem#1640 round-1 finding; previously only the local
+              // compiled branch had this prune).
+              if (upgradeTargets?.has(lesson.hash) || options.force) {
+                nonCompilableMap.delete(lesson.hash);
+              }
+              // mmnto-ai/totem#1627 stale-ledger prune (cloud path): mirror
+              // the local `compiled` branch's sweep of any stale
+              // retry-pending ledger entry so cloud and local cycles
+              // produce identical ledger state on a clean compile.
+              {
+                const prior = nonCompilableMap.get(lesson.hash);
+                if (prior && LEDGER_RETRY_PENDING_CODES.has(prior.reasonCode)) {
+                  nonCompilableMap.delete(lesson.hash);
+                }
+              }
+              upsertRule(newRules, ruleResult.rule);
+              compiled++;
+              logCompiledRule(log, lesson, ruleResult.rule);
+            } else {
+              if (ruleResult.rejectReason) {
+                log.warn(TAG, `[${lesson.heading}] ${ruleResult.rejectReason} — skipping`);
+              }
+              // mmnto-ai/totem#1627 stale-ledger prune (cloud smoke-gate
+              // rejection): any buildCompiledRule rejection on the cloud
+              // path is retry-pending (syntax-invalid, zero-match,
+              // matches-good-example, missing-*example) since parsed.compilable
+              // was true. Mirror the local skipped-branch guard: if a prior
+              // retry-pending entry sits in the ledger for this hash, drop
+              // it so the ledger reflects current-run truth. Permanent
+              // entries stay — they shouldn't be overwritten by a transient
+              // compile failure. Shield review round-2 finding.
+              const prior = nonCompilableMap.get(lesson.hash);
+              if (prior && LEDGER_RETRY_PENDING_CODES.has(prior.reasonCode)) {
+                nonCompilableMap.delete(lesson.hash);
+              }
+              failed++;
+            }
+          }
+
+          spinner.succeed(
+            `${newRules.length} rules — ${compiled} compiled, ${skipped} skipped, ${failed} failed (cloud: ${data.stats.elapsed_seconds}s)`,
+          );
+        } // end cloudLessons.length > 0
+      } else {
+        // Compile lessons in parallel batches (Proposal 188 Phase 1)
+        const { ProgressTracker } = await import('../progress.js');
+        const { withRetry } = await import('../retry.js');
+        const tracker = new ProgressTracker(toCompile.length);
+        spinner.update(tracker.format());
+
+        const parsed = Number(options.concurrency ?? DEFAULT_CONCURRENCY);
+        const CONCURRENCY = Math.min(
+          MAX_CONCURRENCY,
+          Math.max(1, Number.isNaN(parsed) ? DEFAULT_CONCURRENCY : parsed),
+        );
+
+        // Proposal 281: resolve the compile-worker fingerprint once for the
+        // whole batch. When undefined (non-anthropic providers, Phase 1), the
+        // cache is bypassed — no fingerprint means no invalidation signal,
+        // so caching would be unsafe. Matches the verify-manifest no-op
+        // discipline on the same provider gap.
+        const cacheFingerprint = computeFingerprintForManifest();
+        const cacheSessionId = readSessionId(totemDir);
+        let cacheCliVersion: string | undefined;
+        try {
+          const { createRequire } = await import('node:module');
+          const req = createRequire(import.meta.url);
+          const pkg = req('../../package.json') as { version?: string };
+          cacheCliVersion = pkg.version;
+          // totem-context: intentional cleanup — cli_version is a best-effort ledger enrichment; packaging-path resolution failure surfaces diagnostically via log.dim per CR R1 finding, but never blocks the compile path. Mirror of doctor-claim-discipline's pattern.
+        } catch (err) {
+          // totem-context: intentional cleanup — cli_version is a best-effort ledger enrichment; packaging-path resolution failure surfaces diagnostically via log.dim per CR R1 finding, but never blocks the compile path.
+          // Surface at diagnostic level — silent swallow would mask packaging
+          // regressions that strip cli_version from every cache-telemetry event.
+          const errMsg =
+            // totem-context: String(err) is the canonical err-normalization idiom (10+ cohort precedents); the input-pattern lesson misfires on catch-block error extraction.
+            err instanceof Error ? err.message : String(err);
+          log.dim(
+            TAG,
+            `Unable to resolve CLI version for compile_cache_decision telemetry: ${errMsg}`,
+          );
         }
+        const emitCacheDecisionEvent = (
+          sourceHash: string,
+          // Use the canonical CacheDecision union exported from core
+          // (compile-cache.ts). Inline-import-type avoids a top-level
+          // type-import while keeping the wrapper site in lockstep with
+          // future additions to the decision enum.
+          decision: import('@mmnto/totem').CacheDecision,
+        ): void => {
+          try {
+            appendLedgerEvent(
+              totemDir,
+              {
+                timestamp: new Date().toISOString(),
+                type: 'compile_cache_decision',
+                ruleId: sourceHash,
+                justification: '',
+                source: 'lint',
+                activity_name: decision,
+                ...(cacheSessionId !== undefined ? { session_id: cacheSessionId } : {}),
+                ...(cacheCliVersion !== undefined ? { cli_version: cacheCliVersion } : {}),
+              },
+              (msg) => log.warn(TAG, msg),
+            );
+            // totem-context: intentional cleanup — telemetry is fire-and-forget; ledger-append failure must never crash the compile per the A.3.a writer contract.
+          } catch (err) {
+            // totem-context: intentional cleanup — telemetry is fire-and-forget; ledger-append failure must never crash the compile per the A.3.a writer contract.
+            log.warn(TAG, err instanceof Error ? err.message : String(err));
+          }
+        };
 
-        if (!parsed.compilable) {
-          log.dim(TAG, `[${lesson.heading}] Not compilable (conceptual/architectural) — skipping`); // totem-ignore
-          skipped++;
-          continue;
+        for (let i = 0; i < toCompile.length; i += CONCURRENCY) {
+          const batch = toCompile.slice(i, i + CONCURRENCY);
+          const results = await Promise.all(
+            batch.map(async (lesson) => {
+              // Per-lesson deps: telemetry prefix only applies to upgrade targets.
+              // For upgradeBatch, each target may carry a distinct prefix.
+              const lessonDeps = upgradeTargets?.has(lesson.hash)
+                ? { ...coreDeps, telemetryPrefix: upgradeTargets.get(lesson.hash) }
+                : coreDeps;
+
+              // Proposal 281: cache lookup pass. Bypass when fingerprint is
+              // undefined or when the operator forced recompilation via
+              // --force or via --upgrade-batch (upgrade targets are explicit
+              // recompile intent and must not short-circuit).
+              const forceRecompile =
+                options.force === true || upgradeTargets?.has(lesson.hash) === true;
+              // Cache key composition (CR Major on `mmnto-ai/totem#1983` R1)
+              // + same shape used by `migrateFromCompiledRules` to keep runtime
+              // and migration paths producing identical hashes for the same
+              // lesson (GCA R2 critical on the same PR). The shared helper is
+              // the canonical anchor — both paths route through it.
+              const sourceHash = computeLessonSourceHash(
+                composeLessonSourceForHash(lesson.heading, lesson.body),
+              );
+              if (cacheFingerprint !== undefined) {
+                const lookup = lookupCacheEntry(totemDir, sourceHash, cacheFingerprint, {
+                  force: forceRecompile,
+                });
+                emitCacheDecisionEvent(sourceHash, lookup.decision);
+                if (lookup.entry !== null) {
+                  tracker.tick();
+                  spinner.update(tracker.format());
+                  return { lesson, result: lookup.entry.output };
+                }
+              }
+
+              return withRetry(
+                () => compileLessonCore(lesson, COMPILER_SYSTEM_PROMPT, lessonDeps),
+                {
+                  onRetry: (attempt, delayMs) => {
+                    log.warn(
+                      TAG,
+                      `[${lesson.heading}] Rate limited — retry ${attempt} in ${delayMs}ms`,
+                    );
+                  },
+                },
+              )
+                .then((result) => {
+                  tracker.tick();
+                  spinner.update(tracker.format());
+                  // Proposal 281: persist non-transient outcomes. Failed
+                  // results are transient and must not poison the cache;
+                  // compiled / skipped / noop are deterministic given the
+                  // (sourceHash, fingerprint) tuple.
+                  if (cacheFingerprint !== undefined && result.status !== 'failed') {
+                    const entry = buildCacheEntry(sourceHash, cacheFingerprint, result);
+                    writeCacheEntry(totemDir, entry, (msg) => log.warn(TAG, msg));
+                  }
+                  return { lesson, result };
+                })
+                .catch((err) => {
+                  tracker.tick();
+                  spinner.update(tracker.format());
+                  const message = err instanceof Error ? err.message : String(err);
+                  log.warn(TAG, `[${lesson.heading}] ${message} — skipping`);
+                  return { lesson, result: { status: 'failed' as const } };
+                });
+            }),
+          );
+
+          for (const { lesson, result } of results) {
+            // mmnto-ai/totem#1482: emit the per-lesson layer-trace block when
+            // --verbose is active. The whole block ships via one stdout.write
+            // call so concurrent lessons cannot interleave their output.
+            // Non-trace verbose behavior (skipped-lesson reasons) still fires
+            // further down; this renders the structured trace alongside.
+            if (options.verbose) {
+              const resultTrace =
+                'trace' in result ? (result.trace as LayerTraceEvent[] | undefined) : undefined;
+              const reasonCode = result.status === 'skipped' ? result.reasonCode : undefined;
+              const block = formatVerboseTraceBlock(lesson, result.status, reasonCode, resultTrace);
+              process.stdout.write(block + '\n');
+            }
+
+            // Upgrade and --force: remove the stale copy from newRules when
+            // the rule moves to nonCompilable (status === 'skipped') and
+            // must no longer appear as an active rule. The `compiled` case
+            // is handled by upsertRule below (replace-by-lessonHash in
+            // place, preserving array order — splicing here would defeat
+            // that by forcing upsertRule to append). For `failed`
+            // (transient error) and `noop` (no change), leave the old rule
+            // intact so a flaky network / rate-limit doesn't silently
+            // delete work (mmnto/totem#1234 GCA finding; mmnto-ai/totem#1587
+            // extension to cover --force).
+            if (
+              (upgradeTargets?.has(lesson.hash) || options.force) &&
+              result.status === 'skipped'
+            ) {
+              removeRuleByHash(newRules, lesson.hash);
+            }
+
+            // Record the terminal outcome for each upgrade target. Used by
+            // `totem doctor --pr` to distinguish real replacements from
+            // noop/skipped/failed so its PR body doesn't lie about work done
+            // (mmnto/totem#1234 CR finding).
+            if (upgradeTargets?.has(lesson.hash)) {
+              switch (result.status) {
+                case 'compiled':
+                  upgradeOutcomes.set(lesson.hash, 'replaced');
+                  break;
+                case 'skipped':
+                  upgradeOutcomes.set(lesson.hash, 'skipped');
+                  break;
+                case 'failed':
+                  upgradeOutcomes.set(lesson.hash, 'failed');
+                  break;
+                case 'noop':
+                  upgradeOutcomes.set(lesson.hash, 'noop');
+                  break;
+              }
+            }
+
+            switch (result.status) {
+              case 'compiled':
+                // ADR-065: Pipeline 1 error rules require a test fixture
+                if (
+                  extractManualPattern(lesson.body) &&
+                  result.rule.severity === 'error' &&
+                  !testedHashes.has(lesson.hash)
+                ) {
+                  if (options.raw || !autoScaffoldFixture(lesson, result.rule, scaffoldDeps)) {
+                    result.rule.severity = 'warning';
+                    log.warn(
+                      TAG,
+                      `[${lesson.heading}] Downgraded to warning — no test fixture (ADR-065)`,
+                    );
+                  }
+                }
+                // Upgrade targets: also clear any stale nonCompilable entry so
+                // the successfully-compiled rule doesn't coexist with a
+                // non-compilable marker for the same hash.
+                if (upgradeTargets?.has(lesson.hash)) {
+                  nonCompilableMap.delete(lesson.hash);
+                }
+                // mmnto-ai/totem#1627 stale-ledger prune: if a prior run
+                // landed this lesson in nonCompilable under a retry-pending
+                // code (smoke-gate failure, missing-example, etc.) and the
+                // lesson now compiles cleanly, drop the stale entry so the
+                // ledger reflects current truth. Permanent entries
+                // (out-of-scope, context-required, semantic-analysis-required,
+                // security-rule-rejected) stay — those should never coexist
+                // with a fresh rule, but if they do, the surrounding
+                // workflow has other concerns to flag first.
+                {
+                  const prior = nonCompilableMap.get(lesson.hash);
+                  if (prior && LEDGER_RETRY_PENDING_CODES.has(prior.reasonCode)) {
+                    nonCompilableMap.delete(lesson.hash);
+                  }
+                }
+                upsertRule(newRules, result.rule);
+                compiled++;
+                logCompiledRule(log, lesson, result.rule);
+                break;
+              case 'skipped':
+                // mmnto-ai/totem#1627: guard the ledger write against
+                // retry-pending codes. Smoke-gate failures and LLM-output
+                // transient errors are retry-eligible; writing them to
+                // nonCompilable marks them permanent and blocks the next
+                // compile cycle from ever producing a rule. Permanent
+                // classifier codes (out-of-scope, context-required,
+                // semantic-analysis-required, security-rule-rejected,
+                // no-pattern-*, legacy-unknown) still write as before.
+                if (shouldWriteToLedger(result.reasonCode)) {
+                  // mmnto/totem#1280 + mmnto-ai/totem#1481: capture the
+                  // full 4-tuple so ledger reads downstream (doctor,
+                  // telemetry) see a specific reasonCode rather than
+                  // normalizing to 'legacy-unknown'.
+                  nonCompilableMap.set(result.hash, {
+                    title: lesson.heading,
+                    reasonCode: result.reasonCode,
+                    reason: result.reason,
+                  });
+                } else {
+                  // Retry-pending outcome. If a prior retry-pending entry
+                  // still sits in the ledger for this hash, drop it so the
+                  // ledger reflects the current run rather than the stale
+                  // one. Permanent entries (out-of-scope, etc.) stay —
+                  // they shouldn't be overwritten by a transient failure
+                  // against the same hash. Shield review finding on
+                  // mmnto-ai/totem#1598 / #1634 bundle.
+                  const prior = nonCompilableMap.get(result.hash);
+                  if (prior && LEDGER_RETRY_PENDING_CODES.has(prior.reasonCode)) {
+                    nonCompilableMap.delete(result.hash);
+                  }
+                }
+                skippedLessons.push({ heading: lesson.heading, reason: result.reason });
+                skipped++;
+                break;
+              case 'failed':
+                failed++;
+                break;
+              case 'noop':
+                break;
+            }
+          }
         }
-
-        if (!parsed.pattern || !parsed.message) {
-          log.warn(TAG, `[${lesson.heading}] Missing pattern or message — skipping`); // totem-ignore
-          failed++;
-          continue;
-        }
-
-        const validation = validateRegex(parsed.pattern);
-        if (!validation.valid) {
-          log.warn(TAG, `[${lesson.heading}] Rejected regex: ${validation.reason} — skipping`); // totem-ignore
-          failed++;
-          continue;
-        }
-
-        newRules.push({
-          lessonHash: lesson.hash,
-          lessonHeading: lesson.heading,
-          pattern: parsed.pattern,
-          message: parsed.message,
-          engine: 'regex',
-          compiledAt: new Date().toISOString(),
-          ...(parsed.fileGlobs && parsed.fileGlobs.length > 0
-            ? { fileGlobs: parsed.fileGlobs }
-            : {}),
-        });
-        compiled++;
-        log.success(TAG, `[${lesson.heading}] Compiled: /${parsed.pattern}/`); // totem-ignore
-      }
+      } // end cloud/local else
 
       if (!options.raw) {
-        saveCompiledRules(rulesPath, newRules);
-        log.info(
-          TAG,
-          `Results: ${compiled} compiled, ${skipped} skipped (conceptual), ${failed} failed`,
+        // mmnto/totem#1280: Prune stale non-compilable entries (lesson was edited or removed)
+        // and write the result as {hash, title} tuples for observability.
+        // The helper also covers the no-op path via mmnto/totem#1281.
+        const { fresh: freshNonCompilable, drained: nonCompilableDrained } =
+          pruneStaleNonCompilable(nonCompilableMap, currentHashes);
+        if (nonCompilableDrained > 0) {
+          // GCA finding on PR #1331: log drained entries here for parity with
+          // the no-op branch, so telemetry traces are symmetric.
+          log.dim(
+            TAG,
+            `Pruned ${nonCompilableDrained} stale non-compilable entr${nonCompilableDrained === 1 ? 'y' : 'ies'} (lessons edited or removed)`,
+          ); // totem-context: log only fires when actual draining happens
+        }
+        saveCompiledRulesFile(rulesPath, {
+          version: 1,
+          rules: newRules,
+          nonCompilable: freshNonCompilable,
+        });
+
+        // ─── Write compile manifest (provenance chain) ───
+        // CR finding on PR mmnto/totem#1348: generateInputHash/generateOutputHash/
+        // writeCompileManifest are already destructured at the top of this
+        // handler via the mmnto/totem#1337 import consolidation — no dynamic
+        // re-import needed here.
+        const lessonsDir = path.join(totemDir, 'lessons');
+        const manifestPath = path.join(totemDir, 'compile-manifest.json');
+        ensureLessonsDir(lessonsDir);
+        // Tracked-only, matching the consumers — producer/consumer symmetry so
+        // an untracked scratch lesson never diverges the recorded hash
+        // (mmnto-ai/totem#2051 / mmnto-ai/totem#2055).
+        const inputHash = generateInputHash(lessonsDir, cwd);
+        const outputHash = generateOutputHash(rulesPath);
+        const fullRecompileFingerprint = computeFingerprintForManifest();
+        writeCompileManifest(manifestPath, {
+          compiled_at: new Date().toISOString(),
+          model: options.model ?? config.orchestrator?.defaultModel ?? 'unknown',
+          input_hash: inputHash,
+          output_hash: outputHash,
+          rule_count: newRules.length,
+          ...(fullRecompileFingerprint !== undefined
+            ? { compile_worker_fingerprint: fullRecompileFingerprint }
+            : {}),
+        });
+        logCompileRun(totemDir);
+        log.dim(TAG, `Manifest: ${inputHash.slice(0, 8)}…→${outputHash.slice(0, 8)}…`);
+
+        spinner.succeed(
+          `${newRules.length} rules — ${compiled} compiled, ${skipped} skipped, ${failed} failed`,
         );
-        log.success(
-          TAG,
-          `${newRules.length} total rules saved to ${config.totemDir}/${COMPILED_RULES_FILE}`,
-        );
+
+        // ─── Skipped lesson transparency (#1060) ───
+        if (skippedLessons.length > 0) {
+          log.warn(TAG, `${skippedLessons.length} lesson(s) could not be compiled into rules.`);
+          if (options.verbose) {
+            for (const sl of skippedLessons) {
+              const detail = sl.reason ?? 'no reason provided';
+              log.dim(TAG, `  ↳ ${sl.heading}: ${detail}`);
+            }
+          } else {
+            log.dim(TAG, 'Run totem compile --verbose to see why.');
+          }
+        }
       }
     }
   } else if (!options.export) {
-    throw new Error(
-      '[Totem Error] No orchestrator configured. Regex compilation requires a Full-tier config.\n' +
-        'Use --export to export lessons to AI config files without an orchestrator.',
+    throw new TotemConfigError(
+      'No orchestrator configured. Regex compilation requires a Full-tier config.',
+      'Use --export to export lessons to AI config files without an orchestrator.',
+      'CONFIG_MISSING',
     );
   }
 
@@ -242,10 +1979,47 @@ export async function compileCommand(options: CompileOptions): Promise<void> {
       return;
     }
 
+    // Filter lessons whose compiled rule is `untested-against-codebase` so
+    // exports never emit guidance Stage 4 hasn't validated (CR mmnto-ai/
+    // totem#1757 R2: agent context shouldn't rely on unverified rules).
+    // Archived rules are surfaced WITH an `_(archived: <reason>)_` suffix
+    // so the prose stays available as agent context — Stage 4 archival
+    // concerns pattern-matching false positives, not lesson-prose validity
+    // (mmnto-ai/totem#1873).
+    const rawRulesFile = loadCompiledRulesFile(rulesPath);
+    const inertHashes = new Set<string>();
+    const archivedReasonByHash = new Map<string, string>();
+    for (const r of rawRulesFile.rules) {
+      if (r.status === 'untested-against-codebase') {
+        inertHashes.add(r.lessonHash);
+      } else if (r.status === 'archived' && r.archivedReason) {
+        archivedReasonByHash.set(r.lessonHash, r.archivedReason);
+      }
+    }
+    const lessonsForExport =
+      inertHashes.size === 0
+        ? lessons
+        : lessons.filter((l) => !inertHashes.has(hashLesson(l.heading, l.body)));
+
     for (const [name, filePath] of Object.entries(config.exports)) {
       const absPath = path.join(cwd, filePath);
-      exportLessons(lessons, absPath);
-      log.success(TAG, `Exported ${lessons.length} rules to ${filePath} (${name})`); // totem-ignore
+      exportLessons(lessonsForExport, absPath, archivedReasonByHash);
+      log.success(TAG, `Exported ${lessonsForExport.length} rules to ${filePath} (${name})`); // totem-ignore
     }
+  }
+
+  // Return outcomes so callers can report precisely. Only set when --upgrade
+  // or upgradeBatch was requested; default compile runs return void.
+  if (upgradeTargets) {
+    if (options.upgradeBatch) {
+      // Batch mode: return an array of outcomes, one per requested hash.
+      return options.upgradeBatch.map((entry) => ({
+        hash: entry.hash.toLowerCase(),
+        status: upgradeOutcomes.get(entry.hash.toLowerCase()) ?? 'noop',
+      }));
+    }
+    // Single --upgrade: return scalar outcome for backwards compatibility.
+    const [hash, status] = [...upgradeOutcomes.entries()][0]!;
+    return { hash, status };
   }
 }

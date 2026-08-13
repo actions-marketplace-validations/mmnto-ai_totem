@@ -1,5 +1,2884 @@
 # @mmnto/mcp
 
+## 1.116.0
+
+### Minor Changes
+
+- e905963: feat(attribution): agent-source provenance + fail-closed conflict sense at the MCP stamp seams (mmnto-ai/totem#2629). On a shared multi-seat machine, a seat session that mints no identity of its own could inherit ANOTHER seat's attribution through two ambient channels (a wider-than-launch-shell `TOTEM_SELF_AGENT` plus the shared `.totem/ledger/.session-id` pointer), landing wrong-seat, wrong-session rows on exactly the axis the M1 instrument measures. Core gains `senseAgentAttribution` — one per-call, never-cached derivation consumed by both env-stamp seams: every new search-log row and selection-manifest row now carries `agent_source_provenance: 'env' | 'absent'` (`'env'` iff `agent_source` was stamped — the ruled two-value enum), including the managed-template session-start emitters (both rendered hook templates stamp the field inline; the tracked `.gemini/hooks/SessionStart.cjs` is regenerated onto the new template under its byte-parity CI lock). When the ambient env seat disagrees with the session pointer's minting seat (derived per call from the pointer session's `session_start` row in `events.ndjson`), the row stamps NEITHER candidate and carries an `attribution_conflict` disclosure naming both plus the pointer session id. Named limit, stated so coverage is never overread: the conflict arm fires only when two PRESENT candidates disagree (a seated process joining a foreign seat's pointer session) — an unseated mint row (the live specimen's own shape) or a machine-wide ambient var that makes every mint agree yields an env stamp with no conflict; those shapes are what the provenance field, the doctor arm below, and the launch-shell scope protocol exist for. Fail-closed scopes to the attribution, never the operation — a wrong-seat row corrupts two denominators, an unattributed row only under-counts, and the query/write is never refused. Absence of counter-evidence (no pointer, no mint row, unseated mint, absent ledger) never strips the env stamp; a failed probe keeps the stamp and names itself on `attribution_probe_error` (and the manifest `warnings[]` channel). Self-minted manifest rows never probe the pointer — their minting seat IS the emitting process's own env read. Both schema extensions are additive-optional (the ADR-078 `agent_source` migration shape): pre-sensor rows stay parseable under new readers. The reverse direction is version-bounded and named: the manifest schema is `.strict()`, so a reader at ≤1.115.0 silently skips rows written by the new emitter (`readSelectionManifests` counts only JSON-parse failures as malformed) — bounded by shipping inside the single 1.116.0 cohort bump. `totem doctor`'s Seat Identity row gains arm (d), the win32-only registry scope-sense: a NON-BLANK `TOTEM_SELF_AGENT` at user or machine registry scope — the #2629 root-cause misconfiguration — reports an `env-ambient-scope` finding (sense-only, `gateExempt`, two `reg query` spawns per explicit doctor run, never the stamp hot path); a blank-valued key (the post-remediation shape: value cleared, key kept, `reg` still exits 0) is classified inert and stays silent; a probe failure is disclosed as `registry-scope-unreadable`, never silent. QBD ledger events are deliberately out of scope — their read-side correlation already fail-closes on seat mismatch, and re-stamping them would shift compliance-metric denominators.
+
+### Patch Changes
+
+- Updated dependencies [e905963]
+- Updated dependencies [05edd72]
+  - @mmnto/totem@1.116.0
+
+## 1.115.0
+
+### Minor Changes
+
+- 1aac848: feat(instrumentation): per-seat selection manifests — the Prop 308 / strategy#467 M1 measurement instrument (mmnto-ai/totem#2468). Core ships a strict-schema NDJSON manifest substrate (`SelectionManifestRowSchema`, `appendSelectionManifest`/`senseSelectionManifest`, `fingerprintContent`, `buildMeasuredCandidate`) writing one row per selection event to the new `.totem/ledger/selection-manifests.ndjson` sidecar under the QBD sensor posture: emission never blocks, filters, or alters a selection, failures surface on the accounting channel, and the existing `session_start`/`mcp_call`/`derive_action` ledger rows serve as the recorded-absence denominator. Three consumers emit: `search_knowledge` records returned hits, below-floor withheld candidates, and the previously silent federation final-limit cut; `totem orient` records its report sections (derive errors as excluded) on agent-invoked renders only, mirroring the #2510 scope ruling; and the session-start tier records per-block candidates — journal recency policy, mail display caps, ticket-matched proposals, vector char-budget cuts (via new per-result metadata on `AutoContextResult`), and the global slice as `finalTruncation`. Per Prop 308 F1 the schema is strict at both levels (no shared score field can appear without breaking parse — the refute-condition guard is structural), candidates the policy never read are recorded id-only with no fabricated measurement, and every row names its aggregation (`utf8-length` bytes, chars/4 approximate tokens — a payload-byte census, not the strategy#467 ruled `<total>` measured-consumption basis; substitution is the pre-registration's call per its §9). Both published SessionStart templates append an inline manifest row bound to the core schema by a contract test, and both now mint the A.3.a session UUID + `session_start` event (the Gemini template never had it; the totem-repo V2 hook lost it when it replaced the managed template) — the join key and denominator the instrument depends on.
+
+### Patch Changes
+
+- Updated dependencies [a22fcf1]
+- Updated dependencies [1aac848]
+- Updated dependencies [3e9ae31]
+  - @mmnto/totem@1.115.0
+
+## 1.114.0
+
+### Patch Changes
+
+- 3624a2d: Demote the denominator-blind context-pressure warning to a measured size disclosure (#2600): `search_knowledge` no longer claims "you may be at risk of forgetting earlier instructions" (live-falsified at 15% occupancy on a 1M-window seat) — above `contextWarningThreshold` it now appends a self-closing `<size-disclosure chars approxTokens sessionChars sessionCalls scope="server-process" />` measurement envelope, applied once at the finalize seam AFTER the first-call warning prepend so `chars` measures the actually-delivered payload, and leaves the weighing judgment with the consumer, the only party holding the window denominator. `totem_system_warning` remains for conditions the server actually measures (index staleness, degraded retrieval, store failures).
+- Updated dependencies [3624a2d]
+  - @mmnto/totem@1.114.0
+
+## 1.113.1
+
+### Patch Changes
+
+- @mmnto/totem@1.113.1
+
+## 1.113.0
+
+### Patch Changes
+
+- Updated dependencies [3466f09]
+  - @mmnto/totem@1.113.0
+
+## 1.112.0
+
+### Patch Changes
+
+- Updated dependencies [a4e1d96]
+  - @mmnto/totem@1.112.0
+
+## 1.111.1
+
+### Patch Changes
+
+- @mmnto/totem@1.111.1
+
+## 1.111.0
+
+### Patch Changes
+
+- Updated dependencies [e9ebb74]
+  - @mmnto/totem@1.111.0
+
+## 1.110.0
+
+### Patch Changes
+
+- Updated dependencies [a4c30f3]
+  - @mmnto/totem@1.110.0
+
+## 1.109.0
+
+### Patch Changes
+
+- @mmnto/totem@1.109.0
+
+## 1.108.0
+
+### Patch Changes
+
+- @mmnto/totem@1.108.0
+
+## 1.107.1
+
+### Patch Changes
+
+- Updated dependencies [d7a0297]
+  - @mmnto/totem@1.107.1
+
+## 1.107.0
+
+### Minor Changes
+
+- ea04a68: Query-before-derive compliance — one falsifying number wired end-to-end (mmnto-ai/totem#2510). Of the derive-class actions in an agent session (`totem spec` synthesis, `totem orient` derivation, `totem review` grounding), what fraction was preceded by a corpus query correlated to that action?
+
+  **Schema.** The Trap Ledger gains two event types — `corpus_query` and `derive_action` — joined by a new `qbd_correlation_id`, kept deliberately separate from ADR-014's `correlation_id` trace ID because this slice is not chartered to build that stack. The correlation ID is **self-dating**: it encodes the instant it was minted, and `LedgerEventSchema` cross-checks that instant against the timestamp of the row carrying it. A query row whose ID was not minted at its own write instant, or a derive row citing an ID minted after the derive or older than the correlation window, fails to parse — so "minted at event-write time" is a schema constraint rather than a convention, and a backfilled ID is a schema violation rather than a data point. That check fires on **any** event type, so a forged ID cannot be smuggled in under a non-QBD `type`.
+
+  **Correlation semantics.** One query grounds exactly **one** derive: the pointer is consumed on use, and the scanner independently refuses to credit a second derive citing an already-spent ID (a write-side rule needs a read-side check). Correlation is scoped to one session and one seat, fail-closed — both sides must carry a session id and agree on it. Two unseated sides compare equal, which is the right default for solo repos; seating exactly one side stops correlation entirely, so the scanner emits a seat-mismatch hint rather than letting that read as a truthful 0.00. MCP seat plumbing is tracked separately in mmnto-ai/totem#2530. The 2-hour correlation window borrows ADR-029 § 2's value so the slice carries one time constant, but treating that span as a _grounding-validity_ window is this slice's own design decision, not something the ADR authorises.
+
+  **Seams.** Query events come from the `totem search` CLI path and the MCP `search_knowledge` tool — the latter minted only after the search has actually run, so a search blocked by the health gate or one that threw never leaves a groundable ID. Derive events come from `spec`, `orient`, and `review`, the last covering `--mode structural` and the multi-lane fan. Each records once the review actually produced a verdict — parsed, for the standard and structural paths; artifact address on disk, for the fan (an identical re-run dedups to the existing address and still records — each invocation is a derive) — so a FAIL verdict and a fan round that writes an honest `settled=false` verdict before hard-erroring both count, while `--raw`, an unparsable verdict, and a fan that throws before writing an artifact do not. The four CLI surfaces and the doctor reader resolve their ledger through one shared helper, from the **config root** rather than the invocation cwd, so a command run from a subdirectory no longer drops its derive; landing in the global profile is announced rather than silent.
+
+  **Render.** `totem doctor --compliance` shows the number, its trend, and the pre-registered threshold and window verbatim: compliance ≥ 0.50 over the first 20 instrumented sessions carrying ≥1 derive-class event, regardless of query count. The verdict stays `PENDING` until that window fills. The denominator is every derive-class event in those sessions, including sessions that fired zero queries.
+
+  **Sensor, not actuator (Tenet 13):** nothing gates on this number, no exit code changes, and an instrumentation write failure never breaks the instrumented command — it surfaces as a named warning. Degraded reads announce themselves: the scanner parses the NDJSON itself and counts every rejected line by class, so a torn, tampered, or backdated ledger renders under an explicit `DEGRADED` / `UNVERIFIED` envelope with a remediation pointer instead of a confident 100% or 0%. Append-only monotonicity is measured against every row in the file, so backdated appends cannot quietly seize the evaluation window. An unknown event type is reported as version skew, not tampering.
+
+  Known limit, stated rather than solved: this senses query-before-derive _adjacency_, not influence. A query fired to satisfy the metric whose results the following derive never reads is indistinguishable here from one that genuinely grounded it.
+
+### Patch Changes
+
+- Updated dependencies [ea04a68]
+  - @mmnto/totem@1.107.0
+
+## 1.106.0
+
+### Patch Changes
+
+- Updated dependencies [72c8fbf]
+- Updated dependencies [c79cfbf]
+  - @mmnto/totem@1.106.0
+
+## 1.105.0
+
+### Minor Changes
+
+- 9735cf5: Retrieval envelope: carry true relevance through fusion, add a relevance floor with an honest `no_useful_hits` state, and degrade loudly to keyword-only search when the embedder is unavailable (mmnto-ai/totem#2463, slice A).
+  - **core:** `SearchResult` now carries `relevance` (vector-leg similarity `1/(1+distance)`, 0..1; absent for keyword-only hits) and `searchMethod` (`hybrid` | `vector` | `fts`). `rowToSearchResult` populates `relevance`; both the intra-store `rrfMerge` and the MCP federation merge preserve it while still overwriting `score` with the RRF rank artifact, so ordering is byte-identical. New opt-in `SearchOptions.allowFtsFallback` degrades to the existing FTS-only path when the embedder cannot resolve and an FTS index exists (only the no-embedder failure class is caught; all other errors propagate). New flat config key `searchRelevanceFloor` (`z.number().min(0).max(1).default(0.25)`).
+  - **mcp:** `search_knowledge` gains an optional `min_relevance` input (overrides the config floor), emits a machine-parsable `<retrieval-envelope status method bestRelevance floor hits />` line directly below `<index-meta>`, floors on the true relevance (not the RRF rank artifact) with `bestRelevance` empty-safe, reports `status="no_useful_hits"` with a compact below-floor candidate disclosure instead of a silent drop, passes `allowFtsFallback: true` on all store searches and prepends a loud keyword-only warning when the fallback engages, renders a per-hit `Relevance:` field, and records best relevance in the search log.
+
+### Patch Changes
+
+- Updated dependencies [9735cf5]
+  - @mmnto/totem@1.105.0
+
+## 1.104.0
+
+### Patch Changes
+
+- Updated dependencies [bf7f883]
+- Updated dependencies [c7569c3]
+- Updated dependencies [367cdee]
+  - @mmnto/totem@1.104.0
+
+## 1.103.0
+
+### Patch Changes
+
+- Updated dependencies [55bdc44]
+- Updated dependencies [c70f3f1]
+  - @mmnto/totem@1.103.0
+
+## 1.102.0
+
+### Patch Changes
+
+- Updated dependencies [4368f18]
+- Updated dependencies [f65e454]
+  - @mmnto/totem@1.102.0
+
+## 1.101.2
+
+### Patch Changes
+
+- Updated dependencies [f21fbb8]
+- Updated dependencies [296f0d0]
+- Updated dependencies [64c5716]
+  - @mmnto/totem@1.101.2
+
+## 1.101.1
+
+### Patch Changes
+
+- @mmnto/totem@1.101.1
+
+## 1.101.0
+
+### Patch Changes
+
+- @mmnto/totem@1.101.0
+
+## 1.100.0
+
+### Patch Changes
+
+- Updated dependencies [bb42b26]
+- Updated dependencies [c0a56bd]
+  - @mmnto/totem@1.100.0
+
+## 1.99.0
+
+### Patch Changes
+
+- Updated dependencies [5b079a6]
+  - @mmnto/totem@1.99.0
+
+## 1.98.1
+
+### Patch Changes
+
+- 58047bd: chore(descriptions): D1 tagline re-cut, family-wide — the mmnto-ai/totem-strategy#531 A1 tagline convergence (blind-gate release comment 4979503772 + operator veto-edit 2026-07-15) supersedes the Prop 294 D1 headline across the published package family.
+
+  New ruled core: "local-first toolkit that keeps AI-agent work queryable, enforceable, and derivable as plain files in your codebase". Retires "substrate" from public copy (plain-words ruling) and the em-dash (veto-edit) on every npm-visible description surface: the CLI's single-sourced constant (`--help` header + `@mmnto/cli` package.json), `@mmnto/totem` + `@mmnto/mcp` package.json descriptions, and all three per-package README ledes. Parity tests re-pin the new core and add substrate/em-dash regression guards.
+
+  Consumer-impact: npm registry metadata and rendered README pages only; no runtime code paths change.
+
+- Updated dependencies [58047bd]
+  - @mmnto/totem@1.98.1
+
+## 1.98.0
+
+### Minor Changes
+
+- 9ff30b9: feat(doctor): `totem doctor --compliance` recall-rate reader + the ADR-029 A.3.a producer stamp (mmnto-ai/totem#2362).
+
+  ADR-029's Compliance Rate (% of coding sessions where `search_knowledge` preceded the first commit) is now a measured sensor rather than a `Goal:` claim. Two halves, one telemetry pair (`.totem/.search-log.jsonl` + git commit timestamps), sensor-only per Tenet 13 — a readout, never a gate.
+  - **Producer (`@mmnto/mcp`):** `SearchLogEntry` gains three optional A.3.a fields — `agent_source`, `session_id`, `correlation_id` — stamped at log time from the environment (`TOTEM_SELF_AGENT` / `TOTEM_SESSION_ID` / `TOTEM_CORRELATION_ID`) in one producer touch. Absent env → an explicit `null` (Tenet 4, never guessed). The ~420 pre-schema entries stay permanently unattributed (no retro-inference).
+  - **Reader (`@mmnto/cli`):** new `totem doctor --compliance` section computes the rate from the existing log against git history. Sessions follow ADR-029 § 2 verbatim: ONE merged event stream (searches and commits together) in rolling 2-hour windows, repo-wide. The readout shows the repo-wide rate (with n), a "commit-granularity per ADR-029 § 1" caveat, an attribution-coverage diagnostic (entry counts per `agent_source`; null → an explicit "unattributed" bucket) — never per-seat compliance rates, because commits carry no seat identity to join against — low-n honesty ("insufficient data (n=x)" below 5), and the doctor `skip` idiom (not a fail, not 0%) when the log file is absent. `session_id` is stamped as a forward primitive for the commit-side join and is deliberately inert in the current windowing.
+
+  Consumer-impact: new `totem doctor --compliance` section (never affects exit codes); three new optional `SearchLogEntry` fields on the MCP search log (additive — existing log readers unaffected, legacy entries render as unattributed). No breaking changes.
+
+### Patch Changes
+
+- Updated dependencies [ca5aefa]
+  - @mmnto/totem@1.98.0
+
+## 1.97.0
+
+### Patch Changes
+
+- 0100841: docs(claim-discipline): strategy#531 seam-repair burn-down — package-family description alignment + public-surface register fixes (mmnto-ai/totem#1950 residual class).
+
+  The published package family disagreed with itself: `@mmnto/cli` carries the ruled D1 self-description (mmnto-ai/totem#2336 / mmnto-ai/totem#2349) while `@mmnto/totem` and `@mmnto/mcp` still advertised the retired "persistent memory and context layer" category. Public docs also carried autonomy framing ahead of the mechanism ("automatically heal itself", "takes autonomous action", "no extra setup").
+  - `@mmnto/totem` + `@mmnto/mcp` `package.json` descriptions and per-package READMEs re-cut on the D1 descriptive core; drift-locked by per-package parity tests mirroring the CLI's (`description.test.ts` in each package).
+  - README + wiki register fixes: canonical plain-file sources vs derived LanceDB index no longer conflated; the IDE-level MCP registration step is named instead of "no extra setup"; `totem spec`'s catch claim is first-person, not a product guarantee; `totem doctor --pr` copy states the real mechanism — telemetry-derived downgrades staged as a PR a human merges — replacing "Self-Healing"/"autonomous" framing; "provides the hard guarantee" residual (mmnto-ai/totem#1950 class) reworded to the mechanical claim.
+
+  Consumer-impact: npm registry metadata (`description` fields) and rendered README/docs pages only; no runtime code paths change (the two new files are tests).
+
+- Updated dependencies [0100841]
+- Updated dependencies [faeea5b]
+  - @mmnto/totem@1.97.0
+
+## 1.96.0
+
+### Patch Changes
+
+- Updated dependencies [01c2ed0]
+- Updated dependencies [fa21188]
+  - @mmnto/totem@1.96.0
+
+## 1.95.0
+
+### Patch Changes
+
+- Updated dependencies [6e6a9b1]
+- Updated dependencies [0cc4c7f]
+  - @mmnto/totem@1.95.0
+
+## 1.94.0
+
+### Patch Changes
+
+- @mmnto/totem@1.94.0
+
+## 1.93.0
+
+### Patch Changes
+
+- Updated dependencies [bb556cd]
+  - @mmnto/totem@1.93.0
+
+## 1.92.0
+
+### Patch Changes
+
+- @mmnto/totem@1.92.0
+
+## 1.91.0
+
+### Patch Changes
+
+- Updated dependencies [0d9b778]
+- Updated dependencies [a4641d7]
+  - @mmnto/totem@1.91.0
+
+## 1.90.0
+
+### Patch Changes
+
+- Updated dependencies [cad2f30]
+- Updated dependencies [2530a3b]
+  - @mmnto/totem@1.90.0
+
+## 1.89.0
+
+### Patch Changes
+
+- Updated dependencies [317b1a9]
+- Updated dependencies [5a310ec]
+- Updated dependencies [0ee6028]
+- Updated dependencies [9721866]
+- Updated dependencies [bb9d221]
+- Updated dependencies [111e53e]
+- Updated dependencies [0b876d4]
+  - @mmnto/totem@1.89.0
+
+## 1.88.0
+
+### Patch Changes
+
+- Updated dependencies [3a6048d]
+  - @mmnto/totem@1.88.0
+
+## 1.87.0
+
+### Patch Changes
+
+- Updated dependencies [648a987]
+  - @mmnto/totem@1.87.0
+
+## 1.86.0
+
+### Patch Changes
+
+- Updated dependencies [d53fb80]
+  - @mmnto/totem@1.86.0
+
+## 1.85.0
+
+### Patch Changes
+
+- Updated dependencies [ea5ae63]
+  - @mmnto/totem@1.85.0
+
+## 1.84.0
+
+### Patch Changes
+
+- Updated dependencies [6cafc31]
+  - @mmnto/totem@1.84.0
+
+## 1.83.0
+
+### Patch Changes
+
+- Updated dependencies [7baaad5]
+  - @mmnto/totem@1.83.0
+
+## 1.82.0
+
+### Patch Changes
+
+- Updated dependencies [902e7f3]
+  - @mmnto/totem@1.82.0
+
+## 1.81.1
+
+### Patch Changes
+
+- Updated dependencies [1e7881a]
+  - @mmnto/totem@1.81.1
+
+## 1.81.0
+
+### Patch Changes
+
+- Updated dependencies [c3cfeee]
+  - @mmnto/totem@1.81.0
+
+## 1.80.0
+
+### Patch Changes
+
+- Updated dependencies [87512fd]
+- Updated dependencies [367c05e]
+  - @mmnto/totem@1.80.0
+
+## 1.79.0
+
+### Patch Changes
+
+- Updated dependencies [7ec2974]
+  - @mmnto/totem@1.79.0
+
+## 1.78.0
+
+### Patch Changes
+
+- Updated dependencies [d0236ef]
+  - @mmnto/totem@1.78.0
+
+## 1.77.0
+
+### Patch Changes
+
+- Updated dependencies [3a35a1a]
+  - @mmnto/totem@1.77.0
+
+## 1.76.1
+
+### Patch Changes
+
+- Updated dependencies [96d5d55]
+  - @mmnto/totem@1.76.1
+
+## 1.76.0
+
+### Patch Changes
+
+- Updated dependencies [099d892]
+  - @mmnto/totem@1.76.0
+
+## 1.75.2
+
+### Patch Changes
+
+- @mmnto/totem@1.75.2
+
+## 1.75.1
+
+### Patch Changes
+
+- Updated dependencies [5289be6]
+  - @mmnto/totem@1.75.1
+
+## 1.75.0
+
+### Patch Changes
+
+- Updated dependencies [03b9168]
+  - @mmnto/totem@1.75.0
+
+## 1.74.0
+
+### Patch Changes
+
+- Updated dependencies [123fb52]
+  - @mmnto/totem@1.74.0
+
+## 1.73.2
+
+### Patch Changes
+
+- @mmnto/totem@1.73.2
+
+## 1.73.1
+
+### Patch Changes
+
+- @mmnto/totem@1.73.1
+
+## 1.73.0
+
+### Patch Changes
+
+- Updated dependencies [5bed0e6]
+  - @mmnto/totem@1.73.0
+
+## 1.72.1
+
+### Patch Changes
+
+- Updated dependencies [df84386]
+  - @mmnto/totem@1.72.1
+
+## 1.72.0
+
+### Patch Changes
+
+- Updated dependencies [facc2fa]
+  - @mmnto/totem@1.72.0
+
+## 1.71.1
+
+### Patch Changes
+
+- Updated dependencies [ba288bc]
+  - @mmnto/totem@1.71.1
+
+## 1.71.0
+
+### Patch Changes
+
+- Updated dependencies [bd774bd]
+  - @mmnto/totem@1.71.0
+
+## 1.70.1
+
+### Patch Changes
+
+- Updated dependencies [e15da1b]
+  - @mmnto/totem@1.70.1
+
+## 1.70.0
+
+### Patch Changes
+
+- @mmnto/totem@1.70.0
+
+## 1.69.0
+
+### Patch Changes
+
+- @mmnto/totem@1.69.0
+
+## 1.68.0
+
+### Patch Changes
+
+- Updated dependencies [08cbece]
+  - @mmnto/totem@1.68.0
+
+## 1.67.1
+
+### Patch Changes
+
+- @mmnto/totem@1.67.1
+
+## 1.67.0
+
+### Patch Changes
+
+- Updated dependencies [2f4e99c]
+  - @mmnto/totem@1.67.0
+
+## 1.66.0
+
+### Patch Changes
+
+- Updated dependencies [3484fd4]
+  - @mmnto/totem@1.66.0
+
+## 1.65.0
+
+### Patch Changes
+
+- Updated dependencies [1c3e4d7]
+  - @mmnto/totem@1.65.0
+
+## 1.64.2
+
+### Patch Changes
+
+- Updated dependencies [939e699]
+  - @mmnto/totem@1.64.2
+
+## 1.64.1
+
+### Patch Changes
+
+- @mmnto/totem@1.64.1
+
+## 1.64.0
+
+### Patch Changes
+
+- Updated dependencies [7179daa]
+  - @mmnto/totem@1.64.0
+
+## 1.63.0
+
+### Patch Changes
+
+- Updated dependencies [92e852f]
+  - @mmnto/totem@1.63.0
+
+## 1.62.0
+
+### Patch Changes
+
+- Updated dependencies [eec7060]
+  - @mmnto/totem@1.62.0
+
+## 1.61.0
+
+### Patch Changes
+
+- Updated dependencies [b5f0bf5]
+  - @mmnto/totem@1.61.0
+
+## 1.60.0
+
+### Patch Changes
+
+- Updated dependencies [2ed31d0]
+  - @mmnto/totem@1.60.0
+
+## 1.59.1
+
+### Patch Changes
+
+- @mmnto/totem@1.59.1
+
+## 1.59.0
+
+### Patch Changes
+
+- @mmnto/totem@1.59.0
+
+## 1.58.1
+
+### Patch Changes
+
+- Updated dependencies [cfeb312]
+  - @mmnto/totem@1.58.1
+
+## 1.58.0
+
+### Patch Changes
+
+- Updated dependencies [44a0a23]
+  - @mmnto/totem@1.58.0
+
+## 1.57.0
+
+### Patch Changes
+
+- Updated dependencies [02dfaea]
+  - @mmnto/totem@1.57.0
+
+## 1.56.0
+
+### Patch Changes
+
+- Updated dependencies [d1c338d]
+  - @mmnto/totem@1.56.0
+
+## 1.55.1
+
+### Patch Changes
+
+- @mmnto/totem@1.55.1
+
+## 1.55.0
+
+### Patch Changes
+
+- Updated dependencies [5256cb5]
+- Updated dependencies [7cebd71]
+  - @mmnto/totem@1.55.0
+
+## 1.54.1
+
+### Patch Changes
+
+- @mmnto/totem@1.54.1
+
+## 1.54.0
+
+### Patch Changes
+
+- Updated dependencies [2d7210e]
+  - @mmnto/totem@1.54.0
+
+## 1.53.9
+
+### Patch Changes
+
+- @mmnto/totem@1.53.9
+
+## 1.53.8
+
+### Patch Changes
+
+- @mmnto/totem@1.53.8
+
+## 1.53.7
+
+### Patch Changes
+
+- @mmnto/totem@1.53.7
+
+## 1.53.6
+
+### Patch Changes
+
+- Updated dependencies [a62f1c2]
+  - @mmnto/totem@1.53.6
+
+## 1.53.5
+
+### Patch Changes
+
+- @mmnto/totem@1.53.5
+
+## 1.53.4
+
+### Patch Changes
+
+- Updated dependencies [faf7356]
+  - @mmnto/totem@1.53.4
+
+## 1.53.3
+
+### Patch Changes
+
+- Updated dependencies [5e0f029]
+  - @mmnto/totem@1.53.3
+
+## 1.53.2
+
+### Patch Changes
+
+- @mmnto/totem@1.53.2
+
+## 1.53.1
+
+### Patch Changes
+
+- @mmnto/totem@1.53.1
+
+## 1.53.0
+
+### Patch Changes
+
+- Updated dependencies [1d879fc]
+  - @mmnto/totem@1.53.0
+
+## 1.52.0
+
+### Patch Changes
+
+- @mmnto/totem@1.52.0
+
+## 1.51.0
+
+### Patch Changes
+
+- Updated dependencies [ff71d97]
+  - @mmnto/totem@1.51.0
+
+## 1.50.0
+
+### Minor Changes
+
+- 6090152: Surface knowledge-index freshness in MCP envelopes (mmnto-ai/totem#2029, docs-drift Mech C).
+  - `describe_project` rich state gains an `indexState: { lastSyncAt, staleness }` field on `RichProjectStateSchema`. The field is required when `includeRichState: true`; values are null on lite-tier configurations and pre-first-sync state (honest absence per Tenet 14).
+  - `search_knowledge` responses prepend a self-closing `<index-meta lastSyncAt="..." staleness="..." />` envelope above the existing `<knowledge>` block. Null state emits `<index-meta status="no-index" />`. The envelope is present on every non-error response so callers can route on freshness without re-deriving it.
+  - A `<totem_system_warning>` block prepends to `search_knowledge` responses when the corpus is more than 7 days stale, prompting the agent to run `totem sync` before trusting results.
+
+  Source of truth is `.totem/cache/index-meta.json.lastSync` written on every successful `runSync`, with `.totem/index-manifest.json.writtenAt` as a fallback. Staleness strings use a human-readable relative-time format (`'just synced'`, `'5 minutes ago'`, `'3 hours ago'`, `'STALE: 14 days ago'`).
+
+  Per-result `indexedAt` is intentionally out of scope for v1: LanceDB rows do not currently carry per-row sync timestamps, so populating a per-result field from the constant manifest value would be fake-presence data.
+
+### Patch Changes
+
+- @mmnto/totem@1.50.0
+
+## 1.49.3
+
+### Patch Changes
+
+- @mmnto/totem@1.49.3
+
+## 1.49.2
+
+### Patch Changes
+
+- @mmnto/totem@1.49.2
+
+## 1.49.1
+
+### Patch Changes
+
+- @mmnto/totem@1.49.1
+
+## 1.49.0
+
+### Patch Changes
+
+- @mmnto/totem@1.49.0
+
+## 1.48.0
+
+### Patch Changes
+
+- @mmnto/totem@1.48.0
+
+## 1.47.1
+
+### Patch Changes
+
+- @mmnto/totem@1.47.1
+
+## 1.47.0
+
+### Patch Changes
+
+- @mmnto/totem@1.47.0
+
+## 1.46.0
+
+### Patch Changes
+
+- Updated dependencies [e3d87ea]
+  - @mmnto/totem@1.46.0
+
+## 1.45.0
+
+### Patch Changes
+
+- Updated dependencies [388dd95]
+  - @mmnto/totem@1.45.0
+
+## 1.44.0
+
+### Patch Changes
+
+- Updated dependencies [c0f0cfc]
+  - @mmnto/totem@1.44.0
+
+## 1.43.6
+
+### Patch Changes
+
+- @mmnto/totem@1.43.6
+
+## 1.43.5
+
+### Patch Changes
+
+- @mmnto/totem@1.43.5
+
+## 1.43.4
+
+### Patch Changes
+
+- @mmnto/totem@1.43.4
+
+## 1.43.3
+
+### Patch Changes
+
+- @mmnto/totem@1.43.3
+
+## 1.43.2
+
+### Patch Changes
+
+- 9549c15: fix(core): harden resolveOrchestrationPaths with path.resolve(repoRoot) — match resolveSubstratePaths absolute-output guarantee
+
+  Closes [mmnto-ai/totem#1953](https://github.com/mmnto-ai/totem/issues/1953). Tier-1 follow-up from the GCA review on [mmnto-ai/totem#1952](https://github.com/mmnto-ai/totem/pull/1952) (Phase 4 PR C changeset).
+
+  `resolveOrchestrationPaths` (`packages/core/src/orchestration-resolver.ts`) previously trusted the JSDoc contract that callers supply an absolute `repoRoot`. A caller violating the contract by passing a relative path would get relative `outbox` / `processed` / `journal` paths back — a quiet correctness slip rather than a loud error. `resolveSubstratePaths` runs `path.resolve(configRoot)` on its input for the same reason; symmetric absolute-output behavior is restored here.
+
+  One-line fix: `const resolvedRoot = path.resolve(repoRoot);` applied before composition, sibling to the existing path-traversal guard. Plus one new test confirming relative `repoRoot` input produces absolute output (parity with the substrate-resolver path-shape contract). 19 resolver tests green.
+
+- Updated dependencies [9549c15]
+  - @mmnto/totem@1.43.2
+
+## 1.43.1
+
+### Patch Changes
+
+- 5d96b99: feat(core+mcp+skills): orchestration resolver + extractor swap + signoff skill (Proposal 282 / ADR-106 Phase 4 PR A)
+
+  Ships the totem-Claude impl-lane slice of [mmnto-ai/totem-strategy#341](https://github.com/mmnto-ai/totem-strategy/pull/341) (Proposal 282 — Local-Only Orchestration, accepted) per the Phase 4 dispatch at `mmnto-ai/totem-substrate:.handoff/totem-claude/processed/2026-05-17T0929Z-strategy-claude.md`. Substrate stays mounted as a frozen archive for forensic reads; new inter-agent coordination flows through per-repo paths.
+
+  **New `@mmnto/totem` exports:** `resolveOrchestrationPaths` and the `OrchestrationPaths` discriminated-union type. The resolver returns `{ outbox, processed, journal, source }` for a given `(repoRoot, agentId)`, where each path field is the path to that subdir or `null` when it doesn't exist. Per the JSDoc contract, `repoRoot` is supplied absolute (callers resolve via `resolveStrategyRoot` / `resolveGitRoot` / `process.cwd()` upstream). `source: 'orchestration' | 'none'` is the precedence-chain signal — orchestration when at least one subdir exists, none otherwise. Same purity stance as `resolveStrategyRoot` / `resolveSubstratePaths`: no caching, no side effects, no logging.
+
+  **Additive sibling.** `resolveSubstratePaths` stays live for frozen-archive reads; the two resolvers run in parallel through and after the cohort cutover so downstream consumers can migrate independently. No removal of substrate-resolver code in Phase 4.
+
+  **Path-traversal guard.** `resolveOrchestrationPaths` validates `agentId` against `/[/\\\0]|\.\./` before composing the base path. The hardcoded map in the `/signoff` skill is safe, but the `.totem/orchestration/config.json` `host_agents` override is repo-controlled input; a malicious or buggy override (`'..', '../..', 'a/b'`) would otherwise escape `.totem/orchestration/` after `path.normalize` collapses `..` segments. Invalid input returns `source: 'none'` with all paths null — same shape as a missing tree, callers already tolerate that branch.
+
+  **`@mmnto/mcp` extractor swap.** `extractStrategyPointer` now reads orchestration first (the active write target post-Phase-2 migration), falling back to substrate when orchestration is empty across both strategy agents (frozen-archive layer for historical journals). Cross-agent merge uses hybrid sort: filename within an agent's directory (same `<model>-NNNN-*` prefix is monotonic by session counter, cheap), then mtime tiebreak across agents on each agent's latest. The naive alphabetical sort across `claude-*`/`gemini-*` prefixes always puts gemini last regardless of write time and was caught by local shield review pre-merge.
+
+  **`@mmnto/cli` signoff skill.** `SIGNOFF_SKILL_CONTENT` in `init-templates.ts` rewrites the procedure for post-Proposal-282 reality: hardcoded agent-id map (cohort-wide; override hook via `.totem/orchestration/config.json` `host_agents`), `resolveOrchestrationPaths` path discovery, null-source manual-mkdir prose, gitignore-aware no-commit/no-push flow. Source-of-truth for the skill is `.claude/skills/signoff/SKILL.md` with the `installed-skills-match-source.test.ts` invariant locking template content against the source file.
+
+  **Tests.** Resolver: 18 tests covering presence permutations (none / partial / full / multi-agent / cross-repo), path normalization, file-in-place-of-subdir, and 6 agentId validation cases (empty / `..` / `/` / `\\` / null byte / non-string). State-extractor: 7 new tests covering orchestration-vs-substrate precedence, single-agent-only, both-agents-populated mtime semantics, and cross-agent mtime tiebreak. Full sweep: 1976 `@mmnto/totem` + 151 `@mmnto/mcp` + 2192 `@mmnto/cli` tests green.
+
+  **Sequencing.** Phase 4 PR A is the first of three: PR A (this — bundled impl) → PR B (`mmnto-ai/totem-status` dashboard repoint, Go side) → PR C (cohort version bump). The cutover broadcast (last substrate write) is strategy-Claude's lane gated on all three landing.
+
+- Updated dependencies [5d96b99]
+  - @mmnto/totem@1.43.1
+
+## 1.43.0
+
+### Patch Changes
+
+- Updated dependencies [c0c4496]
+  - @mmnto/totem@1.43.0
+
+## 1.42.0
+
+### Patch Changes
+
+- Updated dependencies [14fbb74]
+  - @mmnto/totem@1.42.0
+
+## 1.41.0
+
+### Patch Changes
+
+- Updated dependencies [9bc412c]
+  - @mmnto/totem@1.41.0
+
+## 1.40.2
+
+### Patch Changes
+
+- Updated dependencies [d725010]
+  - @mmnto/totem@1.40.2
+
+## 1.40.1
+
+### Patch Changes
+
+- a75f126: fix(mcp): raise non-Windows vitest timeout floor 5s → 15s to absorb shared-runner cold-import variability
+
+  `packages/mcp/src/ledger-writer.test.ts` uses a `vi.resetModules() + await import('./ledger-writer.js')` pattern in `beforeEach`. Local runs land near 1s for the cold-graph first test (`appends an mcp_call event to events.ndjson with the activity_name`). Under Ubuntu shared-runner CI load (run `25936416424` on the `mmnto-ai/totem#1927` post-merge push), the same test exceeded the 5000ms default and failed, while macOS + Windows in the same run passed.
+
+  The Windows branch already bumped its floor to 30s for subprocess-driving slowness. The same shape of variability — cold-graph imports on shared CI hardware — applies to Linux/macOS too; the floor just hadn't been calibrated for it yet. Raising to 15s gives ~15× headroom over the observed local cost without masking real test slowness in the rest of the `@mmnto/mcp` suite.
+
+  No runtime code change. Test-config only.
+  - @mmnto/totem@1.40.1
+
+## 1.40.0
+
+### Minor Changes
+
+- 986825c: feat(mcp+cli): Trap Ledger activity writers — MCP `mcp_call` + SessionStart `session_start` (A.3.a writers)
+
+  Stacked on #1919 (A.3.a schema). Wires the two activity-event writers that the A.3.b compliance metric will read. Without these writers, the schema is inert — no events of the new types get produced.
+
+  ## Writers shipped
+
+  **MCP `mcp_call` writer** (`packages/mcp/src/ledger-writer.ts`):
+  - New `logMcpCall(activityName)` helper. Fire-and-forget; internal try/catch + outer `.catch()` defense-in-depth at call sites.
+  - Wired into `packages/mcp/src/tools/search-knowledge.ts` — emits `{ type: 'mcp_call', activity_name: 'search_knowledge', session_id, source: 'bot' }` at handler entry. Reads `session_id` from `.totem/ledger/.session-id` if present (TTL 24h), omits when missing.
+  - Other MCP tools (`describe_project`, `add_lesson`, `verify_execution`) intentionally NOT wired in this PR — `search_knowledge` is the only one ADR-029's compliance metric measures. Symmetric wiring deferred to A.3.c when broader observability lands.
+
+  **SessionStart hook writer** (`packages/cli/src/commands/init-templates.ts`):
+  - `CLAUDE_SESSION_START` template extended to mint a session UUID via `crypto.randomUUID()`, persist to `.totem/ledger/.session-id`, and append a `session_start` activity event to `events.ndjson` BEFORE the existing `totem describe` briefing.
+  - Inline implementation (no `@mmnto/totem` import) — hook scripts run via `node` from project root before any package resolution, so they can't depend on the totem npm packages being installed.
+  - Gemini SessionStart hook (`GEMINI_SESSION_START`) intentionally NOT updated in this PR. Symmetric Gemini parity deferred to a follow-on.
+
+  ## New core utilities (`packages/core/src/session-id.ts`)
+  - `mintSessionId()` — wraps `crypto.randomUUID()`.
+  - `writeSessionId(totemDir, sessionId)` — persists to `.totem/ledger/.session-id`. Swallows expected fs error classes (ENOENT/EACCES/EPERM/EROFS) via the optional `onWarn` callback and rethrows unexpected error classes per Tenet 4 Fail Loud.
+  - `readSessionId(totemDir, ttlHours?)` — reads + validates UUID shape + checks mtime against TTL (default 24h). Returns `undefined` for missing/expired/malformed files.
+
+  ## Tests
+  - `packages/core/src/session-id.test.ts` — 15 tests covering mint uniqueness, write/read round-trip, malformed UUID rejection, TTL expiration (file backdating via `utimesSync`), custom TTL argument, trailing-whitespace tolerance, plus fs error class discrimination on read (ENOENT/EACCES/EPERM/EROFS swallow vs unexpected rethrow per Tenet 4).
+  - `packages/mcp/src/ledger-writer.test.ts` — 5 tests covering event emission, session_id population/omission, getContext failure (must not throw), append-don't-overwrite.
+  - `packages/mcp/src/tools/search-knowledge.test.ts` — 2 new integration tests verifying handler emits `mcp_call` with `activity_name: 'search_knowledge'`, including the dimension-mismatch error path (invocation, not success, is what ADR-029 measures).
+  - `packages/cli/src/commands/init.test.ts` — 5 new tests covering the SessionStart template's session-id minting, persistence, ledger-event emission, agent_source stamping (Claude-specific), and fire-and-forget error-handling.
+
+  ## Backward compatibility
+
+  Same forward-only story as A.3.a schema:
+  - Pre-writers Trap Ledgers don't contain `mcp_call` or `session_start` events — readers parse them fine when they appear post-upgrade.
+  - SessionStart hook ledger-write block is in its own try/catch; if it fails (read-only filesystem, missing perms, etc.), the briefing path still runs.
+
+  ## ADR alignment
+  - ADR-029 § Session Heuristic: explicit UUID supersedes the rolling-2h activity heuristic when `.session-id` is present.
+  - ADR-078 § Event Attribution: `source: 'bot'` for both writers (emitter = MCP server / hook subsystem). In this lift, `session_start` includes `agent_source: 'claude'` (the Claude hook template knows its vendor); MCP `mcp_call` agent attribution is deferred to A.3.c via orchestrator → MCP correlation propagation.
+  - ADR-077 Smart Briefing: SessionStart hook already shipped (`installClaudeHooks` scaffolds the script); this PR only extends its body.
+
+  ## Out of scope (next sub-lifts)
+  - **A.3.b** — `totem doctor --compliance` reads these events and computes the ADR-029 metric (~1 week).
+  - **A.3.c** — orchestrator → MCP correlation_id propagation; populates `agent_source` (~1 week).
+  - **A.4.a / A.4.b** — PreToolUse soft-block + pre-push hard-block (per C-12); reads `mcp_call` events to gate Write/Edit on `proposals/active/**`, `adr/**`, `research/**`.
+  - **Gemini SessionStart writer** — symmetric pattern, deferred for parity sweep.
+  - **Other MCP tools** (`describe_project`, `add_lesson`, `verify_execution`) — wire `logMcpCall` when needed for broader observability.
+
+### Patch Changes
+
+- Updated dependencies [986825c]
+  - @mmnto/totem@1.40.0
+
+## 1.39.0
+
+### Minor Changes
+
+- 1934f13: feat(core): Trap Ledger schema extension — agent attribution + activity events (A.3.a)
+
+  Forward-only schema extension to `LedgerEventSchema` in `packages/core/src/ledger.ts`. First lift of the A.3 telemetry sprint (three-stream claim-discipline consensus, design doc at `mmnto-ai/totem-substrate:.handoff/_shared/2026-05-15-a3a-schema-extension-design.md`).
+
+  **New event types** (activity family):
+  - `mcp_call` — MCP tool invocation; `activity_name` discriminates (`search_knowledge`, `describe_project`, ...)
+  - `tool_call_first_significant` — first non-Read/Grep/Glob orchestrator tool call in session
+  - `hook_fire` — lifecycle hook executed; `activity_name` discriminates (`SessionStart`, `PreToolUse`, `pre-push`, ...)
+  - `session_start` — SessionStart hook fired; new `session_id` minted
+
+  **New optional fields:**
+  - `agent_source: 'claude' | 'gemini' | 'human'` — agent runtime attribution, orthogonal to `source` (emitting subsystem). Implements ADR-078 § Event Attribution; renamed from the ADR's `source` to disambiguate against the load-bearing emitter identifier already in production.
+  - `session_id` (UUID) — session correlation, persisted at `.totem/ledger/.session-id` per ADR-029 § Session Heuristic.
+  - `correlation_id` (UUID) — trace correlation per ADR-014; populated by A.3.c end-to-end propagation work.
+  - `activity_name` — sub-type discriminator for activity events.
+
+  **Field relaxations:** `ruleId` and `file` are now optional at the schema level to accommodate activity events. Writer-side discipline enforces required-by-type for `suppress` / `override` / `exemption`. Promotion to a Zod `discriminatedUnion` is deferred to A.3.c per design doc OQ-1 (strategy-Claude T0345Z disposition agreed; rationale and gap-filler tests in `ledger.test.ts` § "writer-side per-branch field presence" lock the discipline until the schema enforces it structurally).
+
+  **Backward compatibility:**
+  - Pre-A.3.a override events (no new fields) parse fine — all new fields optional.
+  - Post-A.3.a activity events read by pre-A.3.a code: silently dropped (`safeParse` fails on unknown enum value, line skipped). Acceptable — no data corruption, only telemetry-visibility loss in stale tooling. Cohort version bump after merge closes this naturally.
+
+  **Doc-sync (bundled):** `docs/wiki/trap-ledger.md` example corrected — pre-existing drift surfaced during A.3.a empirical pass. Three drifts fixed:
+  - Example `type` was `"exception"` (invalid; not in the enum) → now `"suppress"`.
+  - Example `source` was `"totem-context"` (bypass-marker; conflated with code's emitter identifier) → now `"lint"`.
+  - Prose claimed `// totem-context:` directives log `override` events — corrected to `suppress` per code comment in `LedgerEventSchema.type`.
+
+  Activity-event example added for `mcp_call` / `search_knowledge` shape.
+
+  **Out of scope (next sub-lifts):**
+  - A.3.b: `totem doctor --compliance` reads this schema and computes the ADR-029 metric (~1 week).
+  - A.3.c: orchestrator → MCP `correlation_id` propagation (~1 week).
+  - A.4.a / A.4.b: PreToolUse soft-block + pre-push hard-block pair (per C-12, ships alongside A.3.a).
+
+  ADR-078 surface amendment (rename agent attribution from `source` to `agent_source` in § Decision 2) landed at `mmnto-ai/totem-strategy#329` (commit `b830e0c` on main). Includes the first `Falsifying Metric:` field in the ecosystem per Tenet 19 — sibling capability-claim ADRs 014/029/044 backfilled in `mmnto-ai/totem-strategy#330`.
+
+### Patch Changes
+
+- Updated dependencies [1934f13]
+  - @mmnto/totem@1.39.0
+
+## 1.38.0
+
+### Minor Changes
+
+- 923deb0: feat(doctor): add `--strict` mode + pre-push hook integration + CI workflow template (#1908)
+
+  Implements Proposal 273 § 7 routing matrix rows 5+6 (Repo + Auto + Both) for the first repo-state diagnostic (`checkAgentsMdCanonical`, shipped in #1907).
+  - `totem doctor --strict` now exits non-zero when any check reports `fail` (`warn` results remain informational). Default behavior unchanged.
+  - Pre-push hook injects `totem doctor --strict` inside the existing strict-tier guard (`is_agent=1` or `TOTEM_HOOK_TIER=strict`), mirroring the `totem review` shield gate. Standard-tier humans bypass; agents and explicit strict-tier operators get the gate.
+  - New `.github/workflows/totem-doctor.yml` template runs `doctor --strict` on PR + push to main. Cohort repos can copy or reference.
+
+  Exit-code decision lives at the CLI edge — `doctorCommand` returns `DiagnosticResult[]` and does not touch `process.exit` / `process.exitCode`.
+
+  **Calibration fix bundled.** `checkEmbeddingConfig` previously reported `fail` when the configured embedder's env key (`OPENAI_API_KEY` / `GEMINI_API_KEY` / `GOOGLE_API_KEY`) was missing. That misclassified an operator-setup state as a repo defect — empirically surfaced when `totem doctor --strict` ran in CI on this PR (CI intentionally lacks the keys). Both branches now return `warn`, mirroring `checkOllama`'s warn-on-unreachable pattern. The repo's config is correct; the local environment is incomplete.
+
+### Patch Changes
+
+- Updated dependencies [923deb0]
+  - @mmnto/totem@1.38.0
+
+## 1.37.0
+
+### Patch Changes
+
+- @mmnto/totem@1.37.0
+
+## 1.36.0
+
+### Patch Changes
+
+- Updated dependencies [1122e60]
+  - @mmnto/totem@1.36.0
+
+## 1.35.0
+
+### Patch Changes
+
+- @mmnto/totem@1.35.0
+
+## 1.34.3
+
+### Patch Changes
+
+- @mmnto/totem@1.34.3
+
+## 1.34.2
+
+### Patch Changes
+
+- @mmnto/totem@1.34.2
+
+## 1.34.1
+
+### Patch Changes
+
+- Updated dependencies [9e7606d]
+  - @mmnto/totem@1.34.1
+
+## 1.34.0
+
+### Patch Changes
+
+- Updated dependencies [f4c09b6]
+  - @mmnto/totem@1.34.0
+
+## 1.33.0
+
+### Patch Changes
+
+- Updated dependencies [3c3f48e]
+  - @mmnto/totem@1.33.0
+
+## 1.32.0
+
+### Patch Changes
+
+- Updated dependencies [e378ab4]
+  - @mmnto/totem@1.32.0
+
+## 1.31.0
+
+### Patch Changes
+
+- Updated dependencies [2003419]
+  - @mmnto/totem@1.31.0
+
+## 1.30.1
+
+### Patch Changes
+
+- Updated dependencies [73396f0]
+  - @mmnto/totem@1.30.1
+
+## 1.30.0
+
+### Patch Changes
+
+- Updated dependencies [0c5fd65]
+  - @mmnto/totem@1.30.0
+
+## 1.29.0
+
+### Minor Changes
+
+- Add universal agent orientation lesson.
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.29.0
+
+## 1.28.1
+
+### Patch Changes
+
+- @mmnto/totem@1.28.1
+
+## 1.28.0
+
+### Minor Changes
+
+- bd3fd71: `totem sync` Phase A / Phase B architectural separation (mmnto-ai/totem#1811, ADR-101).
+
+  `totem sync` decomposes into two independently-runnable phases:
+  - **Phase A** — deterministic pack-resolution + `installed-packs.json` write (no API key required, runs in CI).
+  - **Phase B** — vector-store embedding sync (still requires the embedding key; unchanged).
+
+  New mutually-exclusive flags on `totem sync`:
+  - `--packs-only` (Lite tier): write the pack manifest only; skip embedding sync, prune, the global registry update, and the `review-extensions.txt` write. Designed for CI environments without API keys after a `@mmnto/totem` cohort bump where pack-resolution alone needs to run before `totem lint` recognizes newly registered Tree-sitter languages.
+  - `--index-only` (Standard tier): run only the embedding sync; skip pack-resolution. Use when `installed-packs.json` is already current and only the vector store needs to re-embed.
+
+  `--packs-only` hard-errors when combined with `--index-only`, `--full`, or `--prune` — Phase B is skipped under `--packs-only`, so those flags would silently no-op. `--index-only` composes with `--full` and `--prune` since all three modify Phase B.
+
+  The CLI orchestrator now writes `installed-packs.json` BEFORE invoking `runSync` so `--packs-only` can short-circuit cleanly. The default flag-less behavior is observably equivalent to prior releases.
+
+  UX nudge for stale manifests: when a rule expects a Tree-sitter language that isn't registered, the rule-engine now consults `installed-packs.json`'s cohort field and surfaces a structured `STALE_MANIFEST` `TotemError` pointing at `totem sync --packs-only` whenever the manifest is missing, pre-1.27.0, or written by an engine whose `major.minor` differs from the running version. Patch-level cohort drift passes (caret-range pack semver tolerance). Cohort-match falls through to the original "install the pack" `TotemParseError`.
+
+  Schema: `InstalledPacksManifestSchema` gains an optional `cohort: string` field (semver). Pre-1.27.0 manifests without the field continue to parse cleanly. Stamped at write time by `writeInstalledPacksManifest()` from `resolveEngineVersion()`; tests can pre-populate the field to override the stamp.
+
+  New public surfaces (additive):
+  - `resolveEngineVersion(): string`
+  - `detectStaleManifest(opts): StaleManifestDetection | null`
+  - `staleManifestError(detection, context): TotemError`
+  - `TotemErrorCode` adds `'STALE_MANIFEST'` and `'FLAG_CONFLICT'`.
+
+### Patch Changes
+
+- Updated dependencies [bd3fd71]
+  - @mmnto/totem@1.28.0
+
+## 1.27.0
+
+### Patch Changes
+
+- 5f4658f: Add sediment-aware substrate path resolver for ADR-100 Phase C.
+
+  `resolveSubstratePaths(configRoot, opts?)` walks four precedence layers — env (`TOTEM_SUBSTRATE_PATH`) → config (`TotemConfig.substratePath`) → sibling-walk (up to 3 levels from `configRoot` looking for `<parent>/totem-substrate/`) → repo-local sediment (`<configRoot>/.handoff/` and `<configRoot>/.journal/`). Layers 1-3 require full substrate shape (`.git/` + `.handoff/` + `.journal/`) to gate stale empty clones. Layer 4 accepts partial sediment (either dir alone). Returns `{ handoffRoot, journalRoot, source }`; null paths with `source: 'none'` is the ADR-090 graceful-degradation surface.
+
+  MCP `extractStrategyPointer` now uses a dual-resolver: `resolveStrategyRoot` for the strategy SHA (still in `mmnto-ai/totem-strategy`) and `resolveSubstratePaths` for the journal lookup (now substrate-preferred per Phase B cutover). The `latestJournal` field semantic is unchanged; the comment at `describe-project.ts:60` describes the new substrate-preferred-with-sediment-fallback resolution.
+
+  New public API (`@mmnto/totem`): `resolveSubstratePaths`, types `SubstratePaths` / `SubstrateResolverConfig` / `SubstrateResolverOptions`, plus `TotemConfigSchema.substratePath` (optional string, mirrors `strategyRoot` parse-time validation).
+
+  Closes #1820.
+
+- Updated dependencies [5f4658f]
+  - @mmnto/totem@1.27.0
+
+## 1.26.1
+
+### Patch Changes
+
+- @mmnto/totem@1.26.1
+
+## 1.26.0
+
+### Patch Changes
+
+- Updated dependencies [c00dc7b]
+  - @mmnto/totem@1.26.0
+
+## 1.25.0
+
+### Patch Changes
+
+- @mmnto/totem@1.25.0
+
+## 1.24.0
+
+### Minor Changes
+
+- 67c3ad3: **ADR-091 § Bootstrap Semantics: pack pending-verification install→lint promotion (#1684)**
+
+  Closes the cloud-compile bootstrap gap that ADR-091 § Bootstrap Semantics defined: pack rules cannot be trusted to fire on the consumer's codebase until Stage 4 verifies them locally, so they now enter the consumer's manifest as `'pending-verification'` and the next `totem lint` runs the verifier and promotes them per outcome.
+
+  **`CompiledRule.status` enum extended** with a fourth lifecycle value `'pending-verification'` alongside `'active' | 'archived' | 'untested-against-codebase'`. The lint-execution path (`loadCompiledRules`) treats it as inert exactly like `'archived'` and `'untested-against-codebase'`; the admin path (`loadCompiledRulesFile`) returns it unfiltered so the promotion interceptor can find pending entries.
+
+  **`totem install pack/<name>`** now stamps every pack rule `'pending-verification'` regardless of the status the pack shipped with. The pack's authoring environment cannot have run Stage 4 against the consumer's codebase, so the cloud-compile status is meaningless on the consumer side. The install command appends `Run \`totem lint\` to activate pack rules` to its output as the activation hint.
+
+  **`.totem/verification-outcomes.json`** is the new committable side-table that memoizes Stage 4 outcomes across runs. The first lint run after install reads pending rules from the manifest, invokes the Stage 4 verifier on each, maps the outcome to one of the four terminal lifecycle values per Invariant #3, atomically writes the outcomes file with canonical-key-order serialization (Invariant #11 — byte-stable across runs so consumer repos see no phantom diffs), and saves the mutated manifest. Subsequent lint runs read the recorded outcome from the file and skip re-verification (Invariant #4); a pack content update produces a new `lessonHash` which has no recorded outcome, so the verifier runs again (Invariant #5).
+
+  **Per-rule verifier-throw isolation** (Invariant #7): one failing rule's verifier-throw does not abort the lint pass; that rule remains `'pending-verification'` and the next lint retries.
+
+  **Empty-pending fast path** (Invariant #9): the common-case lint pass with zero pending rules pays no verification cost and skips the outcomes-file read entirely.
+
+  **New public API** in `@mmnto/totem`:
+  - `promotePendingRules(rules, deps)` and `applyOutcomeToRule(rule, entry)` — the core interceptor.
+  - `readVerificationOutcomes(filePath, onWarn?)` and `writeVerificationOutcomes(filePath, outcomes)` — the persistence layer.
+  - `VerificationOutcomeEntrySchema`, `VerificationOutcomesFileSchema`, `Stage4OutcomeStored` — Zod schemas.
+  - `VerificationOutcomesStore`, `VerificationOutcomesFile`, `VerificationOutcomeEntry`, `Stage4OutcomeStoredValue`, `PromotePendingRulesDeps`, `PromotePendingRulesResult` — types.
+
+  **Naming-collision context (option B):** the original ADR-091 draft specified `.totem/rule-metrics.json` for the verification-outcomes file, but `packages/core/src/rule-metrics.ts` already exists as a per-machine telemetry-cache module (`triggerCount`, `suppressCount`, `evaluationCount`) with a gitignored `.totem/cache/rule-metrics.json` lifetime. ADR-091 § 65 was amended to specify `.totem/verification-outcomes.json` instead — separate filename for the new committable verification state, separate module name (`verification-outcomes.ts`) for the new schemas + persistence layer.
+
+### Patch Changes
+
+- Updated dependencies [67c3ad3]
+  - @mmnto/totem@1.24.0
+
+## 1.23.0
+
+### Minor Changes
+
+- 94ea4a8: **Pack v0.1 alpha pilot: `@totem/pack-rust-architecture` lift + ADR-091/097 substrate completion (#1773)**
+
+  First non-trivial consumer of the ADR-097 § 10 Pack v0.1 substrate (#1768/#1769/#1770 in 1.22.0). Validates the substrate end-to-end by registering Rust as a language extension and dispatching ast-grep rules against `.rs` source.
+
+  **`@totem/pack-rust-architecture@1.23.0`** — new package (`private: true`)
+  - 8 baseline lessons sourced from `mmnto-ai/liquid-city#134` (slice-6 vehicle-agent + dispersion review cycle, lc-Claude attribution preserved)
+  - Synchronous CJS `register.cjs` wires Rust into both engine paths: `api.registerLanguage('.rs', 'rust', wasmLoader)` for the web-tree-sitter side and `napi.registerDynamicLanguage({ rust })` for the @ast-grep/napi side (v0.1 side-channel, see `@mmnto/totem#1774`)
+  - Bundled `tree-sitter-rust.wasm` (1.1 MB) sourced from `@vscode/tree-sitter-wasm@0.3.1` (MIT, Microsoft) via `prepare`-time copy
+  - `compiled-rules.json` ships one tracer-bullet seed rule (`lesson-8cefba95`, Bevy hot-path `Local<Vec<T>>` per-tick allocation) — full LLM-compile of the 8-lesson set deferred to a focused follow-up since γ (per-language `KIND_ALLOW_LIST`, #1655) is needed before LLM-compile of Rust patterns avoids TS-grammar hallucinations
+  - Runtime integration tests boot the pack via `loadInstalledPacks({ inMemoryPacks })` and verify the seed rule fires on `.rs` source through the full substrate path
+
+  **`@mmnto/totem` — #1654 fix: thread target Lang through the compile-time pattern validator**
+
+  Pre-#1654, `validateAstGrepPattern` always parsed under `Lang.Tsx` regardless of the rule's `fileGlobs`, and `inferBadExampleExts` (smoke gate) used a TS/JS-only regex that silently fell back to the default set for non-TS rules. A Rust pattern would either false-pass under TSX (the `ResMut<TacticalState>` exhibit) or false-fail with a TSX-parser error.
+  - `validateAstGrepPattern(pattern, fileGlobs?)` now resolves the target Lang via `resolveAstGrepLangs(fileGlobs)` and accepts the pattern when any one Lang accepts it. Falls back to `Lang.Tsx` when fileGlobs is empty or no glob carries a registered extension (preserves legacy unscoped-rule semantics).
+  - `inferBadExampleExts` extracts any trailing extension from `fileGlobs` (not just TS/JS); runtime's `extensionToLang` filters out unmapped extensions inside `matchAstGrepPattern` so unmapped extensions cleanly return zero matches without parsing under the wrong grammar.
+  - New `resolveAstGrepLangs` helper exported alongside `extensionToLang` from `ast-grep-query.ts`.
+  - 6 new regression tests covering the LC false-positive exhibit and the TS-fallback preservation invariant.
+
+  **Substrate-extension follow-up filed as #1774 (tier-2, investigation)**: lift the napi-side language registration into `PackRegistrationAPI.registerNapiLanguage` once N≥2 pack consumers exist. PR-B's side-channel pattern in `register.cjs` is the time-boxed precedent that gathers design data; the side-channel is documented as visible debt in the pack's README.
+
+### Patch Changes
+
+- Updated dependencies [94ea4a8]
+  - @mmnto/totem@1.23.0
+
+## 1.22.0
+
+### Patch Changes
+
+- Updated dependencies [5f2b0f2]
+  - @mmnto/totem@1.22.0
+
+## 1.21.0
+
+### Patch Changes
+
+- Updated dependencies [2ccef47]
+  - @mmnto/totem@1.21.0
+
+## 1.20.0
+
+### Patch Changes
+
+- @mmnto/totem@1.20.0
+
+## 1.19.0
+
+### Patch Changes
+
+- Updated dependencies [9686817]
+  - @mmnto/totem@1.19.0
+
+## 1.18.3
+
+### Patch Changes
+
+- Updated dependencies [3e03fbf]
+  - @mmnto/totem@1.18.3
+
+## 1.18.2
+
+### Patch Changes
+
+- 8addc49: Promote `sanitizeForTerminal` helper from `@mmnto/cli` to `@mmnto/totem` core (`mmnto-ai/totem#1744`). MCP and other downstream consumers can now import the canonical helper directly from `@mmnto/totem` instead of duplicating the regex inline.
+
+  Internal-only refactor: pure file relocation + import-path updates across 5 consumers (4 cli + 1 mcp). The MCP `context.ts` `strategyStatus.reason` rendering now calls `sanitizeForTerminal()` then applies the existing `\n`/`\t` flatten/collapse/trim chain inline (the helper deliberately preserves `\n`/`\t` for callers wanting multi-line content). Tests for the helper move with the source into `packages/core/`.
+
+  The `cli/src/utils.ts` re-export of `sanitizeForTerminal` is dropped; consumers now import directly from `@mmnto/totem`. The orchestrator-graph guard in `shield-estimate.test.ts` continues to hold — `@mmnto/totem` core does not transit the orchestrator graph the way `cli/src/utils.ts` does via its static `./orchestrators/orchestrator.js` import.
+
+- Updated dependencies [8addc49]
+  - @mmnto/totem@1.18.2
+
+## 1.18.1
+
+### Patch Changes
+
+- @mmnto/totem@1.18.1
+
+## 1.18.0
+
+### Minor Changes
+
+- bea4cce: feat(consumers): port to `resolveStrategyRoot` (mmnto-ai/totem#1710)
+
+  Builds on the `@mmnto/totem` resolver substrate. Each programmatic consumer
+  of the strategy repo now reads through `resolveStrategyRoot` and degrades
+  gracefully when the strategy root is unresolvable.
+
+  **`@mmnto/mcp`:**
+  - **Schema shape change (treated as minor — see rationale below):**
+    `describe_project` rich-state `strategyPointer` payload flips from
+    `{ sha, latestJournal }` to a discriminated union:
+    `{ resolved: true, sha, latestJournal } | { resolved: false, reason }`.
+    Agents that read the rich-state pointer must check `resolved` before
+    reading `sha` / `latestJournal`. Only affects callers that opted in via
+    `includeRichState: true` — the legacy slim payload is byte-identical.
+
+    **Rationale for minor (not major):** (a) success-path is additive —
+    the resolved branch preserves both `sha` and `latestJournal` fields;
+    the failure-path now structures what was previously a pair of `null`s
+    into a `{ resolved: false, reason }` envelope. (b) No known
+    programmatic JSON consumers — the field is consumed across the totem
+    ecosystem (mmnto-ai/totem, mmnto-ai/totem-strategy,
+    mmnto-ai/totem-playground) exclusively as agent-rendered text via
+    SessionStart hooks. (c) No queued cluster of breaking changes to ride
+    alongside in a 2.0.0 bundle. The deferred-breaking-changes ledger
+    (mmnto-ai/totem#1746) records this decision so the precedent stays
+    visible; when that ledger reaches 2-3 substantive items, that bundle
+    becomes 2.0.0.
+
+  - **Auto-injected strategy linkedIndex.** `initContext` consults
+    `resolveStrategyRoot` and prepends the resolved strategy path to the
+    linkedIndexes iteration with a stable link name `'strategy'`. Boundary
+    routing (`boundary: 'strategy'`) keeps working regardless of physical
+    source (sibling / submodule / env override). Init-time warnings surface
+    ONLY when the user explicitly signaled a strategy expectation (env or
+    config); zero-config projects without a strategy repo skip silently.
+
+  **`@mmnto/cli`:**
+  - `totem proposal new` / `totem adr new` use `resolveStrategyRoot` and
+    throw an actionable `TotemError(CONFIG_MISSING)` with a sibling-clone
+    hint and `TOTEM_STRATEGY_ROOT` reference when unresolved (per the
+    ADR-088 design rationale on actionable error UX). Standalone
+    strategy-repo case (cwd IS the strategy repo) is detected before the
+    resolver runs.
+  - New `totem doctor` "Strategy Root" advisory diagnostic (`pass` /
+    `warn`, never `fail`).
+  - Bench scripts (`scripts/benchmark-compile.ts`, `scripts/bench-lance-open.ts`)
+    hard-fail with actionable messages when the strategy root is unresolvable.
+
+  **`totem.config.ts`:** the literal `linkedIndexes: ['.strategy']` is
+  removed; the resolver is now the single source of truth for the strategy
+  mesh path.
+
+  **Documentation:** new `CONTRIBUTING.md` "Strategy Repo Expectations"
+  section + `docs/architecture.md` update describing the configurable
+  resolver.
+
+  `.gitmodules` removal is a separate follow-up after this lands.
+
+### Patch Changes
+
+- Updated dependencies [bea4cce]
+  - @mmnto/totem@1.18.0
+
+## 1.17.1
+
+### Patch Changes
+
+- @mmnto/totem@1.17.1
+
+## 1.17.0
+
+### Minor Changes
+
+- 6fd5271: `totem retrospect <pr>` — bot-tax circuit-breaker (mmnto-ai/totem#1713).
+
+  Closes mmnto-ai/totem#1713. Reads a PR's bot-review history live, groups findings into push-based rounds via each review submission's `commit_id` (one round per push, not one round per submission), enriches each finding with cross-PR-recurrence flags read from `.totem/recurrence-stats.json` (mmnto-ai/totem#1715 substrate, read-only) plus rule-coverage flags read from `.totem/compiled-rules.json`, and emits a deterministic verdict per finding: `route-out`, `in-pr-fix`, or `undetermined`. The classifier is a fixed table over the four-axis cube `(severityBucket × roundPosition × crossPrRecurrenceBucket × coveredByRule)`; route-out reasons come from a closed catalog so the report doesn't accumulate one-off prose strings.
+
+  No LLM. No GitHub mutation. Read-only outside the optional `--out <path>` JSON write. Sub-threshold runs exit 0 with a benign skip message; `--force` overrides. The no-LLM invariant is locked down by both a static-source-grep guard (mirrors `totem review --estimate` from mmnto-ai/totem#1714) and a runtime check that every dynamic import in the command file resolves to a non-LLM module.
+
+  New CLI surface: `totem retrospect <pr-number>` with `--threshold <n>` (default 5), `--force`, `--out <path>`. Requires `gh` authenticated against the repo. The `--auto-file` flag proposed in the auto-spec is intentionally deferred to a follow-up ticket (mass-filing is irreversible; v0.1 emits suggested issue titles + bodies the human can copy-paste).
+
+  New core surface: `RetrospectRoundSchema`, `RetrospectClassificationSchema`, `RetrospectFindingSchema`, `RetrospectReportSchema` plus pure helpers `groupFindingsByRound`, `classifyFinding`, `buildStopConditions`, `computeDedupRate`, `signatureOfBody`, `toRoundPosition`, `toCrossPrBucket`. `toSeverityBucket` is now exported from `@mmnto/totem` so the bot-tax cluster (`#1715` + `#1714` + `#1713`) shares one severity vocabulary. `GitHubCliPrAdapter` gains a `fetchReviews(prNumber)` method that reads `gh api repos/.../pulls/N/reviews --paginate` for `commit_id` + `submitted_at` (the existing `fetchPr` JSON shape doesn't include `commit_id`).
+
+### Patch Changes
+
+- Updated dependencies [6fd5271]
+  - @mmnto/totem@1.17.0
+
+## 1.16.1
+
+### Patch Changes
+
+- @mmnto/totem@1.16.1
+
+## 1.16.0
+
+### Minor Changes
+
+- 2d5b9ac: `totem stats --pattern-recurrence` — cross-PR recurrence clustering substrate.
+
+  Closes mmnto-ai/totem#1715. Fetches bot-review findings (CodeRabbit + Gemini Code Assist) across the most recent merged PRs (`--history-depth`, default 50, capped at 200), folds in trap-ledger `override` events as co-equal signals, clusters them by a normalized signature (paths + line numbers + code-fence content stripped), filters out clusters covered by an existing compiled rule via Jaccard ≥ 0.6 keyword-overlap on the rule's `message`, and writes the surviving patterns at-or-above `--threshold` (default 5) to `.totem/recurrence-stats.json`. The console summary shows the top 5 by occurrence count.
+
+  This is the substrate of truth for the upcoming `totem retrospect <pr>` (mmnto-ai/totem#1713 bot-tax circuit breaker) and `totem review --estimate` (mmnto-ai/totem#1714 pre-flight estimator) — patterns from those features will read this file rather than re-scan PR history per invocation.
+
+  Output shape is versioned (`version: 1`), stable, and Zod-validated; consumers can parse against `RecurrenceStatsSchema` exported from `@mmnto/totem`. Atomic writes via temp + rename keep concurrent invocations safe.
+
+### Patch Changes
+
+- Updated dependencies [2d5b9ac]
+  - @mmnto/totem@1.16.0
+
+## 1.15.10
+
+### Patch Changes
+
+- 4bb87e2: `totem review` operator-dogfood bundle: override stamps the push-gate cache, plus an explicit `--diff <ref-range>` flag.
+  - **mmnto-ai/totem#1716** — `totem review --override <reason>` now writes `.totem/cache/.reviewed-content-hash` after recording the override, so the push-gate hook unblocks immediately. Closes the tribal-knowledge `git reset --soft HEAD~1 && totem review --staged` workaround used since the override flag was added. New `recordShieldOverride` helper bundles the trap-ledger write and content-hash stamp into a single call site exercised by both the V2 structured-verdict path and the V1 fallback.
+  - **mmnto-ai/totem#1717** — adds `totem review --diff <ref-range>` for explicit diff scope (e.g. `--diff HEAD^..HEAD`, `--diff main...feature`). Bypasses the implicit working-tree → staged → branch-vs-base fallback. The chosen diff source is logged to stderr (`Diff source: explicit-range`, `staged`, `uncommitted`, or `branch-vs-base`) so the operator's mental model matches the actual git invocation. Diffs exceeding 50,000 chars now surface a fail-loud truncation warning at the resolution layer — before the LLM call — so the operator can re-run with a narrower range instead of paying for a degraded review. The flag is documented in `--help`'s "Diff resolution" section. New `getGitDiffRange(cwd, range)` core helper rejects flag-injection ranges (leading `-`) and empty values; arg-array `safeExec` invocation prevents shell-metachar interpretation.
+
+- Updated dependencies [4bb87e2]
+  - @mmnto/totem@1.15.10
+
+## 1.15.9
+
+### Patch Changes
+
+- e8792e5: fix(core): enable ast-grep verification in `verifyRuleExamples` (mmnto-ai/totem#1699)
+
+  AI Studio corpus audit ([mmnto-ai/totem-strategy#150](https://github.com/mmnto-ai/totem-strategy/pull/150), B-Q4.1 / Q5 P2-1) finding. `verifyRuleExamples` short-circuited every non-regex rule via `if (rule.engine !== 'regex') return null;`, so ast-grep rules were never verified against their inline `**Example Hit:**` / `**Example Miss:**` blocks during compilation or via `totem rule test`. The downstream tester (`packages/core/src/rule-tester.ts`) already supports ast-grep through its `isAstGrep` branch — the entry point upstream of it was dropping the rule before the existing path could run.
+
+  Real cases were slipping through this gap. Archived rule `e2341ed9229f9a60` shipped with pattern `new $ERROR($$$ARGS)`, matching every error class instantiation; the smoke-gate's bidirectional check (mmnto-ai/totem#1591) would have caught it at compile time if `verifyRuleExamples` had not blocked the engine.
+  - **Guard narrowed.** Changed `if (rule.engine !== 'regex') return null;` to `if (rule.engine !== 'regex' && rule.engine !== 'ast-grep') return null;`. Tree-sitter (`engine: 'ast'`) stays skipped because `testRule`'s non-`ast-grep` branch routes through `applyRulesToAdditions`, which is the regex pipeline and does not handle S-expression queries.
+  - **Tests.** Added two regression cases pinning the new behavior: ast-grep PASS on a matching badExample / non-matching goodExample, and ast-grep FAIL on the over-broad `new $ERROR($$$ARGS)` shape (the `e2341ed9229f9a60` exhibit class). The pre-existing test that asserted ast-grep returns null is rewritten to cover the Tree-sitter `'ast'` engine, which still legitimately short-circuits.
+  - **No CLI surface change required.** `totem rule test <ast-grep-hash>` now returns PASS / FAIL against inline examples instead of warning "Engine 'ast-grep' does not support inline example testing." The compile-pipeline smoke gate (`compile-smoke-gate.ts`) inherits ast-grep coverage through the same entry point.
+
+  Closes mmnto-ai/totem#1699.
+
+- Updated dependencies [e8792e5]
+  - @mmnto/totem@1.15.9
+
+## 1.15.8
+
+### Patch Changes
+
+- d1e0bc2: fix(cli): switch triage-pr dedup identity to deterministic rootCommentId (#1666)
+
+  Strategy upstream-feedback item 024 substrate. The previous `deduplicateFindings` used a `(file, line, body keyword Jaccard ≥ 0.3, line proximity ≤ 3)` fuzzy-merge heuristic. On `mmnto-ai/liquid-city#80` R3, GCA emitted six distinct high-severity findings on the same `(file, line)` anchor (all six anchored at the same rule-section start line because GitHub's pull-request inline-comment API requires a `line` field and GCA chose the rule-section header). The fuzzy merge collapsed all six into one entry, hiding five GCA-high findings from the triage summary.
+  - **Strict-by-id dedup.** `deduplicateFindings` now uses `rootCommentId` as the primary dedup primitive. Two findings with different `rootCommentId` are ALWAYS distinct, even when bodies are byte-identical and they anchor at the same `(file, line)`.
+  - **Body-hash fallback** for synthesized review-body findings (`extractReviewBodyFindings` emits these with `file === '(review body)'` and no `rootCommentId`). Map key is `(file, body)` directly — bounded length, no crypto cost, V8 handles long string keys natively.
+  - **Cross-bot independence is now a feature.** When CR and GCA independently flag the same `(file, line)`, both findings surface so consumers can read the agreement as elevated-confidence signal (per the strategy bot-nuance file's "Cross-bot agreement = elevated finding confidence" pattern). The previous fuzzy merge silently masked that signal.
+  - **`mergedWith` field stays on the schema, undefined in output.** Backward-compat shim so downstream display consumers don't need a coordinated rewrite.
+  - **`extractKeywords` and `jaccardSimilarity` helpers retained as exports** for the deferred `--no-dedup` debug flag (#TBD-follow-up) and ad-hoc analysis scripts. No longer called by core dedup logic.
+
+  Compile-pipeline failure mode shifts from "silent collapse of distinct findings" to "deterministic distinctness when API IDs differ." The 14 prior fuzzy-merge tests are rewritten to match the new semantics; the LC#80 R3 exhibit (6 distinct rootCommentIds on the same file:line) is pinned as a regression test.
+
+  Closes the strategy upstream-feedback batch from `mmnto-ai/totem-strategy#133` — items 020 (#1663), 021 (#1664), 022 (Proposal 248), 023 (#1665), 024 (#1666) all complete.
+
+- Updated dependencies [d1e0bc2]
+  - @mmnto/totem@1.15.8
+
+## 1.15.7
+
+### Patch Changes
+
+- 9e3214e: fix(core): emit `self-suppressing-pattern` reasonCode for self-suppressing skips (#1664)
+
+  Strategy upstream-feedback item 021 substrate. Pre-fix, the compile worker silently dropped lessons whose compiled pattern would match `totem-ignore` / `totem-context` (and self-suppress at runtime) — the rejection mapped to `pattern-syntax-invalid` (a retry-pending code), so the lesson never landed in `nonCompilable`. Bot reviewers reading `compiled-rules.json` would synthesize "missing from manifest" findings because the audit trail was empty.
+  - New `'self-suppressing-pattern'` member on `NonCompilableReasonCodeSchema`. Sibling to `'context-required'` (#1639) and `'semantic-analysis-required'` (#1640) — both are terminal classifier codes for structural incapacity.
+  - Terminal write-policy: NOT in `LEDGER_RETRY_PENDING_CODES`, so `shouldWriteToLedger('self-suppressing-pattern')` returns true. Self-suppression is structural — the same lesson body would produce the same self-suppressing pattern on every retry, so retry-pending would loop forever.
+  - `classifyBuildRejectReason` updated: rejection messages containing `'suppression directive'` now map to `'self-suppressing-pattern'` (was: `'pattern-syntax-invalid'`). Other rejection paths (`'Rejected regex'`, `'Invalid ast-grep pattern'`) keep their existing mappings.
+  - Bot reviewers can now cite the explicit `reasonCode: 'self-suppressing-pattern'` entry in `nonCompilable` instead of inferring "this lesson is missing" from headcount mismatches.
+
+- Updated dependencies [9e3214e]
+  - @mmnto/totem@1.15.7
+
+## 1.15.6
+
+### Patch Changes
+
+- 20c491c: fix(core+cli): honor source-declared `**Scope:**` over LLM emission on Pipeline 2/3 (#1665)
+
+  Strategy item 023 substrate. Inverse of `mmnto-ai/totem#1626` (auto-ADD): the compile worker silently DROPPED test/spec exclusion globs (`!**/*.test.*`, `!**/*.spec.*`) that lessons declared in their `**Scope:**` line. Confirmed twice on `mmnto-ai/liquid-city#80` for rules `5bcc8aad9096c817` and `6c457c82d3945d15`.
+  - New `parseDeclaredScope(body)` helper in `@mmnto/totem` that parses the lesson body's `**Scope:**` prose declaration into a glob list. Preserves `!`-prefixed exclusion entries verbatim and preserves authored order. Returns `undefined` for missing/empty/whitespace-only declarations.
+  - New `isGlobSetEqual(a, b)` pure helper for set-of-strings comparison. Order-insensitive, duplicate-insensitive, sign-sensitive (`'!**/*.test.*'` does not equal `'**/*.test.*'`).
+  - `extractManualPattern` (Pipeline 1) refactored to delegate Scope parsing to `parseDeclaredScope` so the manual flow shares a single source of truth with Pipeline 2/3.
+  - `BuildCompiledRuleOptions.lessonBody?: string` opts callers into the override path. When supplied AND the body declares a `**Scope:**` line, the parsed source-Scope glob list takes precedence over `parsed.fileGlobs` regardless of LLM emission. Both lists pass through `sanitizeFileGlobs` for parity (shallow → recursive normalization).
+  - `BuildRuleResult.scopeOverride?: { from: string[] | undefined; to: string[] }` reports the override event when the override actually changed the emitted globs. Threaded through rejection paths too. Mirrors `severityOverride` discipline from #1656.
+  - New `onScopeOverride` callback on `CompileLessonCallbacks` wired to a `writeScopeOverrideTelemetry` closure in CLI `compile.ts` that records `type: 'scope-override'` entries to `.totem/temp/telemetry.jsonl`. Cloud-compile path also wired.
+  - Author intent supreme: source-declared Scope overrides the LLM's emission AND the #1626 test-contract auto-include heuristic. The auto-include path stays active only when the lesson omits Scope.
+
+  Compile pipeline failure mode shifts from "silent drop" to "deterministic override + telemetry on divergence." Strict-fail compile gate is deferred to a follow-up if telemetry reveals persistent LLM drift.
+
+- Updated dependencies [20c491c]
+  - @mmnto/totem@1.15.6
+
+## 1.15.5
+
+### Patch Changes
+
+- aebf82f: feat(core+mcp): `applies-to` lesson frontmatter for role-of-code citation accuracy (#1663)
+
+  Strategy item 020 substrate. Lesson frontmatter gains an `applies-to:` field carrying a closed role taxonomy (`mutator`, `boundary`, `aggregator`, `hot-path`, `boundary-test`, `infrastructure`, `presentation`, `any`) so downstream bot reviewers can filter lessons by role match instead of grep-by-topic heuristics.
+  - New public exports from `@mmnto/totem`: `LessonRole`, `LessonRoleSchema`, `filterLessonsByRole`, `LessonWithAppliesTo`.
+  - YAML and prose wire formats both supported. YAML accepts list (`applies-to: [mutator, boundary]`) and scalar (`applies-to: mutator`) forms; prose form is `**Applies-to:** mutator, boundary`. Mixed-case input is lowercased; empty arrays normalize to `['any']`; missing field defaults to `['any']`.
+  - `mcp__totem-dev__add_lesson` gains an optional `applies_to` argument (snake_case at the MCP boundary, kebab-case in the on-disk frontmatter per item 020).
+  - Pure `filterLessonsByRole(lessons, targetRole?)` utility exported for downstream consumers; `targetRole` undefined returns input unchanged, otherwise keeps lessons whose `appliesTo` includes the target OR `'any'`.
+  - Backwards-compat: existing 1,159 lessons continue to parse with `appliesTo: ['any']` deterministically; no migration required.
+
+  Bot-prompt integration and the function-role classifier are out of scope for this PR (see follow-up tickets at PR merge). Item 020 is the Proposal 248 (`mmnto-ai/totem-strategy#136`) substrate prereq for per-bot operations packs.
+
+- Updated dependencies [aebf82f]
+  - @mmnto/totem@1.15.5
+
+## 1.15.4
+
+### Patch Changes
+
+- d295439: 1.15.4 bundles two compile-worker prompt classifier improvements that surfaced from downstream consumer friction on `mmnto-ai/liquid-city`. Both close fidelity gaps between the lesson prose authors wrote and the compiled rule that shipped.
+
+  ## Test-contract scope classifier (closes #1626)
+  - New `### Test-Contract Scope Classifier (mmnto-ai/totem#1626)` section on both `COMPILER_SYSTEM_PROMPT` and `PIPELINE3_COMPILER_PROMPT`. Teaches the compile-worker to recognize lessons whose hazard is **behavior inside test files** (assertion conventions, spy / mock contracts, test-fixture hygiene) and emit test-inclusive `fileGlobs` instead of the default `!**/*.test.*` exclusion.
+  - Three positive signals classify a lesson as test-contract: the `testing` tag, test-framework calls in `badExample`/`goodExample` (`describe(`, `it(`, `test(`, `expect(`, `vi.mock(`, `jest.mock(`, `beforeEach(`, `afterEach(`, `vi.spyOn(`, `jest.spyOn(`), or lesson-body references to test-execution-specific behavior.
+  - Broad test-inclusive glob set for test-contract rules: `["**/*.test.*", "**/*.spec.*", "**/tests/**/*.*", "**/__tests__/**/*.*"]`. Narrow test-scoped globs (e.g., `packages/e2e/**/*.spec.ts`) are preserved when the lesson clearly targets them.
+  - False-positive trap guard: the word "contract" alone does NOT classify a lesson as test-scoped. Lessons titled "Define strict API Data Contracts" or "Versioning contracts for REST endpoints" describe application-surface invariants. Classification requires the `testing` tag OR test-framework code in the examples alongside any keyword match.
+
+  **Downstream impact:** Two `liquid-city` rules (`"Normalize temp paths for cross-platform equality"`, `"Spy on logger contracts in tests"`) were shipping with scopes that excluded tests and silently never fired. A follow-up chore cycle (`totem compile --upgrade <hash>` per rule) retriages existing corpus against the new prompt.
+
+  ## Declared severity override (closes #1656)
+  - New `parseDeclaredSeverity(body: string)` helper exported from `@mmnto/totem`. Parses `**Severity:** error` / `Severity: warning` prose declarations from a lesson body and returns a normalized `'error' | 'warning' | undefined`. Tolerates common markdown and punctuation shapes: bold markers (`**`, `*`, `_`) on either side, backtick-wrapped values, trailing sentence punctuation (`.`, `,`, `;`, `:`, `!`, `?`), and combined shapes like `**Severity: error**.`. Strict enum equality follows the strip, so out-of-vocabulary tokens (`info`, `critical`) return `undefined`.
+  - `buildCompiledRule` honors a new `declaredSeverityOverride` option on `BuildCompiledRuleOptions`. Post-LLM override wins over `parsed.severity` regardless of LLM emission. Marker fires in `BuildRuleResult.severityOverride` only when the override actually changed the outcome (declared value differs from `emittedSeverity ?? 'warning'`). Marker is threaded through rejection paths too, so telemetry captures prompt-drift even when the rule fails for other reasons.
+  - New `onSeverityOverride` callback on `CompileLessonCallbacks` fires when the override changes the emitted severity. CLI `compile.ts` wires a `writeSeverityOverrideTelemetry` closure that appends records tagged `type: 'severity-override'` to `.totem/temp/telemetry.jsonl` via the cwd-aware `totemDir` (matches the `mmnto-ai/totem#1645` pattern). Fire-and-forget; sink failures do not interfere with compile results.
+  - New `### Declared Severity (mmnto-ai/totem#1656)` directive section on both compile prompts instructs the LLM to honor prose-declared severity in its emitted JSON. Every Output Schema example and every concrete Lesson → Output few-shot example now carries `"severity": "warning"` (the default) to reduce drift at source.
+
+  **Downstream impact:** Five `liquid-city` ADR-008 rules on PR 77 burned ~10 manual severity-edit commits across R2 + R3 rounds because the compile pipeline emitted `"severity": "warning"` despite lesson prose declaring `Severity: error`. The mechanical re-edit loop closes; the next `totem lesson compile` cycle on LC emits declared severity directly.
+
+  ## Strategy submodule bump
+  - `.strategy` submodule pointer advances from `113179c` to `7892892b`. Picks up strategy PR #125 (upstream-feedback items 015 + 016 from liquid-city session-17) and strategy PR #124 (upstream-feedback item 017 — three-layer language support gap addendum that documents the architectural surface of the pending Rust-support arc).
+
+- Updated dependencies [d295439]
+  - @mmnto/totem@1.15.4
+
+## 1.15.3
+
+### Patch Changes
+
+- b782d4e: 1.15.3 bundles three compile-worker quality fixes and the runtime ReDoS defense. All three extend the ADR-091 Classify stage or harden the deterministic-enforcement path under `totem lint`.
+
+  ## Bounded regex execution (closes #1641)
+  - Runtime per-rule-per-file timeout on regex evaluation via a persistent Node worker thread. Catastrophic-backtracking patterns now terminate at the configured budget instead of hanging `totem lint`. Pre-exhibit defense against a ReDoS attack chain that survives every prior gate (`safe-regex` static check, bidirectional smoke gate, human promotion review).
+  - `totem lint --timeout-mode <strict|lenient>` — new flag on the lint command. `strict` (default) fails non-zero on any timeout; `lenient` skips the offending rule-file pair with a visible warning. Strict mode is the CI path.
+  - New `packages/core/src/regex-safety/` module (`evaluator.ts`, `worker.ts`, `apply-rules-bounded.ts`, `telemetry.ts`). Async `applyRulesToAdditionsBounded` sibling to the sync path, policy-free — returns `{violations, timeoutOutcomes}` and lets the CLI apply strict-vs-lenient exit-code policy.
+  - Telemetry: every terminal outcome (match, no-match, timeout, syntax error) writes a `type: 'regex-execution'` record to `.totem/temp/telemetry.jsonl`, Zod-validated against `RegexTelemetrySchema` with repo-relative path redaction (paths outside the repo root become `<extern:<sha256-12>>`).
+  - Race-condition hardening baked in: `respawnPromise` coalesces concurrent respawn requests, `MAX_CONSECUTIVE_RESPAWNS` guards against infinite spawn loops on a permanently-broken worker, and a cold-start gate prevents the 100ms default from misfiring under CI load.
+
+  ## Context-required classifier (closes #1598)
+  - New `reasonCode: 'context-required'` route on the compile-worker output schema. Lessons whose hazard is scope-bounded by a context the pattern cannot structurally capture (e.g., `"sim.tick() must not advance inside _process"`) now route to the `nonCompilable` ledger instead of compiling into false-positive-prone rules.
+  - Narrow LLM-emittable enum on `CompilerOutputBaseSchema.reasonCode` (not the full `NonCompilableReasonCodeSchema`), preventing the LLM from forging internal codes like `verify-retry-exhausted`. Extends ADR-091's Classify stage.
+  - New **Context Constraints Classifier** section on the compile prompt with marker heuristics (inside / when / only-for-new / must-not) and an explicit **anti-lazy** rule-of-thumb: compilation MUST still succeed when `fileGlobs` / ast-grep `kind:` / `inside:` / `has:` / `regex:` combinators can express the guard.
+
+  ## Semantic-analysis classifier + ledger hygiene
+
+  Closes #1634 + #1627.
+  - Extends the narrow `reasonCode` enum with `'semantic-analysis-required'` covering four sub-classes: multi-file contracts, closure-body AST analysis, system-parameter-aware scoping, project-state-conditional semantics. Sub-class carried in the prose `reason`; one consolidated code keeps the LLM contract tight.
+  - Pipeline 2 and Pipeline 3 `!parsed.compilable` branches switch from per-code conditional checks to `parsed.reasonCode ?? 'out-of-scope'`. Future narrow classifiers thread through without per-code switches.
+  - `LEDGER_RETRY_PENDING_CODES` set + `shouldWriteToLedger(reasonCode)` predicate exported from `@mmnto/totem`. CLI ledger guard now rejects writes for retry-pending codes (`pattern-syntax-invalid`, `pattern-zero-match`, `verify-retry-exhausted`, `missing-badexample`, `missing-goodexample`, `matches-good-example`) so transient smoke-gate rejections no longer permanently mark lessons as unfit.
+  - Symmetric stale-entry prune on both compiled branches (local + cloud) when a lesson compiles cleanly, and on cloud smoke-gate rejection. Cleaned three stale `matches-good-example` entries from the shipped ledger.
+
+- Updated dependencies [b782d4e]
+  - @mmnto/totem@1.15.3
+
+## 1.15.2
+
+### Patch Changes
+
+- 1c766c2: 1.15.2 ships the archive-in-place durability substrate from #1587 and the new `totem lesson archive` atomic command.
+
+  ## Governance durability (closes #1587)
+  - `totem lesson compile --refresh-manifest` — new no-LLM primitive that recomputes `compile-manifest.json` output_hash from the current `compiled-rules.json` state. Closes the postmerge inline-archive gap where the no-op compile path only detected input-hash drift. Strict exclusivity with `--force`.
+  - `totem lesson compile --force` now preserves `status`, `archivedReason`, and `archivedAt` additively on rules whose `lessonHash` survives to the new output. Transient compile failures (network / rate-limit / manual reject / example-verification / cloud parse) leave the old rule intact instead of silently dropping it. Implemented via the new `preserveLifecycleFields` helper in core and `upsertRule` / `removeRuleByHash` helpers in the CLI compile loop (replace-by-hash on success; remove-on-skipped; unchanged on failed / noop). Dangling-archive guard preserved — rules whose source lesson was deleted are never resurrected.
+  - `totem lesson archive <hash> [--reason <string>]` — new atomic command mirroring `totem rule promote`. Flips the rule's `status` to `archived`, stamps `archivedAt` on first transition, preserves `archivedAt` on reruns, refreshes the manifest, and regenerates copilot + junie exports — all in one call. Matches prefix on `lessonHash`; duplicate-full-hash collisions surface as data-corruption errors distinct from prefix ambiguity.
+  - `/postmerge` skill doc rewritten to call `totem lesson archive` directly, retiring the hand-rolled `scripts/archive-bad-postmerge-*.cjs` pattern.
+
+- Updated dependencies [1c766c2]
+  - @mmnto/totem@1.15.2
+
+## 1.15.1
+
+### Patch Changes
+
+- e69edb2: 1.15.1 ships the `totem proposal new` and `totem adr new` scaffolding commands that close out #1288.
+
+  ## Governance authoring (closes #1288)
+  - `totem proposal new <title>` scaffolds a new strategy proposal at `.strategy/proposals/active/NNN-kebab-title.md` with the canonical template (Status / Author / Date / Milestone + Motivation / Problem Statement / Proposed Solution / Consequences / Decision Needed).
+  - `totem adr new <title>` scaffolds a new ADR at `.strategy/adr/adr-NNN-kebab-title.md` with the Format B convention (`# ADR NNN: Title`, Status / Context / Decision / Consequences).
+  - Both commands auto-increment the number by scanning the target directory, collision-check before any disk writes, and warn-and-continue on post-scaffold hooks so partial failures do not leave orphan files.
+  - Runs `pnpm run docs:inject` automatically when the project has that script configured, so the `PROPOSAL_INBOX` and `ADR_TABLE` dashboards in README.md refresh without manual intervention.
+  - New orchestrator at `packages/cli/src/utils/governance.ts` with 5 helpers and 2 default templates. 34 new tests covering slug validation, collision detection, number inference, template selection, and hook degradation.
+  - `@totem/pack-agent-security` allowlist updated for the 2 legitimate `spawn` sites the new commands introduce.
+
+- Updated dependencies [e69edb2]
+  - @mmnto/totem@1.15.1
+
+## 1.15.0
+
+### Minor Changes
+
+- f9c287b: 1.15.0 ships Pack Distribution: the first shippable Totem pack, plus the compile-hardening and zero-trust substrate that makes packs safe to distribute.
+
+  ## Pack Distribution
+  - `@totem/pack-agent-security` (ADR-089 flagship pack). 5 immutable security rules covering unauthorized process spawning, dynamic code evaluation with non-literal arguments, network exfiltration via hardcoded IPs or suspicious domains (API + shell-string variants), and obfuscated string assembly via byte-level primitives. Every rule ships `immutable: true` + `severity: error` + `category: security` with bad/good fixture pairs and 57 unit tests.
+  - `totem install pack/<name>` command installs a published pack into the local manifest.
+  - `pack-merge` primitive refuses downgrade of immutable rules to warning or archived; bypass attempts log to the Trap Ledger.
+  - Content-hash substrate across TypeScript and bash (review + sync + pre-push hook) so pack integrity verifies without relying on file timestamps.
+
+  ## Zero-trust default (ADR-089)
+  - Pipeline 2 and Pipeline 3 LLM-generated rules now ship `unverified: true` unconditionally. Activation via the atomic `totem rule promote <hash>` CLI or the ADR-091 Stage 4 Codebase Verifier in 1.16.0.
+  - Pipeline 1 (manual) keeps its conditional semantics; human-authored rules are self-evidencing.
+
+  ## Compile hardening (ADR-088 Phase 1)
+  - Layer 3 verify-retry loop: rules that fail their own smoke test re-prompt once before the compiler rejects them.
+  - Compile-time smoke gate runs both `badExample` and `goodExample`; rules that fire on both directions are rejected with reason code `matches-good-example` (closes the over-matching hole that drove the 2026-04-18 security-pack 10-of-10 archive rate).
+  - `archivedAt` timestamp preserved across schema round-trips so the institutional first-archive-provenance ledger survives every compile cycle.
+  - `unverified` flag and `nonCompilable` 4-tuple with 9-value reason-code enum replaces the opaque 2-tuples.
+  - `totem doctor` stale-rule advisory (ADR-088 Phase 1) plus the grandfathered-rule advisory that surfaces the pre-zero-trust cohort categorized by `vintage-pre-1.13.0`, `no-badExample`, and `no-goodExample`.
+
+  ## Platform
+  - Compound ast-grep rules (ADR-087, promoted from Proposal 226). `astGrepYamlRule` field on `CompiledRule` with mutual exclusion on `astGrepPattern`, structural combinators (all / any / not / inside / has / precedes / follows), and canonical-serialization hashing via `canonicalStringify`.
+  - Windows shell-injection fix in `safeExec` via `cross-spawn.sync` (closes a three-week-latent vector).
+  - Cross-Repo Context Mesh (`totem search` federation + `totem doctor` Linked Indexes health check).
+  - Standalone binary distribution unblocked (darwin-arm64, linux-x64, win32-x64).
+
+  ## Positioning
+  - **ADR-090 (Multi-Agent State Substrate).** Scopes Totem as the shared state, enforcement, and audit substrate for multi-agent development. Totem does not own agent routing, capability negotiation, session lifecycle, or live-edit conflict resolution. Future feature admission passes the Scope Decision Test.
+  - **ADR-091 (Ingestion Pipeline Refinements).** Redefines the 1.16.0 ingestion pipeline as a 5-stage funnel: Extract → Classify → Compile → Verify-Against-Codebase → Activate. Renames the legacy `allowlist` terminology to `baseline`.
+  - **ADR-085 (Pack Ecosystem).** Accepted with five deferred decisions resolved: Behavioral SemVer with refinement classification, array-order precedence plus `totem doctor` shadowing warning, Local Supreme Authority with ADR-089 immutable-severity carve-out, Sigstore + in-toto signing, native npm lifecycle with 72-hour unpublish constraint.
+
+  Detailed patch-level changes: CHANGELOG.md entries 1.14.1 through 1.14.17.
+
+### Patch Changes
+
+- Updated dependencies [f9c287b]
+  - @mmnto/totem@1.15.0
+
+## 1.14.17
+
+### Patch Changes
+
+- @mmnto/totem@1.14.17
+
+## 1.14.16
+
+### Patch Changes
+
+- b7f298c: Ship the ADR-089 zero-trust default and the `totem rule promote` CLI (mmnto-ai/totem#1581, part 1 of 2).
+
+  **Zero-trust default (core):** every LLM-generated rule now ships `unverified: true` unconditionally. Pipeline 2 (verify-retry loop) and Pipeline 3 (Bad/Good example-based) both flip from the pre-#1581 conditional behavior (keyed on Example Hit presence) to unconditional. Pipeline 1 (manual) keeps its pre-#1581 conditional semantics because manual rules are human-authored and self-evidencing; the existing Pipeline 1 Example-Hit guard stays as a safety net.
+
+  Rationale: the LLM cannot self-certify structural invariants. Example Hit/Miss is an LLM-produced artifact of the compile process, not a human sign-off. Activation requires either human promotion via the new CLI below OR the ADR-091 Stage 4 Codebase Verifier in 1.16.0 (which validates rules empirically against actual code, not against LLM-generated snippet fixtures).
+
+  **`totem rule promote <id>` CLI:** flips a rule's `unverified: true` flag to absent (canonical "verified" state), atomically refreshes `compile-manifest.json`'s `output_hash` so `verify-manifest` passes on the next push. Refuses to promote archived rules and refuses when the target rule is already verified. Exits 1 on ambiguous prefix matches with a disambiguation list.
+
+  Hand-editing `compiled-rules.json` to flip `unverified` would break the manifest hash and trip the pre-push `verify-manifest` gate. The promote command is the blessed path; the atomic refresh closes that user trap at source.
+
+  **Scope split:** the "Option 1 + Categorized Advisory" plan locks the 1.15.0 ship gate via this PR. The categorized `totem doctor` advisory that surfaces the 357 grandfathered pre-1.13.0 rules by reason lands as a follow-up PR on a separate branch to keep the reviewable surface tight.
+
+  Closes #1581 (part 1).
+
+- 358336e: Add `archivedAt` to `CompiledRuleBaseSchema` so Zod stops silently stripping it on round-trips (mmnto-ai/totem#1589).
+
+  Pre-#1589, the schema declared `status`, `archivedReason`, `badExample`, `goodExample`, and a half-dozen other lifecycle fields — but not `archivedAt`. Zod's default behavior strips unknown keys during parse/serialize. Every compile-write cycle that round-tripped `compiled-rules.json` through `CompiledRulesFileSchema.parse()` silently erased prior `archivedAt` values from archived rules. Postmerge archive scripts (`scripts/archive-postmerge-*.cjs`) set the field via raw JSON mutation; it survived on disk until the next `totem lesson compile --export` quietly rewrote the file. Observed on PR #1588 (rule `4b091a1bc7d286d6`, archived 2026-04-19, timestamp lost during postmerge re-export). GCA caught the drop and we restored the timestamp manually; this ticket prevents future losses at the schema level.
+
+  The field is declared `z.string().optional()` for backward compatibility with pre-#1589 manifests that never had the field populated. Existing call sites continue to work unchanged.
+
+  Four new tests in `compiler-schema.test.ts` pin the invariant: accepts a rule with `archivedAt` set, preserves the field across a full parse → serialize → parse round-trip, tolerates an active rule without the field, and preserves the full archive tuple (`status` + `archivedReason` + `archivedAt`) together.
+
+  Closes #1589.
+
+- Updated dependencies [b7f298c]
+- Updated dependencies [358336e]
+  - @mmnto/totem@1.14.16
+
+## 1.14.15
+
+### Patch Changes
+
+- 89ca890: Extend the compile-time smoke gate with an over-matching check via `goodExample` (mmnto-ai/totem#1580).
+
+  The gate now verifies both directions: the rule MUST match its `badExample` (under-matching check, in place since #1408) AND MUST NOT match its `goodExample` (over-matching check, new). A rule that fires on both sides is over-broad and produces false positives on every lint run, which was the dominant defect class observed in the 2026-04-18 security-pack postmerge incident (10-of-10 bad rate from #1526).
+
+  `CompilerOutputSchema.goodExample` flips from optional to engine-conditional required for regex and ast-grep engines, mirroring the #1420 flip for `badExample`. The `ast` engine (Tree-sitter S-expression queries) remains exempt because the smoke gate does not yet evaluate those. `CompiledRuleSchema.goodExample` stays optional on the persisted-rule boundary for backward compat with pre-#1580 rules.
+
+  Two new reason codes added to `NonCompilableReasonCodeSchema`: `matches-good-example` (over-match rejection) and `missing-goodexample` (defensive path for callers that bypass the schema refine). Rejected lessons surface in the `nonCompilable` ledger with the correct code so `totem doctor` and downstream telemetry can distinguish over-match rejections from other skip categories.
+
+  Pipeline 3 automatically threads the lesson's Good snippet through as `goodExampleOverride`; Pipeline 2 requires the LLM to emit `goodExample` alongside `badExample` via the updated compiler prompt. Pipeline 1 (manual) is unaffected — the gate is opt-in via `enforceSmokeGate`.
+
+  Closes #1580.
+
+- Updated dependencies [89ca890]
+  - @mmnto/totem@1.14.15
+
+## 1.14.14
+
+### Patch Changes
+
+- e073dc0: Flip Pipeline 5 auto-capture on `totem review` from opt-out to opt-in.
+
+  `--no-auto-capture` is renamed to `--auto-capture`; the default is now OFF. Observation rules captured from review findings are context-less (regex drawn from the flagged line, message taken from the reviewer, `fileGlobs` scoped to the whole codebase) and routinely pollute `compiled-rules.json` with rules that fire on unrelated files. The Liquid City Session 6 audit measured an 8-rule wave across 5 review invocations producing 13 new warnings on the next `totem lint`, up from 0.
+
+  To preserve the old behavior, pass `--auto-capture` explicitly. Auto-capture will resume as a default once ADR-091 Stage 2 Classifier + Stage 4 Codebase Verifier ship in 1.16.0 and the LLM-emitted rule loop has gates that prevent context-less emissions.
+
+  Closes #1579.
+
+- Updated dependencies [e073dc0]
+  - @mmnto/totem@1.14.14
+
+## 1.14.13
+
+### Patch Changes
+
+- 8dd8dc8: core: thread per-invocation `RuleEngineContext` through the rule engine
+
+  Removes the module-level `let coreLogger` / `let shieldContextDeprecationWarned` state from `rule-engine.ts` and replaces the hidden DI setter (`setCoreLogger` / `resetShieldContextWarning`) with a required `RuleEngineContext` parameter on `applyRulesToAdditions`, `applyAstRulesToAdditions`, `applyRules`, and `extractJustification`. Concurrent or federated rule evaluations cannot bleed logger wiring or deprecation-warning latching across each other. Closes mmnto-ai/totem#1441.
+
+  **Breaking:** `setCoreLogger` and `resetShieldContextWarning` are removed from `@mmnto/totem`. Callers must build a `RuleEngineContext` once per linting invocation and pass it as the first argument to the affected functions. See the README or the `RuleEngineContext` JSDoc for the shape.
+
+- Updated dependencies [8dd8dc8]
+  - @mmnto/totem@1.14.13
+
+## 1.14.12
+
+### Patch Changes
+
+- dad363b: ADR-088 Phase 1 Layer 4 substrate: compile --verbose trace + doctor stale-rule advisory.
+
+  `totem compile --verbose` emits a structured per-lesson layer-trace block
+  that shows which pipeline the lesson took, the generated pattern hash,
+  verify outcome, retry scheduling, and the terminal result plus reasonCode
+  on skip. Output ships via a single `process.stdout.write` per lesson so
+  concurrent compiles do not interleave within a block. The trace is
+  produced unconditionally on `CompileLessonResult.trace` across all three
+  pipelines (layer 1 manual, layer 2 example-based, layer 3 Layer 3 LLM
+  with verify-retry); callers that do not pass `--verbose` pay only the
+  cost of a small per-lesson array.
+
+  `RuleMetric` gains an `evaluationCount` field. `runCompiledRules`
+  increments it exactly once per rule per lint run, regardless of how many
+  matches fire. Pre-#1483 rule-metrics.json files load with the new field
+  defaulted to zero via Zod, so the migration is transparent.
+
+  `totem doctor` adds a stale-rule advisory that flags active rules whose
+  cumulative `evaluationCount` has crossed a configurable window while
+  `contextCounts.code` stayed at zero. Security rules (category=security
+  OR immutable=true) land with a higher-severity label and the advisory
+  declines to recommend archival for them; standard rules get both
+  `totem compile --upgrade <hash>` and archival as recovery paths.
+  `TotemConfig.doctor.staleRuleWindow` (default 10) gates the check. v1
+  uses cumulative-lifetime semantics; #1550 tracks the rolling-window
+  upgrade via `RuleMetric.runHistory` ring buffer, behind the same config
+  key so no user migration is needed.
+
+  Advisory only: no auto-archive, no mutation to the rules file. The
+  existing `totem doctor --pr` autonomous minAgeDays GC path is untouched.
+
+  Closes #1482. Closes #1483.
+
+- 1107f24: ADR-088 Phase 1 Layers 3 and 4 substrate: unverified flag and reason codes.
+
+  `CompiledRule` gains an optional `unverified: boolean` field, set to `true`
+  when the rule was compiled from a lesson lacking a non-empty Example Hit
+  block. Pipeline 1 (manual), Pipeline 2 (LLM), and Pipeline 3 (example-based)
+  all flag the rule rather than shipping a pattern with no ground truth.
+  Security-scoped lessons (`deps.securityContext === true` or a manual rule
+  with `immutable: true`) reject outright instead of flagging, per the
+  Decision 3 zero-tolerance policy. Absence of the field preserves pre-#1480
+  manifest hashes via `canonicalStringify`; the literal `false` is never
+  written.
+
+  The `nonCompilable` ledger upgrades from `{hash, title}` to the 4-tuple
+  `{hash, title, reasonCode, reason?}`. `reasonCode` is one of
+  `no-pattern-generated`, `pattern-syntax-invalid`, `pattern-zero-match`,
+  `verify-retry-exhausted`, `security-rule-rejected`, `no-pattern-found`,
+  `out-of-scope`, `missing-badexample`, or `legacy-unknown`. The loader
+  accepts all three historical shapes (string, 2-tuple, 4-tuple) and
+  normalizes legacy rows to `reasonCode: 'legacy-unknown'`; the writer
+  enforces the 4-tuple via a strict `NonCompilableEntryWriteSchema`.
+  `saveCompiledRulesFile` validates every entry before serialization and
+  throws on schema mismatch, following the lesson 400fed87 Read/Write
+  invariant.
+
+  Pipeline 2 validator rejections (invalid regex, unparseable ast-grep) and
+  LLM-response parse failures move from the `failed` bucket to `skipped`
+  with an explicit reasonCode so ADR-088 Layer 4 telemetry sees every
+  outcome. `compile.ts` `nonCompilableMap` now carries the full 4-tuple
+  through the run, and `install.ts` pack-merge routes writes through
+  `saveCompiledRulesFile` so pack installs also go through the Write
+  schema gate.
+
+  Closes #1480. Closes #1481.
+
+- Updated dependencies [dad363b]
+- Updated dependencies [1107f24]
+  - @mmnto/totem@1.14.12
+
+## 1.14.11
+
+### Patch Changes
+
+- fc0d367: Config-driven source-extension list for the review content hash.
+
+  Polyglot repos can now override the historical `['.ts', '.tsx', '.js', '.jsx']` set by declaring `review.sourceExtensions` in `totem.config.ts`. The CLI writes the validated set to `.totem/review-extensions.txt` on every `totem sync`, and `.claude/hooks/content-hash.sh` reads it so both implementations stay in lockstep. Defaults are unchanged; consumers who do not set the field see no behavior difference. Closes #1527 and #1529.
+
+- Updated dependencies [fc0d367]
+  - @mmnto/totem@1.14.11
+
+## 1.14.10
+
+### Patch Changes
+
+- Updated dependencies [84bba42]
+- Updated dependencies [6776b11]
+  - @mmnto/totem@1.14.10
+
+## 1.14.9
+
+### Patch Changes
+
+- Updated dependencies [e96599e]
+  - @mmnto/totem@1.14.9
+
+## 1.14.8
+
+### Patch Changes
+
+- Updated dependencies [bcc9c72]
+  - @mmnto/totem@1.14.8
+
+## 1.14.7
+
+### Patch Changes
+
+- Updated dependencies [cb51b59]
+  - @mmnto/totem@1.14.7
+
+## 1.14.6
+
+### Patch Changes
+
+- Updated dependencies [6b58563]
+  - @mmnto/totem@1.14.6
+
+## 1.14.5
+
+### Patch Changes
+
+- Updated dependencies [bd63810]
+  - @mmnto/totem@1.14.5
+
+## 1.14.4
+
+### Patch Changes
+
+- Updated dependencies [55a7e19]
+  - @mmnto/totem@1.14.4
+
+## 1.14.3
+
+### Patch Changes
+
+- Updated dependencies [0b3e274]
+  - @mmnto/totem@1.14.3
+
+## 1.14.2
+
+### Patch Changes
+
+- @mmnto/totem@1.14.2
+
+## 1.14.1
+
+### Patch Changes
+
+- b0a46b7: Fix `add_lesson` MCP tool double-prepending `## Lesson —` heading (#1284)
+
+  When a caller passed a pre-formatted lesson to the `add_lesson` MCP tool whose body already started with a canonical `## Lesson — Foo` heading, the tool derived a title from the first line of the body — which included the literal `Lesson —` prefix — and produced a file with `## Lesson — Lesson — Foo` as the wrapper, with the original `## Lesson — Foo` still intact inside the body. The parser correctly read that as two separate lessons.
+
+  The tool now detects a pre-existing canonical heading (em-dash, en-dash, or hyphen variants, consistent with the parser fix in #1278), extracts the title, and strips the heading line from the body before wrapping. Callers who pass plain body text with no leading heading see unchanged behavior.
+
+  Closes #1284. Discovered during PR #1282 dogfooding.
+
+- Updated dependencies [b76128e]
+- Updated dependencies [b76128e]
+- Updated dependencies [b76128e]
+  - @mmnto/totem@1.14.1
+
+## 1.14.0
+
+### Minor Changes
+
+- 11ab03b: 1.14.0 — The Nervous System Foundation
+
+  Cross-repo federated context (shipped as the headline feature) plus opt-in preview of persistent LLM context caching. Mesh and caching are two halves of the same nervous system — sharing context across space (cross-repo federation) and across time (cached tokens) — but they ship at different maturity levels in 1.14.0: mesh is the active default, caching is opt-in preview machinery whose default activation is tracked for 1.15.0 in mmnto/totem#1291.
+  - **Cross-Repo Context Mesh (#1295):** New `linkedIndexes: []` option in `totem.config.ts` lets a repo federate semantic search against sibling Totem-managed repos. `SearchResult` now carries a required `SourceContext` with `sourceRepo` and `absoluteFilePath` so agents can Read/Edit results unambiguously regardless of which repo the hit came from. Federation merges results via cross-store Reciprocal Rank Fusion (RRF k=60) rather than raw score comparison, eliminating the score-scale bias that would otherwise pin one store's results below another's when their underlying search methods produce scores in incompatible ranges (hybrid RRF ~0.03 vs vector-only ~0.85). A healthy primary + one broken linked store returns partial results with a per-query runtime warning; an entire-federation outage returns `isError: true` instead of masking as "no results found." Per-store reconnect+retry recovers from stale handles during concurrent `totem sync` rebuilds. Targeted `boundary: "<name>"` queries route only to that linked store. Strategy Proposal 215.
+  - **LLM Context Caching — Opt-In Preview (#1292):** Anthropic `cache_control` markers wired through the orchestrator middleware for compile + review paths. Sliding TTL configurable via `cacheTTL`, constrained to the two values Anthropic supports natively: `300` (5 minutes, default ephemeral) or `3600` (1 hour, extended cache). The TTL resets on every cache hit, so bulk recompile runs stay warm end-to-end as long as operations land inside the active window. **Defaults to off in 1.14.0** — opt-in via `enableContextCaching: true` in `totem.config.ts` to avoid surprising existing users mid-cycle with a token-usage profile shift. Default activation tracked for 1.15.0 in mmnto/totem#1291. Anthropic-only in this release; Gemini `CachedContent` support tracked for 1.16.0+. Strategy Proposal 217. The full machinery (orchestrator middleware, schema field, TTL-literal validation, per-call cache metric tracking) ships in 1.14.0 — only the default-on behavior is deferred.
+  - **Federation diagnostic hardening:** Dimension-mismatch diagnostic now persists across queries (one-shot is wrong when the underlying state is actively blocking — a single warning followed by cryptic LanceDB errors was worse than a persistent actionable message). One-shot first-query flags are only consumed after the gated operation actually succeeds, so transient `getContext` failures don't permanently suppress startup warnings. Linked-store init warnings (empty stores, name collisions, dimension mismatches) survive reconnect cycles intact — they represent static config state that a runtime reconnect can't fix.
+  - **Collision-safe state:** Linked store name collisions (two paths deriving to the same basename) are keyed under the bare derived name in `linkedStoreInitErrors` so the `performSearch` boundary lookup can find them — earlier revisions used a descriptive composite key that was unreachable by any user-facing query. Primary store failures are tracked in a dedicated `FailureLog.primary` slot rather than overloading `'primary'` as a map key, which would have collided with legal link names (`deriveLinkName` strips leading dots, so a linked repo at `.primary/` derives to `'primary'`).
+  - **Smoke test (#1295 Phase 3):** Standalone CLI integration test (`packages/mcp/dist/smoke-test.js`) exercises a real `ServerContext` against the current `totem.config.ts`, runs a federated query across primary + all linked stores, and emits a pass/fail verdict with per-store hit counts and top-N formatted results. Used as the empirical proof for the PR #1295 body; repurposable for any future cross-repo validation.
+  - **19 lessons extracted** from the 1.14.0 PR arc (#1292, #1295, #1296); 1 new compiled rule via local Sonnet (394 total, up from 393). 18 lessons skipped as architectural/conceptual — tracked as `nonCompilable` tuples for doctor triage. Most of the architectural 1.14.0 learnings (silent-drift anti-patterns, reserved-key collisions, session-vs-per-request state confusion, failure-modes-table-as-design-review-tool) are non-compilable by nature but live in `.totem/lessons/` as referenceable architectural patterns. (The initial compile pass produced 2 rules; the delimiter-cache-key rule was reframed as architectural after both bots caught a malformed ast-grep pattern that the LLM produced twice in a row — Tenet 4 says broken rules should not ship, so the lesson now lives as documentation only.)
+  - **2722 tests** across core + cli + mcp (up from 2580 at the start of the 1.14.0 cycle).
+
+### Patch Changes
+
+- Updated dependencies [11ab03b]
+  - @mmnto/totem@1.14.0
+
+## 1.13.0
+
+### Patch Changes
+
+- Updated dependencies [0b08629]
+  - @mmnto/totem@1.13.0
+
+## 1.12.0
+
+### Patch Changes
+
+- Updated dependencies [c4f9746]
+  - @mmnto/totem@1.12.0
+
+## 1.11.0
+
+### Minor Changes
+
+- 33039d1: 1.11.0 — The Import Engine
+
+  Rule portability across tools, compiler safety, and thick baseline language packs.
+  - **Proactive Language Packs (#1152):** 50 baseline rules (up from 23) across TypeScript, Node.js Security, and Shell/POSIX. Sourced from @typescript-eslint, OWASP, and ShellCheck best practices.
+  - **Lesson Retirement Ledger (#1165):** `.totem/retired-lessons.json` tracks intentionally removed rules, preventing re-extraction during future import cycles.
+  - **Compiler Guard (#1177):** Rejects self-suppressing patterns (totem-ignore, totem-context, shield-context) at compile time.
+  - **ESLint Syntax/Properties (#1140):** `totem import --from-eslint` now handles `no-restricted-properties` (dot, optional chaining, bracket notation) and `no-restricted-syntax` (ForInStatement, WithStatement, DebuggerStatement).
+  - **Model Defaults (#1185):** `totem init` defaults updated to `claude-sonnet-4-6` (Anthropic) and `gpt-5.4-mini` (OpenAI).
+  - **Supported Models Refresh:** Gemini 2.5 deprecation warning, gemma4/qwen3 for Ollama, new embedding models.
+
+### Patch Changes
+
+- Updated dependencies [33039d1]
+  - @mmnto/totem@1.11.0
+
+## 1.10.2
+
+### Patch Changes
+
+- 7b51599: Phase 2: Import Engine foundations
+  - Lesson retirement ledger (.totem/retired-lessons.json) prevents re-extraction of intentionally removed rules
+  - Compiler guard rejects self-suppressing patterns (totem-ignore/totem-context/shield-context)
+  - ESLint adapter: no-restricted-properties (dot, optional chaining, bracket notation) and no-restricted-syntax (ForInStatement, WithStatement, DebuggerStatement) handlers
+  - Model defaults updated: claude-sonnet-4-6 (Anthropic), gpt-5.4-mini (OpenAI)
+  - Supported models reference refreshed (2026-04-04)
+
+- Updated dependencies [7b51599]
+  - @mmnto/totem@1.10.2
+
+## 1.10.1
+
+### Patch Changes
+
+- @mmnto/totem@1.10.1
+
+## 1.10.0
+
+### Patch Changes
+
+- @mmnto/totem@1.10.0
+
+## 1.9.0
+
+### Minor Changes
+
+- 1650e51: 1.9.0 — Pipeline Engine milestone release
+
+  Five pipelines for rule creation: P1 manual scaffolding, P2 LLM-generated, P3 example-based compilation, P4 ESLint/Semgrep import, P5 observation auto-capture. Docs, wiki, and playground updated to match.
+
+### Patch Changes
+
+- Updated dependencies [1650e51]
+  - @mmnto/totem@1.9.0
+
+## 1.8.5
+
+### Patch Changes
+
+- Updated dependencies [9a6a1a0]
+  - @mmnto/totem@1.8.5
+
+## 1.8.4
+
+### Patch Changes
+
+- Updated dependencies [1bb150d]
+  - @mmnto/totem@1.8.4
+
+## 1.8.3
+
+### Patch Changes
+
+- @mmnto/totem@1.8.3
+
+## 1.8.2
+
+### Patch Changes
+
+- Updated dependencies [11f4512]
+  - @mmnto/totem@1.8.2
+
+## 1.8.1
+
+### Patch Changes
+
+- Updated dependencies [f088d68]
+- Updated dependencies [f088d68]
+  - @mmnto/totem@1.8.1
+
+## 1.8.0
+
+### Patch Changes
+
+- Updated dependencies [4d87c56]
+  - @mmnto/totem@1.8.0
+
+## 1.7.2
+
+### Patch Changes
+
+- Updated dependencies [8fe2329]
+  - @mmnto/totem@1.7.2
+
+## 1.7.1
+
+### Patch Changes
+
+- @mmnto/totem@1.7.1
+
+## 1.7.0
+
+### Patch Changes
+
+- @mmnto/totem@1.7.0
+
+## 1.6.3
+
+### Patch Changes
+
+- @mmnto/totem@1.6.3
+
+## 1.6.2
+
+### Patch Changes
+
+- @mmnto/totem@1.6.2
+
+## 1.6.1
+
+### Patch Changes
+
+- fix: pipeline fixes, compiler DX improvements, and shield auto-refresh
+  - Shield flag auto-refresh on pre-push — no more stale flag after every commit (#1045)
+  - Bot source enum in LedgerEvent for accurate exemption tracking (#1048)
+  - Thread context propagation for reliable PR comment replies (#1051)
+  - Shield false positive fix on synchronous adapter methods (#1058)
+  - Compiler transparency — `totem compile --verbose` shows why lessons are skipped (#1060)
+  - Zero-match rule detection in lint output (#1061)
+  - Compile-time validation for ast-grep patterns (#1062)
+  - Hardened hook upgrade tests (#1068)
+
+- Updated dependencies
+  - @mmnto/totem@1.6.1
+
+## 1.6.0
+
+### Minor Changes
+
+- 069d652: feat: 1.6.0 — Pipeline Maturity
+
+  Exemption Engine (#917):
+  - Dual-storage false positive tracking (local gitignored + shared committed)
+  - 3-strike auto-promotion to team-wide suppressions
+  - --suppress flag for manual pattern suppression
+  - Bot review pushback → exemption tracking via extractPushbackFindings
+  - Ledger 'exemption' event type for full audit trail
+
+  Auto-ticket Deferred (#931):
+  - createDeferredIssue service with idempotency and thread reply
+  - inferNextMilestone for semver-aware milestone assignment
+  - PrAdapter: createIssue, replyToComment, addPrComment
+
+  Interactive Triage CLI (#958):
+  - totem triage-pr --interactive / -i with Clack prompts
+  - Per-finding actions: Fix, Defer, Dismiss, Learn, Skip
+  - TTY guard, isCancel on every prompt, confirm preview
+
+  Agent Dispatch (#957):
+  - dispatchFix: LLM-powered code fix with atomic commit and thread reply
+  - Path traversal guard, git rollback on failure
+  - Bot re-trigger: /gemini-review after fixes
+
+  Bot-to-Lesson Loop (#959):
+  - "Learn" action saves findings as lessons with bot-review tags
+  - Post-triage review-learn prompt for batch extraction
+
+### Patch Changes
+
+- Updated dependencies [069d652]
+  - @mmnto/totem@1.6.0
+
+## 1.5.11
+
+### Patch Changes
+
+- Updated dependencies [7cd543a]
+  - @mmnto/totem@1.5.11
+
+## 1.5.10
+
+### Patch Changes
+
+- 990c3bf: Incremental shield, totem status/check, docs staleness fix.
+  - feat: incremental shield validation — delta-only re-check for small fixes (#1010)
+  - feat: totem status + totem check commands (#951)
+  - fix: totem docs staleness — aggressive rewrite of stale roadmap sections (#1024)
+  - fix: mermaid lexer error in architecture diagram
+  - chore: MCP add_lesson rate limit bumped to 25 per session
+  - chore: 364 compiled rules, 966 lessons, 2,000 tests
+
+- Updated dependencies [990c3bf]
+  - @mmnto/totem@1.5.10
+
+## 1.5.9
+
+### Patch Changes
+
+- 59a605c: Pipeline integrity fixes, docs storefront rewrite, COSS covenant.
+  - fix: MCP spawn ENOENT on Windows — env + shell options (#1023)
+  - fix: triage-pr and review-learn surface outside-diff findings (#984)
+  - feat: lesson linter semantic heuristics + --strict flag (#1013)
+  - docs: README storefront rewrite with flywheel diagram
+  - docs: workflow wiki pages (learning loop, self-healing, agent governance)
+  - docs: COSS covenant and maintainer policy
+  - chore: 354 compiled rules, 953 lessons
+
+- Updated dependencies [59a605c]
+  - @mmnto/totem@1.5.9
+
+## 1.5.8
+
+### Patch Changes
+
+- Shield hardening, rule unit testing, and bug bundle
+  - Rule unit testing: `**Example Hit:**`/`**Example Miss:**` in lesson markdown verified at compile time
+  - Shield context enrichment: full file content for small changed files reduces LLM false positives
+  - Shield `--override <reason>`: audited bypass for false positives, logged to trap ledger
+  - safeExec: forced pipe mode, type-safe return, removed unsafe `as string` cast
+  - gh-utils: error unwrapping matches safeExec error chain structure
+  - GH_PROMPT_DISABLED added to all direct gh invocations
+  - Hook paths resolved from git root, not cwd
+  - Hook regex tightened to match git subcommand only (not filenames)
+  - jq for JSON parsing in pre-push hook with grep/sed fallback
+  - Agent worktree scratchpads excluded from prettier
+  - Compile-after-extract ritual added to CLAUDE.md
+
+- Updated dependencies
+  - @mmnto/totem@1.5.8
+
+## 1.5.7
+
+### Patch Changes
+
+- Codebase audit remediation and foundation hardening
+  - New `core/src/sys/` standard library: `safeExec()`, `readJsonSafe()`, git adapter (13 functions moved from CLI to core)
+  - Error cause chains (ES2022): TotemError hierarchy accepts `cause`, 22 catch blocks updated
+  - Forbidden native module rules: 3 compiled rules enforce shared helper usage
+  - Phase-gate hooks hardened: `fix/*` exemption removed, warning upgraded to block
+  - CoreLogger DI: `setCoreLogger()` replaces `console.warn` in core
+  - CRLF fixed: `.gitattributes` forces LF, prettier `endOfLine: "lf"`
+  - Shield flag verify-not-consume: push no longer deletes the flag
+  - AST query graceful degradation: tree-sitter failures no longer crash compilation
+  - Spec gap remediation: `cleanTmpDir` helper, CLI wiring fixes
+
+- Updated dependencies
+  - @mmnto/totem@1.5.7
+
+## 1.5.6
+
+### Patch Changes
+
+- fc607ce: ### 1.5.6 — Foundation & Hardening
+
+  **Features:**
+  - Unified Findings Model (`TotemFinding`) — common output schema for lint and shield (ADR-071)
+  - `totem-context:` is now the primary override directive; `shield-context:` remains as silent alias
+  - `totem lint --format json` now includes a `findings[]` array alongside `violations[]`
+  - safe-regex validation for user-supplied DLP patterns — ReDoS-vulnerable patterns rejected at input time
+
+  **Fixes:**
+  - `matchesGlob()` now correctly handles `*.test.*` and `dir/*.test.*` patterns (was doing literal string match)
+  - `readRegistry()` differentiates ENOENT from permission/parse errors via `onWarn` callback
+  - `TotemParseError` used for schema validation failures (was generic `Error`)
+  - Git hooks path resolved via `git rev-parse --git-path` (supports worktrees and custom `core.hooksPath`)
+  - `shield-hints.ts` uses `log.dim()` instead of raw ANSI escape codes
+  - `store.count()` failure no longer breaks sync
+  - `maxBuffer` (10MB) added to git diff commands — prevents ENOBUFS on large branch diffs
+  - Windows `ENOTEMPTY` flake fixed with `maxRetries` in test cleanup
+
+  **Chores:**
+  - Dynamic imports in `doctor.ts` for startup latency
+  - 8 new lessons extracted from bot reviews (305 compiled rules)
+  - Audited and removed 6 `totem-ignore` suppressions
+  - Updated compiled baseline hash and scope for JSON.parse rule
+
+- Updated dependencies [fc607ce]
+  - @mmnto/totem@1.5.6
+
+## 1.5.5
+
+### Patch Changes
+
+- Updated dependencies [19de6b1]
+  - @mmnto/totem@1.5.5
+
+## 1.5.4
+
+### Patch Changes
+
+- Updated dependencies [7f5d4e7]
+  - @mmnto/totem@1.5.4
+
+## 1.5.3
+
+### Patch Changes
+
+- ### Shield Redesign — Structured Verdicts + Deterministic Fast-Path (#910)
+  - Three-stage pipeline: file classification → hybrid diff filtering → Zod-validated JSON findings
+  - Non-code diffs (docs, YAML, config) skip LLM entirely for instant PASS
+  - Severity levels (CRITICAL/WARN/INFO) with deterministic pass/fail — LLM no longer decides the gate
+  - V1 regex fallback for custom `.totem/prompts/shield.md` overrides
+
+  ### Compile Pipeline Reliability (#939, #941)
+  - Pre-push hook auto-verifies compile manifest; auto-compiles if stale then aborts push
+  - `totem lint` emits non-blocking staleness warning when manifest is out of date
+  - Compiler normalizes shallow fileGlobs (`*.ts` → `**/*.ts`) for external tool compatibility
+  - `sanitizeFileGlobs` guards against non-string and empty entries
+
+  ### CLI Performance (#943)
+  - Converted ~90 static imports to dynamic `await import()` across 25 command files
+  - Heavy modules only loaded when the specific command is executed
+  - Startup latency reduced for lightweight operations (`--help`, `--version`)
+
+  ### Error Logging (#849)
+  - Standardized `[Totem Error]` prefix across all CLI error output
+  - `handleError` now consistently tags errors with guard against double-prefixing
+
+- Updated dependencies
+  - @mmnto/totem@1.5.3
+
+## 1.5.0
+
+### Minor Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.5.0
+
+## 1.4.3
+
+### Patch Changes
+
+- DX hardening, core refactor, and docs overhaul.
+
+  **Core:**
+  - Extract `buildCompiledRule()`, `buildManualRule()`, `compileLesson()` to core package — eliminates duplicated rule-building logic between local and cloud compilation paths
+
+  **CLI:**
+  - Reduce pre-push hook verbosity: dot reporter by default, full output on failure, `TOTEM_DEBUG=1` for verbose mode
+  - Suppress gh CLI stderr leak in multi-repo issue fetch
+  - Extract shared `ghExecOptions()` with `GH_PROMPT_DISABLED=1` to prevent interactive auth hangs
+  - Protect `<manual_content>` blocks from `stripMarketingTerms` mutation
+
+  **Config:**
+  - Remove `**/*.test.ts` from `ignorePatterns` so shield can see test files in diffs
+
+  **Docs:**
+  - Rewrite README as technical spec sheet (~130 lines, zero marketing)
+  - Create SECURITY.md with full 1.4.x audit
+  - Scaffold `docs/wiki/` with enforcement model, MCP setup, cross-repo mesh, troubleshooting
+  - Add 6 placeholder wiki pages for 1.5.0 features
+
+- Updated dependencies
+  - @mmnto/totem@1.4.3
+
+## 1.4.2
+
+### Patch Changes
+
+- f1509d3: Post-1.4.0 quality sweep (Proposal 189): security fixes, broken functionality, 154 new tests, quality hardening, DRY cleanup, and compile manifest CI attestation
+- Updated dependencies [f1509d3]
+  - @mmnto/totem@1.4.2
+
+## 1.4.1
+
+### Patch Changes
+
+- ec5b807: Security sweep: fix sanitizer regex statefulness (#871), secret pattern ordering (#872), extract parser injection vector (#873), SQL escaping (#874), and add compile manifest CI attestation (#875)
+- Updated dependencies [ec5b807]
+  - @mmnto/totem@1.4.1
+
+## 1.4.0
+
+### Minor Changes
+
+#### Security Hardening
+
+### Core (`@mmnto/totem`)
+
+- **AST engines fail-closed** — query/parse errors now throw `TotemParseError` instead of silently returning empty arrays (#848)
+- **Compile manifest signing** — `totem compile` writes `.totem/compile-manifest.json` with SHA-256 provenance chain (#842)
+- **XML trust boundaries** — new `wrapUntrustedXml()` for network-fetched content, existing `wrapXml()` preserved for trusted local diffs (#843)
+- **Tag name validation** — both XML wrappers validate tag names against injection (#843)
+- **DLP secret masking** — `maskSecrets()` utility with centralized `rethrowAsParseError` and `getErrorMessage` helpers (#848, #strategy-12)
+- **247 compiled rules** (up from 230)
+
+### CLI (`@mmnto/cli`)
+
+- **Wind tunnel SHA lock** — `tools/update-wind-tunnel-sha.sh` with CI verification job (#840)
+- **`totem verify-manifest`** — zero-LLM CI command to verify compiled rules match source lessons (#842)
+- **Docs confirmation gate** — `totem docs` requires interactive confirmation or `--yes` before writing LLM output (#847)
+- **Marketing term stripping** — case-preserving deterministic replacement, preserves code blocks and URLs (#833)
+- **DLP middleware** — `maskSecrets` runs before every outbound LLM call, bypasses local providers (#strategy-12)
+
+### MCP (`@mmnto/mcp`)
+
+- **add_lesson auth model** — Zod schema validation, rate limiting (10/session), source provenance, heading sanitization (#844)
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.4.0
+
+## 1.3.19
+
+### Patch Changes
+
+- feat: markdown-magic deterministic doc injection
+  - Integrated markdown-magic with 4 transforms (RULE_COUNT, HOOK_LIST, CHMOD_HOOKS, COMMAND_TABLE)
+  - Wired docs:inject into totem wrap pipeline (step 5/6, after LLM docs, before compile)
+  - 9 unit tests for transforms, runs in 0.02s
+  - Eliminates stale hardcoded values in docs across releases
+
+- Updated dependencies
+  - @mmnto/totem@1.3.19
+
+## 1.3.18
+
+### Patch Changes
+
+- feat: invisible sync hooks (ADR-066)
+  - Post-merge hook only syncs when `.totem/lessons/` files change (git diff-tree conditional)
+  - New post-checkout hook syncs on branch switch when `.totem/` differs
+  - `totem sync --quiet` flag for silent background hook execution
+  - Deterministic end markers for safe eject scrubbing
+  - DRY scrubHook helper with try/catch and exact marker matching
+  - 230 compiled rules (19 new), 697 lessons
+
+- Updated dependencies
+  - @mmnto/totem@1.3.18
+
+## 1.3.17
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.3.17
+
+## 1.3.16
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.3.16
+
+## 1.3.15
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.3.15
+
+## 1.3.14
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.3.14
+
+## 1.3.13
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.3.13
+
+## 1.3.12
+
+### Patch Changes
+
+- Updated dependencies
+  - @mmnto/totem@1.3.12
+
+## 1.3.11
+
+### Patch Changes
+
+- 0b47c94: Security hardening: regex escape, shell:true removal, SQL backtick escape. CodeRabbit integration with path instructions. onWarn logging for AST catch blocks. Unsafe non-null assertions replaced.
+- Updated dependencies [0b47c94]
+  - @mmnto/totem@1.3.11
+
+## 1.3.10
+
+### Patch Changes
+
+- Updated dependencies [ceb8663]
+  - @mmnto/totem@1.3.10
+
+## 1.3.9
+
+### Patch Changes
+
+- 48cd644: Named index partitions for context isolation. Backfilled body text for 125 Pipeline 1 lessons. Consolidated near-duplicate rules (146 → 144).
+- Updated dependencies [48cd644]
+  - @mmnto/totem@1.3.9
+
+## 1.3.8
+
+### Patch Changes
+
+- 16e6071: Context isolation boundary parameter for search_knowledge MCP tool. Consolidated near-duplicate rules (146 → 144).
+- Updated dependencies [16e6071]
+  - @mmnto/totem@1.3.8
+
+## 1.3.7
+
+### Patch Changes
+
+- Updated dependencies [6a2eb4c]
+  - @mmnto/totem@1.3.7
+
+## 1.3.6
+
+### Patch Changes
+
+- Updated dependencies [09153f8]
+  - @mmnto/totem@1.3.6
+
+## 1.3.5
+
+### Patch Changes
+
+- Updated dependencies [5810bcc]
+  - @mmnto/totem@1.3.5
+
+## 1.3.4
+
+### Patch Changes
+
+- Updated dependencies [98d56dc]
+  - @mmnto/totem@1.3.4
+
+## 1.3.3
+
+### Patch Changes
+
+- @mmnto/totem@1.3.3
+
+## 1.3.2
+
+### Patch Changes
+
+- 5aeb86d: ### DX Polish
+  - Post-init message for Lite users now dares them to test the engine: "Write an empty `catch(e) {}` block and run `npx totem lint`"
+  - Hidden legacy commands (`install-hooks`, `demo`, `migrate-lessons`) from `--help` output
+  - Clean `totem lint` PASS is now one line instead of six
+  - Added launch metrics to README (3-layer gate, 1.75s benchmark)
+  - Unix process group cleanup for lint timeout handler (prevents zombie processes)
+  - @mmnto/totem@1.3.2
+
+## 1.3.1
+
+### Patch Changes
+
+- ace02c0: ### Bug Fixes
+  - **Critical:** Fixed filter ordering in `totem lint` and `totem shield` — ignored patterns (e.g., `.strategy` submodule) were checked after the emptiness test, preventing branch-diff fallback from firing. The Layer 3 pre-push gate was silently passing. (#709)
+  - Fixed latent bug where AST rules with empty `pattern` fields could match every line when passed to the regex executor (#710)
+  - Replaced 13 raw `throw new Error()` calls with typed `TotemError` subclasses across core and CLI packages (#711)
+
+  ### Improvements
+  - **Compiler facade refactor:** Split `compiler.ts` (600 lines) into focused modules — `compiler-schema.ts`, `diff-parser.ts`, `rule-engine.ts` — with `compiler.ts` as a clean coordinator. Public API unchanged. (#710)
+  - Added `TOTEM_DEBUG=1` env var for full stack traces during troubleshooting (#711)
+  - Added mandatory verify steps (lint + shield + verify_execution) to `totem spec` output (#708)
+  - Reverted to curated 147-rule set and added 59 lesson hashes to nonCompilable blocklist (#708)
+
+- Updated dependencies [ace02c0]
+  - @mmnto/totem@1.3.1
+
+## 1.3.0
+
+### Minor Changes
+
+- a02f7f8: Release 1.3.0 — MCP verify_execution, spec inline invariants, baseline Fix guidance.
+
+  ### Highlights
+  - **MCP `verify_execution` tool**: AI agents can now mathematically verify their work before declaring a task done. Runs `totem lint` as a child process and returns pass/fail with violation details. Supports `staged_only` flag. Warns about unstaged changes.
+  - **Spec inline invariant injection**: `totem spec` now outputs granular implementation tasks with Totem lessons injected directly into the steps where they apply. Closes the gap between "planning" and "doing."
+  - **Baseline Fix suggestions**: 24 of 59 universal baseline lessons updated with explicit "Fix:" guidance. Every lesson now tells developers what TO do, not just what to avoid.
+
+### Patch Changes
+
+- Updated dependencies [a02f7f8]
+  - @mmnto/totem@1.3.0
+
+## 1.2.0
+
+### Patch Changes
+
+- baf6e15: Release 1.2.0 — ast-grep engine, compound rules, and shield CI hardening.
+
+  ### Highlights
+  - **ast-grep pattern engine**: Third rule engine alongside regex and Tree-sitter. Patterns look like source code (`process.env.$PROP`, `console.log($ARG)`) — dramatically easier for LLMs to generate accurately.
+  - **ast-grep compound rules**: Full support for `has`/`inside`/`follows`/`not`/`all`/`any` operators via NapiConfig rule objects. Enables structural rules like "useEffect without cleanup."
+  - **Shield CI hardening**: `shieldIgnorePatterns` now filters the diff before linting, preventing `.strategy` submodule pointer changes from triggering false CI failures.
+  - **Dynamic import rules narrowed**: Code scanning alerts for dynamic imports in command files eliminated — rules now only apply to core/adapter code.
+  - **Case-insensitive hash matching**: `totem explain` and `totem test --filter` now match regardless of case.
+  - **README hardened**: Staff Engineer red team feedback addressed — deterministic enforcement, air-gapped operation, and git-committed artifacts all clarified.
+  - **Docs injection scoped**: Manual content injection now targets README only, not all docs.
+
+- Updated dependencies [baf6e15]
+  - @mmnto/totem@1.2.0
+
+## 1.1.0
+
+### Minor Changes
+
+- 4c0b2cd: Release 1.1.0 — Tier 2 AST engine, cross-totem queries, and totem explain.
+
+  ### Highlights
+  - **Tier 2 AST engine**: Compiled rules now support Tree-sitter S-expression queries alongside regex. Enables structural rule matching that regex alone can't express.
+  - **Cross-totem queries**: New `linkedIndexes` config lets `totem spec` query knowledge from other totem-managed directories (e.g., strategy repos, design docs) alongside the primary project index.
+  - **totem init --bare**: Zero-config initialization for non-code repositories — notes, docs, ADRs, infrastructure configs. No package.json required.
+  - **totem explain**: Look up the full lesson behind any compiled rule violation. Supports partial hash prefix matching. Zero LLM, instant.
+  - **TODO guardrail rules**: 3 new baseline rules catch `// TODO: implement` stubs, `throw new Error("Not implemented")`, and empty catch blocks. Baseline now ships 15 pre-compiled rules.
+  - **Dimension mismatch detection**: `totem sync` writes `index-meta.json`. Switching embedding providers without rebuilding the index now throws a clear error instead of silently returning garbage results.
+  - **Compiled rules reverted to curated set**: The 147 hand-audited rules are preserved. Blind recompilation with Flash produced regressions — compiler improvements tracked in #670.
+
+### Patch Changes
+
+- Updated dependencies [4c0b2cd]
+  - @mmnto/totem@1.1.0
+
+## 1.0.0
+
+### Major Changes
+
+- d49cdbf: Release 1.0.0 — Totem is production-ready.
+
+  ### Highlights
+  - **Zero-config lint protection**: `totem init` now ships 13 pre-compiled universal baseline rules. Every user gets deterministic lint protection from Day 1 — no API keys, no LLM calls required.
+  - **Filesystem concurrency locks**: Sync and MCP mutations are now protected by PID-aware file locks with signal cleanup (SIGINT, SIGTERM, SIGHUP, SIGQUIT).
+  - **Portability audit**: CLI help grouped by tier, `requireGhCli()` guard on GitHub commands, dynamic orchestrator detection, configurable bot markers, expanded issue URL regex for GitLab/self-hosted.
+  - **TotemError consistency**: All error paths use structured `TotemError` hierarchy with recovery hints. Ollama model-not-found errors give actionable `ollama pull` instructions.
+  - **MCP race condition fix**: `getContext()` uses promise memoization to prevent duplicate connections from concurrent callers, with retry on transient failures.
+  - **Compiled rule audit**: 148 → 147 rules, 0 undefined severity, false positives on TotemError/type imports/stdlib imports eliminated.
+  - **Manual docs survive regeneration**: `docs/manual/` content is injected verbatim into `totem docs` output.
+
+### Patch Changes
+
+- Updated dependencies [d49cdbf]
+  - @mmnto/totem@1.0.0
+
+## 0.44.0
+
+### Patch Changes
+
+- ab254bf: feat: migrate 54 throw sites to TotemError hierarchy
+
+  Every error now includes a `recoveryHint` telling the user exactly how to fix it. New error classes: `TotemOrchestratorError`, `TotemGitError`. New error code: `GIT_FAILED`. Includes rule fix exempting error class imports from the static import lint rule.
+
+- Updated dependencies [ab254bf]
+  - @mmnto/totem@0.44.0
+
+## 0.43.0
+
+### Patch Changes
+
+- @mmnto/totem@0.43.0
+
+## 0.42.0
+
+### Patch Changes
+
+- 557d046: feat: DLP secret masking — strip secrets before embedding (#534)
+
+  Automatically masks API keys, tokens, passwords, and credentials with [REDACTED] before entering LanceDB. Preserves key names in assignments. Handles quoted and unquoted patterns.
+
+  fix: compiler glob patterns — prompt constraints + brace expansion (#602)
+
+  Compiler prompt now forbids unsupported glob syntax. Post-compile sanitizer expands brace patterns. Fixed 12 existing rules.
+
+  fix: init embedding detection — Gemini first (#551)
+
+  Reorders provider detection to prefer Gemini (task-type aware) over OpenAI when both keys present.
+
+  fix: review blitz 2 — dynamic imports, onWarn, rule demotions (#575, #594, #595)
+
+  compile.ts dynamic imports, loadCompiledRules onWarn callback, err.message rule demoted to warning.
+
+  docs: Scope & Limitations section, Solo Dev Litmus Test styleguide rule
+
+- Updated dependencies [557d046]
+  - @mmnto/totem@0.42.0
+
+## 0.41.0
+
+### Patch Changes
+
+- 028786b: perf: cache non-compilable lessons to skip recompilation (#590)
+
+  `totem compile` now caches lesson hashes that the LLM determined cannot be compiled. Subsequent runs skip them instantly. `totem wrap` goes from ~15 min to ~30 seconds.
+
+  fix: remove duplicate compiled rule causing false positives (#589)
+
+  Root cause was duplicate rules from compile, not a glob matching bug. Removed the broad duplicate.
+
+  feat: auto-ingest cursor rules during totem init (#596)
+
+  `totem init` scans for .cursorrules, .mdc, and .windsurfrules. If found, prompts user to compile them into deterministic invariants.
+
+  fix: strip known-not-shipped issue refs from docs generation (#598)
+
+  Ends the #515 hallucination that recurred in 5 consecutive releases. Pre-processing strips from git log, post-processing strips from LLM output.
+
+- Updated dependencies [028786b]
+  - @mmnto/totem@0.41.0
+
+## 0.40.0
+
+### Patch Changes
+
+- 99f8995: feat: .mdc / .cursorrules ingestion adapter (#555)
+
+  New `totem compile --from-cursor` flag. Scans .cursor/rules/\*.mdc, .cursorrules, and .windsurfrules files. Parses frontmatter and plain text rules. Compiles them into deterministic Totem rules via the existing LLM pipeline.
+
+  docs: README Holy Grail positioning (ADR-049)
+
+  "A zero-config CLI that compiles your .cursorrules into deterministic CI guardrails. Stop repeating yourself to your AI." MCP as step 2, Solo Dev Superpower section, command table with speed metrics.
+
+- Updated dependencies [99f8995]
+  - @mmnto/totem@0.40.0
+
+## 0.39.0
+
+### Patch Changes
+
+- dda8715: feat: shield severity levels — error vs warning (#498)
+
+  Rules now support `severity: 'error' | 'warning'`. Errors block CI, warnings inform but pass. SARIF output maps severity to the `level` field. JSON output includes error/warning counts.
+
+  chore: rule invariant audit — 137 rules categorized (#556)
+
+  27 security (error), 56 architecture (error), 47 style (warning), 7 performance (warning). 39% reduction in hard blocks while maintaining all guidance.
+
+  fix: auto-healing DB — dimension mismatch + version recovery (#500, #548)
+
+  LanceStore.connect() auto-heals on embedder dimension mismatch and LanceDB version/corruption errors. Nukes .lancedb/ and reconnects empty for a clean rebuild.
+
+- Updated dependencies [dda8715]
+  - @mmnto/totem@0.39.0
+
+## 0.38.0
+
+### Patch Changes
+
+- 89fcb02: feat: Trap Ledger Phase 1 — SARIF extension + enhanced totem stats
+
+  Every `totem lint` violation now generates SARIF properties with eventId, ruleCategory, timestamp, and lessonHash. Rules support a `category` field (security/architecture/style/performance). `totem stats` shows "Total violations prevented" with category breakdown and top 10 prevented violations.
+
+  fix: code review blitz — 7 findings from Claude+Gemini synthesis
+
+  Critical: MCP loadEnv quote stripping, add_lesson race condition (promise memoization), SARIF format flag works with totem lint. High: extracted shared runCompiledRules (-75 lines), Gemini default model fixed, health check --rebuild → --full, lesson validation before disk write.
+
+  fix: stale prompts — docs glossary, init model, reflex block v3
+
+  Command glossary in docs system prompt prevents LLM confusing lint/shield. Gemini embedder model corrected in init. AI_PROMPT_BLOCK distinguishes lint (pre-push) from shield (pre-PR).
+
+  chore: 137 compiled rules (39 new), 17 extracted lessons, docs sync
+
+- Updated dependencies [89fcb02]
+  - @mmnto/totem@0.38.0
+
+## 0.37.0
+
+### Patch Changes
+
+- 382c77a: feat: `totem lint` — new command for fast compiled rule checks (zero LLM)
+
+  Split from `totem shield`. `totem lint` runs compiled rules against your diff in ~2 seconds with no API keys needed. `totem shield` is now exclusively the AI-powered code review. `--deterministic` flag is deprecated with a warning.
+
+  feat: semantic rule observability (Phase 1)
+
+  Rules now track `createdAt`, `triggerCount`, `suppressCount`, and `lastTriggeredAt` metadata. `totem stats` displays rule metrics. Foundation for automated rule decay analysis.
+
+  fix: shield rule scoping — dynamic import and match/exec rules narrowed
+
+  Dynamic import rule scoped to command files only (not adapters/orchestrators). match/exec rule scoped to security-sensitive code only. `.cjs` rule excludes CI workflow YAML.
+
+- Updated dependencies [382c77a]
+  - @mmnto/totem@0.37.0
+
+## 0.36.0
+
+### Patch Changes
+
+- 74e521e: feat: graceful degradation for orchestrator and embedder providers
+
+  Orchestrators (Gemini, Anthropic) now fall back to their CLI equivalents when the SDK or API key is missing. Embedders fall back to Ollama when the configured provider is unavailable. LazyEmbedder uses promise memoization to prevent race conditions with concurrent embed() calls.
+
+  feat: configurable issue sources — support multiple repos in triage/extract/spec
+
+  Add `repositories` field to `totem.config.ts`. When set, triage, audit, and spec commands aggregate issues from all listed repos. Supports `owner/repo#123` syntax for disambiguation.
+
+  chore: switch default embedder to Gemini (gemini-embedding-2-preview)
+
+  Task-type aware 768d embeddings replace OpenAI text-embedding-3-small (1536d). Requires `totem sync --full` after upgrade.
+
+- Updated dependencies [74e521e]
+  - @mmnto/totem@0.36.0
+
+## 0.35.1
+
+### Patch Changes
+
+- Updated dependencies [9cd061e]
+  - @mmnto/totem@0.35.1
+
+## 0.35.0
+
+### Patch Changes
+
+- Updated dependencies [f6074c4]
+  - @mmnto/totem@0.35.0
+
+## 0.34.0
+
+### Patch Changes
+
+- @mmnto/totem@0.34.0
+
+## 0.33.1
+
+### Patch Changes
+
+- 7a90a44: Bug fixes: Gemini embedder dimension mismatch detection, shell orchestrator process leak on Windows.
+  - **MCP:** Detect embedding dimension mismatch on first query and return clear error message with fix instructions (rebuild index + restart MCP server)
+  - **CLI:** Fix shell orchestrator process leak on Windows — use `taskkill /T` to kill entire process tree on timeout instead of just the shell wrapper
+  - **CLI:** `totem demo` command for previewing spinner animations
+  - @mmnto/totem@0.33.1
+
+## 0.33.0
+
+### Minor Changes
+
+- a91ca10: Agent hooks, rule testing harness, multi-domain MCP, and docs migration.
+  - **CLI:** `totem test` command — TDD harness for compiled shield rules with pass/fail fixtures
+  - **CLI:** Agent hooks reinstated — Claude PreToolUse shield gate, Gemini SessionStart + BeforeTool
+  - **CLI:** Instruction file length enforcement (FR-C01, <50 lines)
+  - **Core:** `parseFixture()`, `testRule()`, `runRuleTests()` — rule testing engine
+  - **Core:** Export `matchesGlob` for shield file filtering
+  - **MCP:** `--cwd` flag for multi-domain knowledge architecture (strategy Totem)
+  - **MCP:** Robust `--cwd` validation with `[Totem Error]` prefix
+  - **Shield:** `shieldIgnorePatterns` config field (separate from sync ignorePatterns)
+  - **Shield:** Compiled rules respect ignorePatterns from config
+  - **Shield:** execSync rule scoped to exclude hook scripts
+  - **Shield:** Literal-file-path rule scoped to lesson files only (#457)
+  - **Docs:** README-to-wiki migration — marketing-lean README + 5 new wiki pages
+  - **Config:** Consumer hook templates use `--deterministic` shield
+
+### Patch Changes
+
+- Updated dependencies [a91ca10]
+  - @mmnto/totem@0.33.0
+
+## 0.32.0
+
+### Patch Changes
+
+- bd40894: Agent config cleanup, shield ignorePatterns separation, and Junie support.
+  - **Shield:** `shieldIgnorePatterns` config field separates shield exclusions from sync indexing
+  - **Shield:** Deterministic shield now respects `ignorePatterns` from config
+  - **Core:** Export `matchesGlob` for shield file filtering
+  - **Init:** Fix Gemini CLI reflexFile path (`.gemini/gemini.md` → `GEMINI.md`)
+  - **Init:** Export `AI_PROMPT_BLOCK` for drift test consumption
+  - **MCP:** Replace empty catch blocks with `logSearch()` disk-based diagnostics
+  - **Config:** Add `shieldIgnorePatterns` to config schema
+  - **Junie:** Lean guidelines.md, correct MCP path (`.junie/mcp/mcp.json`), compiled rules as skill
+  - **Drift Tests:** 41-assertion config drift test suite guarding hooks, agent configs, MCP scaffolding, and secrets
+
+- Updated dependencies [bd40894]
+  - @mmnto/totem@0.32.0
+
+## 0.31.0
+
+### Minor Changes
+
+- feat: hybrid search (FTS + vector with RRF reranking), Gemini embedding provider, retrieval eval script
+- feat: lessons directory migration — dual-read/single-write (per-file lessons replace monolithic lessons file)
+
+### Patch Changes
+
+- Updated dependencies
+- Updated dependencies
+  - @mmnto/totem@0.31.0
+
+## 0.30.0
+
+### Patch Changes
+
+- Updated dependencies [d0be9c6]
+  - @mmnto/totem@0.30.0
+
+## 0.29.0
+
+### Patch Changes
+
+- e311aff: Lesson injection into all orchestrator commands, totem audit, and Junie docs.
+  - **`totem audit`** — strategic backlog audit with human approval gate, interactive multi-select, shell injection prevention via `--body-file`, resilient batch execution (#362)
+  - **Lesson injection** — vector DB lessons now injected into shield (full bodies), triage (condensed), and briefing (condensed) via shared `partitionLessons()` + `formatLessonSection()` helpers (#370)
+  - **Junie docs** — MCP config example and export target docs in README (#371)
+  - **Lesson ContentType** — `add_lesson` MCP tool now uses `lesson` content type for better vector DB filtering (#377)
+  - **Versioned reflex upgrade** — `REFLEX_VERSION=2` with `detectReflexStatus()` and `upgradeReflexes()` for existing consumers (#375)
+  - **Spec lesson injection** — lessons injected as hard constraints into `totem spec` output (#366)
+
+- Updated dependencies [e311aff]
+  - @mmnto/totem@0.29.0
+
+## 0.28.0
+
+### Minor Changes
+
+- d221d54: Extraction Hardening: semantic dedup for `totem extract`, dangling-tail heading cleanup, submodule-aware file resolver, and CLI `--help` fix.
+
+### Patch Changes
+
+- Updated dependencies [d221d54]
+  - @mmnto/totem@0.28.0
+
 ## 0.27.0
 
 ### Minor Changes

@@ -1,0 +1,1915 @@
+/**
+ * `totem mail` — canonical cross-repo outbox poll (ADR-106 § 3 / ADR-107).
+ *
+ * Senders write to their own `<repoRoot>/.totem/orchestration/<sender-agent>/outbox/*.md`
+ * with `to: <recipient-agent>` (or `to: broadcast`) in the frontmatter.
+ * Recipients invoke this command at session-start (typically via a
+ * vendor-specific hook in `.claude/hooks/` or `.gemini/hooks/`) to surface
+ * unread mail addressed to themselves.
+ *
+ * SELF_AGENTS resolution flows through `resolveSelfAgents` from
+ * `@mmnto/totem` (env > config.json > seat dirs ∪ basename map — the dirs ARE
+ * the registration, mmnto-ai/totem#2141). Workspace defaults to the parent
+ * directory of the calling repo, overridable via the `TOTEM_WORKSPACE` env
+ * var or `--workspace` flag.
+ *
+ * Resolution is lifecycle-BLIND; the declared seat lifecycle
+ * (`.totem/orchestration/<seat>/lifecycle.json`, mmnto-ai/totem#2511) filters
+ * only the BROADCAST denominator, and only through a successfully-parsed
+ * marker. A suspended seat keeps every byte of its directed-mail behavior —
+ * visibility and processed-mark subtraction alike — and the poll annotates the
+ * held obligation rather than hiding it.
+ *
+ * Ports the strategy-side reference implementation
+ * (`mmnto-ai/totem-strategy:.claude/hooks/SessionStart.cjs:pollInboundOutboxes`,
+ * merged via mmnto-ai/totem-strategy#373) into a cohort-portable command
+ * surface per the ADR-107 § Consequences direction.
+ */
+
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import {
+  isPathSafeAgentId,
+  knownCohortAgents,
+  // pollMail is a SYNC public API consumed directly by the SessionStart hook
+  // (session-context.mjs), so the #2339 dynamic-import shape is structurally
+  // impossible for this name; mail.ts is itself action-lazy-loaded by index.ts
+  // and ecl-gc, so this statement (five sibling value imports, all predating
+  // the #2339 coverage fix) never runs on the --help startup graph.
+  // totem-ignore-next-line mmnto-ai/totem#2511
+  readSeatLifecycle,
+  resolveSelfAgents,
+  resolveTotemRepoRootSync,
+  type SeatLifecycleState,
+  type SelfAgentResolution,
+  TotemError,
+} from '@mmnto/totem';
+
+// ─── Constants ──────────────────────────────────────────
+
+const TAG = 'Mail';
+
+/**
+ * Hard cap on unread files OPENED per invocation — the OOM/latency backstop,
+ * not the operating regime (mmnto-ai/totem#2144: the inherited 500 became the
+ * regime once cohort outboxes outgrew it, and the post-cap `to:` filter made
+ * old self-addressed mail silently unreachable). Bounded header reads cap
+ * per-file cost at the header window, so 5000 × ~16KB ≈ 80MB worst-case
+ * (realistic ≈15MB) stays inside session-start hook budget on local disk.
+ * When tripped, the result carries `truncated: true` plus a DIRECTED warning
+ * when anything self-addressed-looking fell beyond the horizon.
+ */
+const MAX_SCAN = 5000;
+
+// ─── Types ──────────────────────────────────────────────
+
+/** A single piece of mail surfaced by the poll. */
+export interface MailEntry {
+  /** Outbox-relative filename (e.g. `2026-05-18T1734Z-strategy-claude.md`). */
+  file: string;
+  /** Repo basename where the outbox lives. */
+  repo: string;
+  /** Sender agent-id (from frontmatter `from:` or outbox-dir name as fallback). */
+  from: string;
+  /** Recipient (from frontmatter `to:`, preserved verbatim). */
+  to: string;
+  /** ISO timestamp from frontmatter `timestamp:` (ADR-098 v0.4 canonical), falling back to legacy `date:`; null if absent. */
+  date: string | null;
+  /** Subject line from frontmatter, or `(no subject)` if absent. */
+  subject: string;
+  /** Absolute path to the outbox file (useful for `--json` consumers). */
+  filePath: string;
+}
+
+/** Aggregate result of a single poll. */
+export interface MailPollResult {
+  /** Resolution metadata describing how SELF_AGENTS was determined. `source`
+   * is single-sourced from core's `SelfAgentResolution` (Greptile P2 on
+   * mmnto-ai/totem#2160 — a manual copy would compile-error in the wrong
+   * place if core ever narrowed a literal). */
+  selfAgents: {
+    agents: string[];
+    source: SelfAgentResolution['source'];
+  };
+  /** Mail addressed to any SELF_AGENT or to `broadcast`, sorted newest-first. */
+  mail: MailEntry[];
+  /** Total files actually opened during the scan (≤ `MAX_SCAN`). */
+  scanned: number;
+  /** True iff the scan hit `MAX_SCAN` before exhausting the workspace. */
+  truncated: boolean;
+  /** Workspace directory walked (absolute). */
+  workspace: string;
+  /** Per-source repo failure messages — never throws, surfaces via this.
+   * GATE-ARMED accounting channel: three consumers treat a non-empty array as
+   * "the scan/subtraction is not trustworthy" — the `ecl-gc --compact` A2.2
+   * completeness gate and A2.4 post-delete verify (mmnto-ai/totem#2309), and
+   * the #2516 `INCOMPLETE` verdict token. Only scan/subtraction-integrity
+   * anomalies belong here; informational senses ride `notices`. */
+  warnings: string[];
+  /** Informational lifecycle senses (mmnto-ai/totem#2511) — NEVER gate-armed.
+   * Rendered to humans as `Note:` lines; every `warnings.length` consumer
+   * ignores this channel by design, so a weeks-long suspension can never red
+   * mark-compaction or pin the verdict to INCOMPLETE (the falsification-round
+   * regression this channel exists to prevent). */
+  notices: string[];
+}
+
+export interface MailCommandOptions {
+  /** Emit JSON instead of human-readable text. */
+  json?: boolean;
+  /** Use the recursive variant of the ADR-106 § 3 glob (default: single-level). */
+  recursive?: boolean;
+  /** Workspace override (default: `TOTEM_WORKSPACE` env, else parent-of-cwd). */
+  workspace?: string;
+  /**
+   * Walk-START directory (default: `process.cwd()`), not the definitive root:
+   * the effective repo root is derived by walking up to the nearest
+   * `.totem`/`.git` marker (mmnto-ai/totem#2312); a marker-less start is used
+   * as-is. Test injection point.
+   */
+  repoRoot?: string;
+  /** Env override (default: `process.env`). Test injection point. */
+  env?: Record<string, string | undefined>;
+  /** Scan cap override (default: `MAX_SCAN`). Test injection point — cap
+   * MECHANICS are exercised with small fixtures instead of 5000-file trees. */
+  maxScan?: number;
+  /**
+   * Return the RAW addressed-inbound set — every dispatch addressed to a
+   * SELF_AGENT or `broadcast`, WITHOUT subtracting `processed/` marks. The
+   * pre-dedupe discovery `ecl-gc` compaction consumes (ADR-106 § A2.1): the
+   * cursor-GC key is `processed ∩ raw-addressed-inbound`, and feeding back the
+   * default `inbound − processed` list would read every handled dispatch as
+   * absent and delete the marks it must retain (the false-unread bomb A2.1
+   * names). Default `false` preserves the reader's `unread = inbound −
+   * processed` contract; the two callers stay single-homed on one scan.
+   */
+  includeProcessed?: boolean;
+}
+
+// ─── Frontmatter parsing ────────────────────────────────
+
+/**
+ * Hard cap on bytes searched for the CLOSING `---` frontmatter delimiter.
+ * Bounds regex work on pathological files. Genuine cohort frontmatter is
+ * multi-KiB — frontmatter-only dispatches carry the whole message in
+ * `subject:` (4,163 bytes observed live, mmnto-ai/totem#2118) — so the
+ * window is sized ~4× the observed max, NOT the "dozens of bytes" the
+ * 2 KiB predecessor assumed (that assumption silently dropped 8/8 of the
+ * misses in the #2118 forensics). A closing `---` beyond this window is
+ * treated as absent.
+ */
+const MAX_HEADER_SEARCH_BYTES = 16_384;
+
+/**
+ * Closing frontmatter delimiter: a `---` line after the opener (LF/CRLF/EOF),
+ * tolerating trailing whitespace on the line (hand-authored dispatches).
+ */
+const CLOSING_DELIMITER = /\r?\n---[ \t]*(?:\r?\n|$)/;
+
+/**
+ * Discriminated parse result so the scan loop can warn on mail-shaped
+ * rejects (sender error — must be loud, Tenet 4) while staying silent on
+ * stray non-mail files (a warning there would be permanent, unclearable
+ * noise: the recipient cannot remove a sender's file). Carries the reject
+ * reason for the warning message. mmnto-ai/totem#2118: parse-null was the
+ * module's only warning-less failure path, and it ate real dispatches.
+ */
+type HeaderParse =
+  | {
+      ok: true;
+      header: { to: string; from: string | null; subject: string | null; date: string | null };
+    }
+  | { ok: false; mailShaped: boolean; reason: string };
+
+/**
+ * Extract `to:` / `from:` / `subject:` / `date:` from a leading frontmatter
+ * block. Restricts the regex search to the delimited header (text between
+ * the opening and closing `---` lines) so body lines starting with `to:`
+ * etc. cannot fabricate a match or overwrite displayed metadata.
+ *
+ * `to:` is the only frontmatter field required for a file to be eligible
+ * mail; a mail-shaped file without it is a reject, not a fallback.
+ */
+function parseHeader(content: string, sourceTruncated = false): HeaderParse {
+  // Defense in depth: real handoffs open with a YAML frontmatter delimiter.
+  // Reject anything that doesn't, so a stray .md file in an outbox cannot
+  // be coerced into mail.
+  if (!content.startsWith('---')) {
+    return { ok: false, mailShaped: false, reason: 'no opening --- delimiter' };
+  }
+
+  // Parse to the CLOSING `---` line (mmnto-ai/totem#2118). The predecessor
+  // split on the first blank line and rejected any >2 KiB file without one —
+  // silently dropping every frontmatter-only dispatch over 2 KiB (the cohort
+  // convention puts the whole message in `subject:`, zero blank lines). The
+  // closing delimiter is the real header terminator; the byte cap bounds the
+  // SEARCH WINDOW instead of rejecting the file outright.
+  const window = content.slice(3, 3 + MAX_HEADER_SEARCH_BYTES);
+  const close = CLOSING_DELIMITER.exec(window);
+  if (!close) {
+    return {
+      ok: false,
+      mailShaped: true,
+      reason:
+        // The window starts at byte 3 (after the opener), so truncation only
+        // actually occurs past 3 + MAX — the window message must not fire for
+        // files the window fully covered (Greptile R1 on mmnto-ai/totem#2119).
+        // Under bounded reads `content.length` can never exceed the window, so
+        // the reader threads `sourceTruncated` (file extends past the bytes
+        // read) to keep the window message accurate (codex F3).
+        content.length > 3 + MAX_HEADER_SEARCH_BYTES || sourceTruncated
+          ? `no closing --- within the ${MAX_HEADER_SEARCH_BYTES}-byte search window`
+          : 'no closing --- delimiter',
+    };
+  }
+  const header = window.slice(0, close.index);
+
+  const toMatch = header.match(/^to:\s*(.+)$/im);
+  if (!toMatch) {
+    return { ok: false, mailShaped: true, reason: 'no to: field in frontmatter' };
+  }
+  const fromMatch = header.match(/^from:\s*(.+)$/im);
+  const subjectMatch = header.match(/^[-\s]*subject:\s*(.+)$/im);
+  const subject = subjectMatch ? unquoteScalar(subjectMatch[1]!.trim()) : null;
+  // ADR-098 v0.4 codified `timestamp:` (full RFC3339) as canonical, replacing
+  // legacy `date:`; `date:` remains a backwards-compat read (the amendment's
+  // own migration note). Read `timestamp:` first, fall back to `date:`. The
+  // surfaced field stays `MailEntry.date` (no rename) — it is the displayed
+  // time, and a cosmetic rename would widen blast radius across hooks +
+  // `--json` consumers for no contract gain (Tenet 5; strategy-claude concur
+  // 2026-06-09, folded into ADR-098's migration note on the strategy side).
+  const timestampMatch = header.match(/^timestamp:\s*(.+)$/im);
+  const dateMatch = header.match(/^date:\s*(.+)$/im);
+  const when = timestampMatch ? timestampMatch[1]! : dateMatch ? dateMatch[1]! : null;
+  // Every field below is sender-controlled wire text that downstream writers
+  // (`formatTextResult` → stderr, `--json` consumers' logs) display verbatim —
+  // escape raw control bytes at this single boundary so no parse path (quoted,
+  // unquoted, hand-authored) can carry terminal-injection bytes into
+  // `MailEntry` (CR R5 on mmnto-ai/totem#2134; the unquoted exposure predates
+  // this PR — closing the whole class here, not just the unquote fallback).
+  return {
+    ok: true,
+    header: {
+      to: escapeControlBytes(toMatch[1]!.trim()),
+      from: fromMatch ? escapeControlBytes(fromMatch[1]!.trim()) : null,
+      subject: subject !== null ? escapeControlBytes(subject) : null,
+      date: when !== null ? escapeControlBytes(when.trim()) : null,
+    },
+  };
+}
+
+/**
+ * Replace each raw control byte with its JSON-escaped spelling (ESC becomes
+ * the six characters backslash-u-0-0-1-b, LF becomes backslash-n, …) so the
+ * value stays display-safe AND lossless — the escaped form is visible instead
+ * of interpreted. Printable text passes through unchanged.
+ */
+function escapeControlBytes(value: string): string {
+  return value.replace(/\p{Cc}/gu, (ch) => JSON.stringify(ch).slice(1, -1));
+}
+
+/**
+ * Strict PRINTABLE JSON-string shape: a double-quoted scalar whose decoded
+ * value provably contains no control bytes. The only escapes admitted are
+ * `\"` `\\` `\/` — the ones that decode to printables. Escapes that decode to
+ * control bytes (`\n`, `\t`, `\b\f\r`, `\uXXXX`) deliberately do NOT match
+ * (CR R4 on mmnto-ai/totem#2134): a control-bearing quoted subject would
+ * otherwise decode into raw ESC/newline that `formatTextResult` writes to
+ * stderr — the same terminal-injection class the agent-id guard blocks.
+ * Likewise hand-authored asymmetric quotes, raw control bytes, and single
+ * quotes — all read verbatim.
+ */
+const PRINTABLE_JSON_STRING_SCALAR = /^"(?:[^"\\\p{Cc}]|\\["\\/])*"$/u;
+
+/**
+ * Undo `yamlScalar`'s double-quoting on read so quoted scalars round-trip:
+ * compose → parse → `Re: <subject>` must not accrete quotes, and `pollMail`
+ * must surface the subject the sender typed (CR R3 on mmnto-ai/totem#2134).
+ * The shape pre-check makes `JSON.parse` infallible here — no catch needed —
+ * and confines unquoting to printable-only strings, so a wire value encoding
+ * control bytes surfaces in its escaped spelling instead of decoding into the
+ * terminal (display stays lossless AND injection-free), and reader behavior
+ * for legacy/hand-authored mail is unchanged.
+ */
+function unquoteScalar(value: string): string {
+  return PRINTABLE_JSON_STRING_SCALAR.test(value) ? (JSON.parse(value) as string) : value;
+}
+
+/**
+ * Bytes read per file when scanning headers: the opener (`---`) plus the
+ * `parseHeader` search window. For ASCII content this reproduces the
+ * whole-file parse byte-for-byte (the window slice sees identical text); for
+ * multi-byte content the decoded window can only be SHORTER than a whole-file
+ * read's, which converts an exotic >window header into the LOUD mail-shaped
+ * warning path — never a silent drop (codex F3, mmnto-ai/totem#2144).
+ */
+const HEADER_READ_BYTES = 3 + MAX_HEADER_SEARCH_BYTES;
+
+/** Bounded header read: content plus the truncation signal for warnings. */
+interface HeaderWindowRead {
+  content: string;
+  /** True iff the file extends past the bytes read (window semantics apply). */
+  sourceTruncated: boolean;
+}
+
+/**
+ * Read at most `HEADER_READ_BYTES` from the head of a file. The byte boundary
+ * lives HERE, not in `parseHeader` string slicing (codex F3) — the caller
+ * threads `sourceTruncated` into the parse-warning path so a no-closing-
+ * delimiter reject names the window when the window is why.
+ */
+function readHeaderWindow(filePath: string): HeaderWindowRead {
+  const fd = fs.openSync(filePath, 'r');
+  try {
+    // Sentinel read (+1 byte, never decoded): `bytesRead > HEADER_READ_BYTES`
+    // IS the past-the-window signal — equivalent to the fstat-size check
+    // (bytesRead = N+1 ⟺ size > N) at one fewer syscall per scanned file,
+    // which matters at the 5000-file cap (Greptile P2, mmnto-ai/totem#2160).
+    const buf = Buffer.alloc(HEADER_READ_BYTES + 1);
+    const bytesRead = fs.readSync(fd, buf, 0, HEADER_READ_BYTES + 1, 0);
+    return {
+      content: buf.toString('utf-8', 0, Math.min(bytesRead, HEADER_READ_BYTES)),
+      sourceTruncated: bytesRead > HEADER_READ_BYTES,
+    };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * Normalize an ECL dispatch basename to its portable, NTFS-safe form by
+ * STRIPPING COLONS — the compact `...T0510Z...` shape the send actuator already
+ * emits (mmnto-ai/totem#2431). A colon in a filename is an NTFS Alternate Data
+ * Stream separator: `fs.writeFileSync` to `...T05:10Z-x.md` "succeeds" but
+ * writes a 0-byte base file (`...T05`) with the real bytes in an invisible
+ * `:10Z-x.md` stream that `fs.readdirSync` NEVER lists — so a colon-bearing
+ * `processed/` mark is unreadable and its dispatch reports UNREAD forever
+ * (agy root-cause, live-verified with `Get-Item -Stream *`). Applied on ALL
+ * platforms (not just win32) so marks stay portable across checkouts: a mark
+ * written on a colon-legal filesystem must still be found on Windows. This is
+ * the single normalization seam — the writer (`markSource`) stores under the
+ * sanitized name, and the reader normalizes BOTH inbound outbox basenames AND
+ * mark basenames through it before comparison, so sanitized marks subtract
+ * colon-bearing inbound names and pre-existing corrupted 0-byte marks stop
+ * mattering once a healed mark lands. Idempotent — a colon-free basename passes
+ * through unchanged. Colons ONLY: broadening to other characters would perturb
+ * the reader's positional-token bucketing (which keys on the raw filename).
+ */
+export function sanitizeEclBasename(name: string): string {
+  return name.replace(/:/g, '');
+}
+
+/**
+ * Per-seat SANITIZED processed-mark basenames for the RESOLVED SELF seats (in
+ * `processed/` or `processed/_broadcast/` — both locations count; the live
+ * mmnto-ai/totem#2412 specimen sat in the root).
+ *
+ * Split out of the old single-pass count builder (mmnto-ai/totem#2511) because
+ * the directed and broadcast denominators now fold DIFFERENT seat sets: the
+ * drain happens ONCE per seat here and `countMarksAcrossSeats` folds it twice.
+ * A second drain would double every `processed/ scan failed` warning on the
+ * degraded path, and a markerless tree must poll byte-identically to a
+ * pre-#2511 one — warnings channel included.
+ *
+ * Marks are keyed by their SANITIZED basename (mmnto-ai/totem#2431) so a
+ * colon-bearing inbound name (matched via the same sanitizer in `pollMail`)
+ * subtracts against its NTFS-safe mark. De-duping per seat happens here so a
+ * corrupted+healed pair (a legacy colon mark on a colon-legal FS plus its
+ * sanitized heal) in one seat's stores still counts as ONE seat — load-bearing
+ * for the per-seat broadcast requirement.
+ */
+function readProcessedMarkKeys(
+  repoRoot: string,
+  selfAgents: string[],
+  warnings: string[],
+): Map<string, Set<string>> {
+  const marksBySeat = new Map<string, Set<string>>();
+  for (const agent of selfAgents) {
+    const agentDir = path.join(repoRoot, '.totem', 'orchestration', agent, 'processed');
+    const seatMarks = new Set<string>();
+    drainProcessedDir(agentDir, seatMarks, warnings);
+    drainProcessedDir(path.join(agentDir, '_broadcast'), seatMarks, warnings);
+    const seatKeys = new Set<string>();
+    for (const name of seatMarks) seatKeys.add(sanitizeEclBasename(name));
+    marksBySeat.set(agent, seatKeys);
+  }
+  return marksBySeat;
+}
+
+/**
+ * Per-basename count of seats (drawn from `seats`) holding a processed mark.
+ * Directed mail subtracts on ANY seat's mark (the historical flat union). A
+ * broadcast is per-seat consumable — ecl-gc stores and collects `_broadcast`
+ * marks per seat — so it subtracts only when EVERY seat in its denominator
+ * holds the mark: the flat union collapsed exactly that, letting one seat's
+ * consumption hide a live broadcast from every other seat in a multi-seat poll
+ * (first-consumer-wins, mmnto-ai/totem#2412). A multi-seat poll's unread line
+ * then truthfully asserts "unread for at least one of my seats" — the only
+ * claim it can make.
+ *
+ * `seats` is the FULL resolved self set for the directed count and the
+ * lifecycle-ACTIVE subset for the broadcast count (mmnto-ai/totem#2511): a
+ * suspended seat's mark must not close a broadcast the active seats have not
+ * all marked, while its directed marks must keep subtracting — an
+ * already-consumed directed dispatch resurfacing as unread is the ADR-106
+ * § A2.1 false-unread bomb.
+ */
+function countMarksAcrossSeats(
+  marksBySeat: ReadonlyMap<string, ReadonlySet<string>>,
+  seats: readonly string[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const seat of seats) {
+    for (const key of marksBySeat.get(seat) ?? []) {
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function drainProcessedDir(dir: string, into: Set<string>, warnings: string[]): void {
+  if (!fs.existsSync(dir)) return;
+  // totem-context: intentional cleanup — an unreadable processed/ subtree (EACCES, race with concurrent rename) emits a warning and degrades to a stale exclusion set rather than blocking the poll. Mail still surfaces; the agent may see already-actioned items in that worst case, which is observable (the warning) rather than silent.
+  try {
+    for (const entry of fs.readdirSync(dir)) {
+      if (entry.endsWith('.md')) into.add(entry);
+    }
+    // totem-context: intentional cleanup — see directive above the try; dual placement so the rule fires on either the catch-keyword line or the catch-body line.
+  } catch (err) {
+    warnings.push(`processed/ scan failed (${dir}): ${String(err)}`);
+  }
+}
+
+// ─── Workspace scan ─────────────────────────────────────
+
+/**
+ * One slot of work for the scanner: an outbox directory to walk plus the
+ * repo + agent labels for surfacing.
+ */
+interface OutboxSlot {
+  repo: string;
+  agent: string;
+  outbox: string;
+}
+
+/**
+ * No-follow directory probe for the outbox level: `fs.existsSync` follows
+ * symlinks, so a symlinked `outbox/` would pull outside-tree content into the
+ * mail scan (mmnto-ai/totem#2355, sibling class to the #2354 ingest guard).
+ */
+function isRealDirectory(p: string): boolean {
+  // totem-context: intentional cleanup — a raced/ENOENT lstat degrades to "not a directory" and skips this slot, matching the scan's skip-don't-abort posture (same idiom as the #2356 ingest guard).
+  try {
+    return fs.lstatSync(p).isDirectory();
+    // totem-context: intentional cleanup — see directive above the try; dual placement so the rule fires on either the catch-keyword line or the catch-body line.
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Enumerate outbox directories under `<workspace>/<repo>/.totem/orchestration/<agent>/outbox`.
+ * Single-level by default; recursive mode walks `<workspace>/**` (capped at MAX_SCAN
+ * to bound runtime on deep trees).
+ */
+function enumerateOutboxes(
+  workspace: string,
+  recursive: boolean,
+  warnings: string[],
+): OutboxSlot[] {
+  const slots: OutboxSlot[] = [];
+
+  if (!fs.existsSync(workspace)) {
+    warnings.push(`workspace does not exist: ${workspace}`);
+    return slots;
+  }
+
+  let repos: string[];
+  try {
+    repos = fs
+      .readdirSync(workspace, { withFileTypes: true })
+      .filter((d) => d.isDirectory() && !d.name.startsWith('.') && d.name !== 'node_modules')
+      .map((d) => d.name)
+      .sort();
+    // totem-context: intentional cleanup — a workspace readdir failure (EACCES, ENOTDIR via raced symlink) is recorded as a structured warning so the CLI surfaces it; throwing here would block hook-driven session start over a non-fatal scan issue.
+  } catch (err) {
+    warnings.push(`workspace scan failed: ${String(err)}`);
+    return slots;
+  }
+
+  const visit = (repoLabel: string, orchDir: string): void => {
+    // No-follow both remaining path hops (greptile round on this PR):
+    // `existsSync` follows symlinks, so a symlinked `.totem/` or
+    // `orchestration/` inside a real repo would swing the whole agent scan
+    // into the link target. `path.dirname(orchDir)` is the `.totem` hop.
+    if (!isRealDirectory(path.dirname(orchDir)) || !isRealDirectory(orchDir)) return;
+    let agents: string[];
+    try {
+      // Dirent-filter the agent level like the workspace/repo levels above:
+      // a symlinked `<agent>/` dir must not be followed into the mail scan
+      // (mmnto-ai/totem#2355; orchestration-resolver.ts is no-follow by design).
+      agents = fs
+        .readdirSync(orchDir, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name)
+        .sort();
+      // totem-context: intentional cleanup — per-repo readdir failure skips this slot, emits a structured warning, and lets sibling repos continue; one inaccessible orchestration tree must not block the rest of the scan.
+    } catch (err) {
+      warnings.push(`orchestration scan failed (${repoLabel}): ${String(err)}`);
+      return;
+    }
+    for (const agent of agents) {
+      const outbox = path.join(orchDir, agent, 'outbox');
+      if (isRealDirectory(outbox)) {
+        slots.push({ repo: repoLabel, agent, outbox });
+      }
+    }
+  };
+
+  if (!recursive) {
+    for (const repo of repos) {
+      visit(repo, path.join(workspace, repo, '.totem', 'orchestration'));
+    }
+    return slots;
+  }
+
+  // Recursive variant: descend into each top-level repo and look for any
+  // `.totem/orchestration/` under it. Bounded depth so a malformed tree
+  // can't pin us — the MAX_SCAN file-open cap is the second guard.
+  const RECURSIVE_DEPTH_CAP = 6;
+  const stack: Array<{ dir: string; label: string; depth: number }> = repos.map((r) => ({
+    dir: path.join(workspace, r),
+    label: r,
+    depth: 0,
+  }));
+  while (stack.length > 0) {
+    const node = stack.pop()!;
+    visit(node.label, path.join(node.dir, '.totem', 'orchestration'));
+    if (node.depth >= RECURSIVE_DEPTH_CAP) continue;
+    let children: fs.Dirent[];
+    try {
+      children = fs.readdirSync(node.dir, { withFileTypes: true });
+      // totem-context: intentional cleanup — recursive-descent readdir failure on one node emits a structured warning and skips that subtree; a single inaccessible dir must not abort the whole scan.
+    } catch (err) {
+      warnings.push(`recursive scan failed (${node.dir}): ${String(err)}`);
+      continue;
+    }
+    for (const child of children) {
+      if (!child.isDirectory() || child.name.startsWith('.')) continue;
+      if (child.name === 'node_modules') continue;
+      stack.push({
+        dir: path.join(node.dir, child.name),
+        // Use the immediate-parent directory name as the repo label for
+        // nested layouts (e.g. `wrapper/nested-strategy/.totem/orchestration/`
+        // surfaces as repo='nested-strategy'). The top-level label is
+        // misleading when the orchestration tree lives under a wrapper dir.
+        label: child.name,
+        depth: node.depth + 1,
+      });
+    }
+  }
+  return slots;
+}
+
+// ─── Core poll ──────────────────────────────────────────
+
+/**
+ * Programmatic entry point. Returns a structured `MailPollResult` for
+ * consumers that want to render their own output (hooks, MCP audits,
+ * future surfaces). The CLI wrapper calls this then formats the result
+ * for human consumption.
+ *
+ * Never throws — filesystem failures degrade to warnings on the result.
+ */
+export function pollMail(opts: MailCommandOptions = {}): MailPollResult {
+  const env = opts.env ?? process.env;
+  // Walk-start, not definitive root (contract in `resolveTotemRepoRootSync`):
+  // from a SUBDIRECTORY (e.g. `.totem/orchestration/<seat>/processed/`), the
+  // old `path.resolve(cwd)` made `repoRoot` the subdir and `workspace =
+  // dirname(subdir)` garbage — `enumerateOutboxes` scanned nothing real and the
+  // poll rendered a false-clean inbox (mmnto-ai/totem#2312). Explicit
+  // `--workspace` / `TOTEM_WORKSPACE` overrides are untouched below.
+  const repoRoot = resolveTotemRepoRootSync(opts.repoRoot, process.cwd());
+
+  const workspaceRaw = opts.workspace ?? env['TOTEM_WORKSPACE'] ?? path.dirname(repoRoot);
+  const workspace = path.resolve(workspaceRaw);
+
+  const selfResolution = resolveSelfAgents(repoRoot, env);
+  const selfLower = new Set(selfResolution.agents.map((a) => a.toLowerCase()));
+
+  const warnings: string[] = [];
+  // Non-gating informational channel (see MailPollResult.notices).
+  const notices: string[] = [];
+  if (selfResolution.warnings !== undefined) {
+    // Resolver diagnostics are Tenet-4 loud by contract (today: the config
+    // warn-shape — host_agents omitting a present seat dir, mmnto-ai/totem#2141).
+    warnings.push(...selfResolution.warnings);
+  }
+  if (selfResolution.agents.length === 0) {
+    warnings.push(
+      `no SELF_AGENT resolved (set TOTEM_SELF_AGENT, add .totem/orchestration/config.json host_agents, or run from a known cohort repo)`,
+    );
+  }
+
+  // Normalize duplicate ids once (env/config can carry them): a duplicated seat
+  // would double-drain its marks AND inflate the broadcast requirement in
+  // lockstep — behavior-equivalent today by symmetry, but the equality between
+  // "seats counted" and "seats that can hold marks" is load-bearing for the
+  // per-seat broadcast rule, so it is enforced rather than assumed (GCA #2424).
+  const selfAgents = [...new Set(selfResolution.agents)];
+
+  // Declared seat lifecycle (mmnto-ai/totem#2511). Resolution stays
+  // lifecycle-BLIND: `selfAgents` is the resolver's answer untouched, so every
+  // resolved seat keeps directed-mail visibility AND its processed-mark
+  // subtraction. Lifecycle filters exactly ONE thing — the broadcast
+  // denominator below — and only via a SUCCESSFULLY-PARSED marker. The filter
+  // therefore starts from the resolver's OUTPUT, never from a fresh directory
+  // enumeration: `readSeatDirs` degrades to `[]` silently on an unreadable
+  // orchestration dir by its own shipped contract, and a silent empty set must
+  // never shrink a required-set (#2511 failure table). Core's read is
+  // fail-open-and-loud, so a corrupt/unreadable marker leaves its seat ACTIVE
+  // (still in the denominator, mail still surfacing) and warns naming the file.
+  //
+  // Channel discipline (falsification-round finding on this branch): the
+  // `warnings` channel arms THREE gates — the ecl-gc A2.2 completeness gate,
+  // its A2.4 post-delete verify (`verifyComplete`, exit 3), and the #2516
+  // `INCOMPLETE` verdict token. The CORRUPT-MARKER warning below deliberately
+  // rides it: compaction must not run, and a verdict must not read clean,
+  // while a denominator is being read through a marker nobody can parse; it
+  // clears the moment the marker is fixed or deleted. The lifecycle
+  // ANNOTATIONS (suspended-held / retired-addressee, further down) ride
+  // `notices` instead — informational senses on a healthy scan must never red
+  // compaction or render a complete scan as INCOMPLETE.
+  const seatLifecycleStates = new Map<string, SeatLifecycleState>();
+  const activeSelfAgents: string[] = [];
+  for (const agent of selfAgents) {
+    const lifecycle = readSeatLifecycle(repoRoot, agent);
+    seatLifecycleStates.set(agent.toLowerCase(), lifecycle.state);
+    if (lifecycle.warning !== undefined) warnings.push(lifecycle.warning);
+    // Both conjuncts are deliberate rather than redundant: "only an explicitly
+    // PARSED suspended/retired marker shrinks the denominator" IS the rule, and
+    // stating it structurally keeps a fail-open read (`source:
+    // 'default-active'`) inside the denominator even if the degraded state ever
+    // widens beyond `active`.
+    if (lifecycle.source === 'marker' && lifecycle.state !== 'active') continue;
+    activeSelfAgents.push(agent);
+  }
+
+  // `includeProcessed` (ADR-106 § A2.1) yields the RAW addressed-inbound set:
+  // an empty mark-count map makes the subtraction below a no-op, so nothing is
+  // subtracted. The reader default stays `inbound − processed`; the compaction
+  // path opts in to the pre-dedupe view.
+  const marksBySeat =
+    opts.includeProcessed !== true && selfAgents.length > 0
+      ? readProcessedMarkKeys(repoRoot, selfAgents, warnings)
+      : new Map<string, Set<string>>();
+  // Directed subtraction: the FULL resolved self set, unchanged by lifecycle —
+  // a suspended seat's already-consumed directed mail must never resurface as
+  // unread (mmnto-ai/totem#2511).
+  const processedMarkCounts = countMarksAcrossSeats(marksBySeat, selfAgents);
+  // Broadcast subtraction: ACTIVE seats only, on BOTH sides of the comparison
+  // (count and requirement), so a suspended seat can neither hold a broadcast
+  // open nor close one on the active seats' behalf.
+  const broadcastMarkCounts = countMarksAcrossSeats(marksBySeat, activeSelfAgents);
+  const activeSeatCount = activeSelfAgents.length;
+
+  const slots = enumerateOutboxes(workspace, opts.recursive === true, warnings);
+
+  // Set inside the PARSE loop (parsed `to: broadcast` + the filename token
+  // that selects the per-seat floor — never the filename alone, which can
+  // mislabel a directed dispatch, the codex-F2 class); surfaced as ONE notice
+  // after the scan.
+  let allSuspendedBroadcastHeld = false;
+
+  // Two-pass scan for fairness under MAX_SCAN.
+  // Pass 1 (cheap): readdirSync every outbox to collect all unread filenames.
+  // Pass 2 (bounded): order self-token-first then global newest-first, and
+  // header-window-read only the top MAX_SCAN. Without the global sort,
+  // alphabet-early repos can exhaust the cap before later repos are touched
+  // (per GCA review on mmnto-ai/totem#1971); without the self-first bucket,
+  // other-recipient volume crowds self mail out of the horizon
+  // (mmnto-ai/totem#2144).
+  // Compact-stamp prefix shared by the subtraction discriminator below and the
+  // self-priority bucket further down.
+  const stampPrefix = /^\d{4}-\d{2}-\d{2}T\d{4}Z-/;
+
+  // Positional broadcast token — the same zero-I/O filename signal the
+  // self-priority bucket trusts (mmnto-ai/totem#2144): `broadcast` immediately
+  // after the compact stamp. Subtraction runs pre-parse (the scan cap must not
+  // be spent opening consumed files), so this token also selects the
+  // subtraction rule: a broadcast-named file needs EVERY resolved seat's mark
+  // (per-seat consumable, mmnto-ai/totem#2412); anything else keeps the
+  // historical any-seat union. A `to: broadcast` dispatch WITHOUT the filename
+  // token (legacy names) stays on the union rule — no worse than before, and
+  // the ecl filename discipline makes the token standard on new dispatches.
+  const isBroadcastNamed = (file: string): boolean => {
+    // Classify on the SANITIZED basename (mmnto-ai/totem#2431, CR @623): the
+    // `T\d{4}Z` stamp fails against a colon-bearing stamp (`T05:10Z`), so an
+    // UN-normalized colon-bearing BROADCAST would fall to the any-seat rule and
+    // one seat's mark would hide it from every other seat — the #2412
+    // first-consumer-wins class, resurrected for that name shape. No-op for the
+    // colon-free common case.
+    const normalized = sanitizeEclBasename(file);
+    const stamp = stampPrefix.exec(normalized);
+    if (stamp === null) return false;
+    const rest = normalized.slice(stamp[0].length).toLowerCase();
+    return rest === 'broadcast.md' || rest.startsWith('broadcast-');
+  };
+
+  const unread: Array<{ slot: OutboxSlot; file: string }> = [];
+  for (const slot of slots) {
+    let files: string[];
+    try {
+      files = fs.readdirSync(slot.outbox).filter((f) => f.endsWith('.md'));
+      // totem-context: intentional cleanup — outbox readdir failure (mid-rename race, EACCES, removed-during-scan) emits a structured warning and skips this slot.
+    } catch (err) {
+      warnings.push(`outbox scan failed (${slot.repo}/${slot.agent}): ${String(err)}`);
+      continue;
+    }
+    for (const file of files) {
+      const broadcastNamed = isBroadcastNamed(file);
+      // `max(seats, 1)` keeps the zero-resolution poll (empty map, seats = 0)
+      // from vacuously treating every broadcast as consumed, and makes a
+      // single-seat poll bit-identical to the pre-#2412 behavior. The seat count
+      // is the lifecycle-ACTIVE one (mmnto-ai/totem#2511) — a suspended seat
+      // leaves the DENOMINATOR, not the poll — and the same `max(…, 1)` floor
+      // covers the all-seats-suspended edge: an empty required set is never
+      // "closed" (the inherited orchestration.go boundary), and it is read
+      // against an EMPTY active-mark map, so broadcasts simply never subtract
+      // until a seat is reactivated.
+      const required = broadcastNamed ? Math.max(activeSeatCount, 1) : 1;
+      // Broadcast counts come from the ACTIVE seats' marks only; directed mail
+      // keeps the full-self-set union (mmnto-ai/totem#2511).
+      const counts = broadcastNamed ? broadcastMarkCounts : processedMarkCounts;
+      // Normalize the inbound basename through the same sanitizer the marks are
+      // keyed by (mmnto-ai/totem#2431), so a colon-bearing inbound name subtracts
+      // against its NTFS-safe mark. `isBroadcastNamed` keeps reading the RAW file
+      // (positional-token logic is untouched per the amendment scope).
+      if ((counts.get(sanitizeEclBasename(file)) ?? 0) >= required) continue;
+      unread.push({ slot, file });
+    }
+  }
+
+  // Global newest-first by filename. ISO-timestamp prefixes give a total
+  // order; non-ISO filenames sort lexically (stable; only matters within a
+  // sender's outbox).
+  unread.sort((a, b) => b.file.localeCompare(a.file));
+
+  // Self-priority bucketing (mmnto-ai/totem#2144): files whose FILENAME
+  // recipient token — matched positionally, immediately after the compact
+  // stamp, so a slug word equal to a seat id cannot mis-bucket — names a
+  // SELF agent or `broadcast` scan first. Everything else (tokenless legacy
+  // names and known-other tokens alike) stays MERGED at the global
+  // newest-first baseline above: under a pre-parse cap, ordering becomes
+  // delivery, so a known-other token must never rank a file WORSE than
+  // today's scan would (codex F2 — a mislabeled filename carrying `to: self`
+  // inside). The token grants priority only; delivery truth stays the parsed
+  // `to:` field.
+  const selfTokens = [...selfLower, 'broadcast'];
+  const hasSelfToken = (file: string): boolean => {
+    // Normalize identically to `isBroadcastNamed` (mmnto-ai/totem#2431, CR @623
+    // second `stampPrefix.exec` site): a colon-bearing self/broadcast name would
+    // otherwise fail the stamp match and mis-bucket into the LOW-priority tail,
+    // where it could fall past the MAX_SCAN horizon on a colon-legal filesystem
+    // (on win32 the ADS-corrupt name never lists, so this is the cross-checkout
+    // guard). Ordering only — delivery truth stays the parsed `to:`. No-op for
+    // colon-free names.
+    const normalized = sanitizeEclBasename(file);
+    const stamp = stampPrefix.exec(normalized);
+    if (stamp === null) return false;
+    const rest = normalized.slice(stamp[0].length).toLowerCase();
+    return selfTokens.some((token) => rest === `${token}.md` || rest.startsWith(`${token}-`));
+  };
+  const ordered = [
+    ...unread.filter(({ file }) => hasSelfToken(file)),
+    ...unread.filter(({ file }) => !hasSelfToken(file)),
+  ];
+
+  const maxScan = opts.maxScan ?? MAX_SCAN;
+  let scanned = 0;
+  let truncated = false;
+  if (ordered.length > maxScan) {
+    truncated = true;
+    // Directed truncation warning (Tenet 4): the dropped tail is checked by
+    // FILENAME (zero I/O) for self/broadcast tokens. Self-token files sort
+    // first, so any landing here means self-priority volume alone exceeded
+    // the cap — name them explicitly instead of hiding behind the generic
+    // truncation line.
+    const droppedSelf = ordered
+      .slice(maxScan)
+      .filter(({ file }) => hasSelfToken(file))
+      .map(({ slot, file }) => `${slot.repo}/${slot.agent}/${file}`);
+    if (droppedSelf.length > 0) {
+      const shown = droppedSelf.slice(0, 5);
+      if (droppedSelf.length > shown.length) {
+        shown.push(`(+${droppedSelf.length - shown.length} more)`);
+      }
+      warnings.push(`possible self-addressed mail beyond the scan horizon: ${shown.join(', ')}`);
+    }
+  }
+
+  // Roster-validation sensor (mmnto-ai/totem#2335, write-side sibling of the
+  // #2311 basename-collision sensor below): a dispatch whose `to:` names no
+  // roster agent is invisible to EVERY seat-scoped poll — it "looks sent
+  // forever" and is never discoverable as unread (live exhibit: a verdict
+  // deposited with `to: cohort`, a non-roster literal). The roster is the SAME
+  // set the send-side actuator validates recipients against —
+  // `knownCohortAgents` reused, not re-derived (the hardcoded-map audit is
+  // mmnto-ai/totem#2017) — UNIONed with this repo's resolved self agents,
+  // because an env/config self-id (mmnto-ai/totem#2141) can sit outside the
+  // cohort map yet is a valid recipient here (never false-flag self-addressed
+  // mail). The no-`to:` / mail-shaped-reject sub-class is the same
+  // undeliverable class but is already surfaced loudly by the parse-fail
+  // warning above (`no to: field in frontmatter`), so this sensor deliberately
+  // does not re-warn it; non-mail-shaped strays stay silent by the #2118
+  // design (a warning there is permanent, unclearable noise).
+  const rosterLower = new Set(
+    [...knownCohortAgents(workspace), ...selfResolution.agents].map((a) => a.toLowerCase()),
+  );
+
+  const mail: MailEntry[] = [];
+  // Cross-sender basename-collision sensor (mmnto-ai/totem#2311, read-side
+  // half of mmnto-ai/totem-strategy#827): dispatch filenames don't encode the
+  // sender and `processed/` dedupe is basename-only, so two seats converging
+  // on one addressed-inbound basename means a single mark silently shadows
+  // BOTH dispatches. Keyed on the OUTBOX-OWNER seat (`slot.agent` —
+  // single-writer filesystem truth), never the forgeable `from:` header, so
+  // one seat's broadcast fan-out copies across repos can never fire it.
+  // basename → (owner-seat lowercased → `repo/agent` display path).
+  const collisionsByBasename = new Map<string, Map<string, string>>();
+  // Lifecycle annotation ledger (mmnto-ai/totem#2511): one NOTICE per affected
+  // SELF seat per poll, not one per file — a suspended seat carrying twenty held
+  // dispatches must not bury the rest of the notices channel.
+  const lifecycleAnnotatedSeats = new Set<string>();
+  const inScope = ordered.length > maxScan ? ordered.slice(0, maxScan) : ordered;
+  for (const { slot, file } of inScope) {
+    scanned += 1;
+    let headerWindow: HeaderWindowRead;
+    try {
+      headerWindow = readHeaderWindow(path.join(slot.outbox, file));
+      // totem-context: intentional cleanup — per-file read failure emits a structured warning and skips that file; mail surfacing must degrade gracefully on a single unreadable handoff (mid-write race or transient FS hiccup).
+    } catch (err) {
+      warnings.push(`mail read failed (${slot.repo}/${slot.agent}/${file}): ${String(err)}`);
+      continue;
+    }
+    const parsed = parseHeader(headerWindow.content, headerWindow.sourceTruncated);
+    if (!parsed.ok) {
+      // Tenet 4 parity with the readFileSync path above: a mail-shaped file
+      // that fails to parse is the silent-drop hazard (mmnto-ai/totem#2118 —
+      // eight real dispatches vanished without a trace). Non-mail-shaped
+      // strays stay silent by design (see HeaderParse).
+      if (parsed.mailShaped) {
+        warnings.push(`mail parse failed (${slot.repo}/${slot.agent}/${file}): ${parsed.reason}`);
+      }
+      continue;
+    }
+    const header = parsed.header;
+    const toLower = header.to.toLowerCase();
+    // Roster check runs HERE — before the self-filter below — because an
+    // unresolvable `to:` is undeliverable to EVERY seat, not just this one, and
+    // the whole-workspace scan is the only place the file is ever seen (Tenet
+    // 13: warn, don't gate). `broadcast` is a routing literal, not an agent, so
+    // it is a valid target. `header.to` is already control-byte-escaped by
+    // `parseHeader`, so interpolating it into the warning is display-safe.
+    if (toLower !== 'broadcast' && !rosterLower.has(toLower)) {
+      warnings.push(
+        `unresolvable outbox address: ${slot.repo}/${slot.agent}/${file} — to: "${header.to}" matches no roster agent; invisible to every seat-scoped poll`,
+      );
+    }
+    if (toLower !== 'broadcast' && !selfLower.has(toLower)) continue;
+    const senderSeat = slot.agent.toLowerCase();
+    // Own-broadcast exclusion (mmnto-ai/totem#2364): a seat's outbound
+    // broadcast is not its own inbound — without this, a broadcasting seat
+    // reads "1 unread" from its own outbox forever unless it hand-backfills a
+    // `processed/_broadcast/` mark. Keyed on the OUTBOX-OWNER seat
+    // (`slot.agent`, single-writer filesystem truth — same doctrine as the
+    // collision sensor below), never the forgeable `from:` header. Reader
+    // path only: the `includeProcessed` compaction discovery (ADR-106 § A2.1)
+    // must keep the RAW addressed-inbound set, or existing self-broadcast
+    // marks would read as stale and be collected — the false-unread bomb.
+    // Directed self-mail (`to:` a SELF agent) stays surfaced; broadcasts are
+    // the observed noise class.
+    if (opts.includeProcessed !== true && toLower === 'broadcast' && selfLower.has(senderSeat)) {
+      continue;
+    }
+    // Lifecycle annotations (mmnto-ai/totem#2511) — sense, never hide. Directed
+    // mail addressed to a non-active SELF seat still surfaces above and below
+    // this block: a lifecycle transition does NOT discharge an obligation edge
+    // (OQ4, resolved at the Phase-4 gate), and the exclusion this feature grants
+    // is denominator-only. Bounded by `lifecycleAnnotatedSeats` to one notice
+    // per seat per poll. `header.to` is already control-byte-escaped by
+    // `parseHeader`, so interpolating it is display-safe (same as the roster
+    // sensor above). Like the collision sensor below, detection is bounded by
+    // the scan window — a held dispatch beyond the maxScan horizon is never
+    // parsed — and truncation independently warns, so the bounded view never
+    // renders as a clean one.
+    //
+    // Lifecycle-caused permanent pin (falsification finding 2 + re-arm D-2):
+    // a broadcast that SURVIVED subtraction under the per-seat floor while
+    // every resolved seat is suspended/retired can never be cleared by any
+    // action the seat can take. Flagged on PARSED truth (`to: broadcast`) AND
+    // the filename token (which is what selects the per-seat floor — a legacy
+    // tokenless `to: broadcast` stays on the any-seat union rule and remains
+    // clearable, so it earns no notice). Zero-resolution polls keep the
+    // pre-#2511 behavior.
+    if (
+      toLower === 'broadcast' &&
+      isBroadcastNamed(file) &&
+      activeSeatCount === 0 &&
+      selfAgents.length > 0
+    ) {
+      allSuspendedBroadcastHeld = true;
+    }
+    // These annotations ride `notices`, never `warnings`: they are
+    // informational senses on a HEALTHY scan, and every `warnings.length`
+    // consumer treats non-empty as scan-untrustworthy (channel-discipline
+    // comment above the lifecycle read). Uniform across both poll paths —
+    // nothing gates on notices, so the discovery path needs no special case.
+    if (toLower !== 'broadcast' && !lifecycleAnnotatedSeats.has(toLower)) {
+      const seatState = seatLifecycleStates.get(toLower);
+      if (seatState === 'suspended') {
+        lifecycleAnnotatedSeats.add(toLower);
+        notices.push(
+          `directed mail surfacing for suspended seat: to: "${header.to}" — obligation held, not discharged — disposition per mmnto-ai/totem-status#127`,
+        );
+      } else if (seatState === 'retired') {
+        lifecycleAnnotatedSeats.add(toLower);
+        notices.push(
+          `addressed to retired seat: to: "${header.to}" — mail still surfaces; the sender should re-route`,
+        );
+      }
+    }
+    let seats = collisionsByBasename.get(file);
+    if (seats === undefined) {
+      seats = new Map();
+      collisionsByBasename.set(file, seats);
+    }
+    if (!seats.has(senderSeat)) seats.set(senderSeat, `${slot.repo}/${slot.agent}`);
+    mail.push({
+      file,
+      repo: slot.repo,
+      from: header.from ?? slot.agent,
+      to: header.to,
+      date: header.date,
+      subject: header.subject ?? '(no subject)',
+      filePath: path.join(slot.outbox, file),
+    });
+  }
+
+  if (allSuspendedBroadcastHeld) {
+    // Never advertise a recovery the CLI refuses (re-arm D-1): `--reactivate`
+    // exists only for suspended seats; an all-retired roster routes to a
+    // fresh operator ruling — resurrection is structurally refused.
+    const anySuspended = [...seatLifecycleStates.values()].some((s) => s === 'suspended');
+    notices.push(
+      anySuspended
+        ? 'every resolved self seat is suspended/retired — broadcast dispatches cannot be cleared (the required-set floor holds them unread); recovery: totem seat add <seat-id> --reactivate'
+        : 'every resolved self seat is retired — broadcast dispatches cannot be cleared (the required-set floor holds them unread); a retirement is never resurrected: register a replacement seat (totem seat add <new-seat-id>) or route to the operator',
+    );
+  }
+
+  // Warn once per colliding basename, naming every seat path. Sensor, not
+  // actuator (Tenet 13): both dispatches still surface as mail above. Riding
+  // the `warnings` channel is load-bearing — `ecl-gc --compact` arms its A2.2
+  // completeness gate on `warnings.length === 0` (mmnto-ai/totem#2309), so a
+  // live collision blocks mark-compaction during exactly the coexistence
+  // window in which one mark could strand the other dispatch, with zero new
+  // gate plumbing. (Its `includeProcessed` discovery poll sees through marks,
+  // so a half-marked collision still reds the gate.) Detection is bounded by
+  // the scan window: a colliding file beyond the maxScan horizon is never
+  // parsed, so this sensor is reliable only within the scanned set — not an
+  // absolute guarantee. Truncation itself warns above and independently reds
+  // the compaction gate, so the bounded view never silently green-lights a
+  // compact.
+  for (const [name, seats] of collisionsByBasename) {
+    if (seats.size < 2) continue;
+    const paths = [...seats.values()];
+    warnings.push(
+      `cross-sender basename collision: ${name} from ${paths.join(' and ')} — a single processed/ mark would shadow ${seats.size === 2 ? 'both' : `all ${seats.size}`}`,
+    );
+  }
+
+  // Re-sort the surviving mail by frontmatter date when available (filename
+  // sort already handled the primary order; this refines for files whose
+  // `date:` differs from the filename prefix).
+  mail.sort((a, b) => (b.date ?? b.file).localeCompare(a.date ?? a.file));
+
+  return {
+    selfAgents: { agents: [...selfResolution.agents], source: selfResolution.source },
+    mail,
+    scanned,
+    truncated,
+    workspace,
+    warnings,
+    notices,
+  };
+}
+
+// ─── Output formatting ──────────────────────────────────
+
+/**
+ * Exit-code contract for `totem mail` (mmnto-ai/totem#2312). Pure so the class
+ * is unit-testable independent of the CLI wrapper, mirroring
+ * `resolveEclGcExitCode`. An UNRESOLVED self (`source: 'none'`, agents `[]`) is
+ * a NOT-DERIVED verdict, never a clean inbox: every directed dispatch is
+ * filtered out so "no unread" asserts nothing (the false-clean class). The
+ * plain poll must not be softer than its `totem ecl-gc` sibling, whose
+ * unresolvable-self is exit 2 — so this arm is exit 2 too. A resolved self
+ * (genuine clean inbox OR a real unread list) is exit 0.
+ */
+export function resolveMailExitCode(result: MailPollResult): 0 | 2 {
+  return result.selfAgents.source === 'none' ? 2 : 0;
+}
+
+export function formatTextResult(result: MailPollResult): string {
+  const lines: string[] = [];
+  const selfList =
+    result.selfAgents.agents.length > 0 ? result.selfAgents.agents.join(', ') : '(none)';
+  lines.push(`Workspace: ${result.workspace}`);
+  lines.push(`Self agents: ${selfList} (source: ${result.selfAgents.source})`);
+  if (result.warnings.length > 0) {
+    for (const w of result.warnings) lines.push(`Warning: ${w}`);
+  }
+  // Notices are informational senses (lifecycle annotations) — rendered for
+  // the human, invisible to every `warnings.length` gate and to the verdict
+  // qualifiers below (a notice never makes a complete scan read INCOMPLETE).
+  if (result.notices.length > 0) {
+    for (const n of result.notices) lines.push(`Note: ${n}`);
+  }
+  if (result.selfAgents.source === 'none') {
+    // Unresolved self ⇒ refuse to render ANY inbox verdict (Tenet 4 fail-loud,
+    // mmnto-ai/totem#2312). A clean/unread line here is a FALSE-CLEAN: with an
+    // empty self-set every directed dispatch is filtered out, so an empty inbox
+    // asserts nothing. Broadcast matches survive the filter but still cannot
+    // certify directed-mail absence — they are COUNTED in the hint (so waiting
+    // mail is not invisible) and inspectable via `--json`; the verdict itself
+    // stays withheld.
+    const broadcastHint =
+      result.mail.length > 0
+        ? ` ${result.mail.length} broadcast dispatch(es) present — inspect via --json.`
+        : '';
+    lines.push(
+      `Inbox state NOT DERIVED — no self agent resolved; cannot assert an empty inbox.${broadcastHint} Set TOTEM_SELF_AGENT or declare host_agents in .totem/orchestration/config.json.`,
+    );
+  } else if (result.mail.length === 0) {
+    // A degraded scan must not close with the verdict a clean scan produces
+    // (mmnto-ai/totem#2516): the `Warning:` lines above are scrollback, the
+    // verdict is what gets read. The empty-inbox arm LEADS with the qualifier
+    // — the class defect is a reassuring lead with the fine print after — and
+    // `INCOMPLETE` is the single greppable discriminator, present iff the
+    // warnings channel is non-empty. Clean paths stay byte-identical.
+    lines.push(
+      result.warnings.length > 0
+        ? `Scan INCOMPLETE (${result.warnings.length} warning(s) above) — no unread mail found in the scanned locations; unread mail may exist in the unscanned ones.`
+        : `No unread mail addressed to ${selfList} or broadcast.`,
+    );
+  } else {
+    // Non-empty degraded arm: the count leads (it is derived and true), but it
+    // is qualified in the same breath — a bare `N unread:` over an incomplete
+    // scan asserts a completeness the poll cannot back.
+    lines.push(
+      result.warnings.length > 0
+        ? `${result.mail.length} unread — scan INCOMPLETE (${result.warnings.length} warning(s) above); more may exist in unscanned locations.`
+        : `${result.mail.length} unread:`,
+    );
+    for (const m of result.mail) {
+      lines.push(`  - ${m.file} (from ${m.from} @ ${m.repo}, to: ${m.to})`);
+      lines.push(`      subject: ${m.subject}`);
+    }
+  }
+  if (result.truncated) {
+    lines.push(`[scan truncated at ${result.scanned} files; raise concern if this persists]`);
+  }
+  return lines.join('\n');
+}
+
+// ─── CLI entry ──────────────────────────────────────────
+
+export async function mailCommand(
+  opts: MailCommandOptions = {},
+): Promise<{ result: MailPollResult; exitCode: 0 | 2 }> {
+  const result = pollMail(opts);
+  // The wrapper decides the exit (AGENTS.md: lib returns data, wrapper maps to a
+  // code — `pollMail` never throws). The `mail` action sets `process.exitCode`
+  // from this (mmnto-ai/totem#2312).
+  const exitCode = resolveMailExitCode(result);
+
+  if (opts.json === true) {
+    // JSON output goes to stdout (hook-friendly); structured logger goes to stderr
+    // via the standard CLI path. Using process.stdout keeps the JSON stream clean.
+    // Emit the FULL result even on the exit-2 unresolved arm — it already exposes
+    // `source: 'none'` + warnings, so a --json consumer parses one object AND
+    // reads the exit code (mmnto-ai/totem#2312).
+    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+    return { result, exitCode };
+  }
+
+  const { log } = await import('../ui.js');
+  const text = formatTextResult(result);
+  // log.info is stderr-bound across the CLI; mail output is informational,
+  // not a primary data product, so it joins the stderr stream consumers
+  // already attach to.
+  for (const line of text.split('\n')) {
+    log.info(TAG, line);
+  }
+
+  return { result, exitCode };
+}
+
+// ─── Outbound: send / reply (mmnto-ai/totem#2042) ───────
+//
+// The actuator half of the ADR-106 coordination triad (sensor = `pollMail`
+// above). Before this, `totem mail send` silently fell through to the read
+// command and every dispatch was hand-authored against five undocumented
+// conventions — a discipline the protocol structurally could not satisfy
+// (Tenet 13: sensor without actuator). Three composing validity layers,
+// none violating ADR-106 inv6 (fail-open transport):
+//
+//   structural  — v0.4 compliance by CONSTRUCTION (the `DispatchHeader` type
+//                 makes a malformed-shape dispatch unrepresentable);
+//   content     — predicates that can't be guaranteed at construction
+//                 (recipient known? refs non-empty?) → LOUD warn + write
+//                 anyway (a blocked dispatch is worse than a malformed one,
+//                 the mmnto-ai/totem#2119 exhibit);
+//   reader      — `pollMail`'s scan-errors-always-warn is the never-silent
+//                 -drop backstop.
+//
+// (OQ-1 ruled 1b by satur8d 2026-06-09; emit-shape + reader `timestamp:` read
+// concurred by strategy-claude, ADR-098 owner, same day.)
+
+/** ADR-098 v0.4 canonical schema literal emitted by the actuator. */
+const ADR098_SCHEMA = 'adr-098-v0.4';
+
+/**
+ * Structurally-complete dispatch header. ADR-098 v0.4 compliance is enforced
+ * *by construction*: you cannot build this object without `schema` / `from` /
+ * `to` / `timestamp` / `subject` / `expectedAction`, so a structurally invalid
+ * dispatch is unrepresentable rather than rejected after the fact — the
+ * strongest form of "enforce via substrate" (inv2 realized). The content
+ * predicates that CANNOT be guaranteed at construction time (is the recipient
+ * a known agent? do refs resolve?) are the validator's job, and warn rather
+ * than block (inv6).
+ */
+export interface DispatchHeader {
+  schema: string;
+  from: string;
+  to: string;
+  /** Full RFC3339 UTC, e.g. `2026-06-09T17:34:37.127Z` (ADR-098 v0.4). */
+  timestamp: string;
+  subject: string;
+  /** ADR-098 v0.4 mandatory; the `none` literal for informational dispatches. */
+  expectedAction: string;
+  inReplyTo?: string;
+  priority?: string;
+  related?: string[];
+}
+
+export interface MailSendOptions {
+  /** Recipient agent-id (or `broadcast`). */
+  to: string;
+  /** Subject line (the cohort convention carries the gist here). */
+  subject: string;
+  /** Sender agent-id; default resolves from self, erroring if ambiguous. */
+  from?: string;
+  /** Read the dispatch body from this file (hard error if unreadable). */
+  bodyFile?: string;
+  /** Direct body text (test/stdin seam); `bodyFile` overrides when both set. */
+  body?: string;
+  /** `in-reply-to:` frontmatter — the source dispatch path. */
+  inReplyTo?: string;
+  /** `priority:` frontmatter. */
+  priority?: string;
+  /** `related-issues:` frontmatter list. */
+  related?: string[];
+  /** `expected-action:` frontmatter; defaults to the `none` literal. */
+  expectedAction?: string;
+  /** Filename slug override; default derived from the subject. */
+  slug?: string;
+  /**
+   * Workspace for dir-derived known-recipient validation (default:
+   * `TOTEM_WORKSPACE` env, else parent of repoRoot — the same resolution as
+   * `pollMail`). Advisory only (inv6): widens the known set so a
+   * dir-registered seat is not warned as unknown (mmnto-ai/totem#2141).
+   */
+  workspace?: string;
+  /** Repo root (default: cwd). Test injection point. */
+  repoRoot?: string;
+  /** Env override (default: process.env). Test injection point. */
+  env?: Record<string, string | undefined>;
+  /** Clock injection for deterministic timestamps/filenames in tests. */
+  now?: () => Date;
+  /** Known-recipient set override (default: `knownCohortAgents()`). */
+  knownAgents?: readonly string[];
+}
+
+export interface MailSendResult {
+  /** Absolute path of the written dispatch. */
+  filePath: string;
+  /** Basename of the written dispatch. */
+  fileName: string;
+  /** The composed (structurally-valid-by-construction) header. */
+  header: DispatchHeader;
+  /** Content-class warnings surfaced at emit-time; dispatch still written. */
+  warnings: string[];
+  /**
+   * Present only on a `mailReply` that atomically marked the source dispatch
+   * consumed (ADR-106 § A1.4; mmnto-ai/totem#2396). Absent on `mailSend` and on
+   * a `--no-mark` (stage-only) reply.
+   */
+  mark?: MailMarkResult;
+}
+
+/**
+ * Double-quote a frontmatter scalar (JSON form is a valid YAML double-quoted
+ * scalar) only when the raw value would otherwise mis-parse: edge whitespace,
+ * a newline/quote, a leading flow/indicator char, or a `: ` / ` #` sequence
+ * (YAML's map-value + comment triggers). Now that the actuator is the
+ * v0.4-compliant emitter, the output must be real YAML — the derivation engine
+ * will parse it, unlike the regex reader. Refs like `owner/repo#123` (no space
+ * before `#`) stay unquoted, matching the de-facto wire.
+ */
+function yamlScalar(value: string): string {
+  const needsQuote =
+    value === '' ||
+    value !== value.trim() ||
+    /[\n"]/.test(value) ||
+    /^[[\]{}>|*&!%@`'"#-]/.test(value) ||
+    /:\s/.test(value) ||
+    /\s#/.test(value) ||
+    // YAML 1.1 plain-scalar coercion traps: a bare boolean/null/numeric-shaped
+    // value would parse as a non-string once the derivation engine YAML-parses
+    // the wire (GCA R3 on mmnto-ai/totem#2134; incl. YAML 1.1's bare y/n and
+    // exponential/trailing-dot floats). Quote to pin the string type.
+    /^(?:y|n|yes|no|true|false|on|off|null|~)$/i.test(value) ||
+    /^[+-]?(?:\d+\.?|\d*\.\d+)(?:[eE][+-]?\d+)?$/.test(value);
+  return needsQuote ? JSON.stringify(value) : value;
+}
+
+/**
+ * Serialize a dispatch header + body to ADR-098 v0.4 markdown. Pure +
+ * deterministic — the round-trip anchor: its output MUST parse back through
+ * `parseHeader` (the sensor↔actuator "one enumeration, two readers" pairing).
+ * Frontmatter keys are kebab-case wire form, the surface the reader greps.
+ */
+export function composeDispatch(header: DispatchHeader, body: string): string {
+  const lines: string[] = ['---'];
+  lines.push(`schema: ${header.schema}`);
+  // `from`/`to` are traversal-validated agent-ids, but YAML-quote them anyway
+  // (defense in depth) so a non-standard recipient can't inject frontmatter
+  // once the v0.4 derivation engine YAML-parses this (CodeRabbit, mmnto-ai/totem#2134).
+  lines.push(`from: ${yamlScalar(header.from)}`);
+  lines.push(`to: ${yamlScalar(header.to)}`);
+  lines.push(`timestamp: ${header.timestamp}`);
+  lines.push(`subject: ${yamlScalar(header.subject)}`);
+  lines.push(`expected-action: ${yamlScalar(header.expectedAction)}`);
+  if (header.inReplyTo !== undefined) lines.push(`in-reply-to: ${yamlScalar(header.inReplyTo)}`);
+  if (header.priority !== undefined) lines.push(`priority: ${yamlScalar(header.priority)}`);
+  if (header.related !== undefined && header.related.length > 0) {
+    lines.push('related-issues:');
+    for (const ref of header.related) lines.push(`  - ${yamlScalar(ref)}`);
+  }
+  lines.push('---');
+  lines.push('');
+  // Exactly one trailing newline on the body for stable round-trips.
+  lines.push(body.replace(/\s+$/, ''));
+  lines.push('');
+  return lines.join('\n');
+}
+
+/**
+ * Content-class validation (inv1: exact predicates only — set membership and
+ * non-emptiness, never judgment). NEVER throws, NEVER blocks: returns warnings
+ * the caller surfaces at emit-time and writes anyway (inv6). The headline check
+ * is the unknown-recipient typo class (strategy-claude 2026-06-09): a typo'd
+ * recipient writes under a wrong name and is undelivered-but-not-errored unless
+ * the sender is told loudly.
+ */
+export function validateDispatchContent(
+  header: { to: string; related?: string[] },
+  knownAgents: readonly string[],
+): string[] {
+  const warnings: string[] = [];
+  const to = header.to.trim();
+  const known = new Set(knownAgents.map((a) => a.toLowerCase()));
+  if (to.toLowerCase() !== 'broadcast' && !known.has(to.toLowerCase())) {
+    warnings.push(
+      `recipient "${to}" is not a known cohort agent — the dispatch WILL be written but may be undeliverable (check for a typo). Known: ${[...knownAgents].sort().join(', ')}, broadcast.`,
+    );
+  }
+  if (header.related !== undefined) {
+    for (const ref of header.related) {
+      if (ref.trim().length === 0) {
+        warnings.push('a related-issues entry is empty/whitespace (kept verbatim).');
+      }
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Resolve the single sender identity for an outbound dispatch. Unlike the
+ * reader (which resolves a SET of self-agents to filter by), send must pick
+ * ONE. Precedence: explicit `--from` > unambiguous `resolveSelfAgents` > error.
+ * A >1 ambiguous map (e.g. totem hosts both totem-claude + totem-gemini) is a
+ * hard usage error — never silently pick one (it would mis-attribute the
+ * dispatch). Zero is a hard error too — never write to `.../undefined/outbox`.
+ */
+export function resolveSelfSender(
+  repoRoot: string,
+  env: Record<string, string | undefined>,
+  explicitFrom?: string,
+): string {
+  if (explicitFrom !== undefined && explicitFrom.trim().length > 0) {
+    return explicitFrom.trim();
+  }
+  const resolved = resolveSelfAgents(repoRoot, env);
+  if (resolved.agents.length === 1) return resolved.agents[0]!;
+  if (resolved.agents.length === 0) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      'cannot resolve a sender identity for the outbound dispatch',
+      'set TOTEM_SELF_AGENT or pass --from <agent-id>.',
+    );
+  }
+  throw new TotemError(
+    'MAIL_SEND_FAILED',
+    `ambiguous sender — this repo hosts ${resolved.agents.join(', ')}`,
+    'pass --from <agent-id> to disambiguate.',
+  );
+}
+
+function assertSafeAgentId(id: string, label: string): void {
+  // Reuse core's single path-segment guard (`isPathSafeAgentId`) rather than
+  // re-deriving the pattern — both the sender's `--from` (an outbox directory
+  // segment) and the recipient's `--to` (interpolated into the filename) must
+  // be blocked from `/`, `\`, `..`, a null byte (Greptile P2 / GCA + CR
+  // path-traversal critical, mmnto-ai/totem#2134), and from control/
+  // whitespace/win32-reserved characters that would propagate into the
+  // dispatch markdown and CLI logs (CR R2, same PR).
+  if (!isPathSafeAgentId(id)) {
+    // JSON-escape the echoed id: this rejection path exists precisely because
+    // the value may carry control bytes — echoing it raw to stderr would
+    // re-create the terminal injection it blocks (CR R3 on mmnto-ai/totem#2134).
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `invalid --${label} ${JSON.stringify(id)} (path-traversal, unsafe characters, or empty)`,
+      'pass a plain agent-id such as "totem-claude" (no path separators, "..", whitespace, or control characters).',
+    );
+  }
+}
+
+/**
+ * Reduce a recipient/agent token to a filename-safe form: a defense-in-depth
+ * layer on top of `assertSafeAgentId` (which already rejects traversal). Even a
+ * validated-but-odd `to` (e.g. a stray `:`/space — illegal in win32 filenames)
+ * cannot corrupt the outbox filename. Valid kebab agent-ids pass through
+ * unchanged; `broadcast` is preserved.
+ */
+function fileToken(value: string): string {
+  const cleaned = value.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '');
+  return cleaned.length > 0 ? cleaned : 'recipient';
+}
+
+/**
+ * Filename-safe minute-granularity UTC stamp: `YYYY-MM-DDTHHMMZ`. Colons are
+ * illegal in win32 filenames (strategy-claude 2026-06-09, non-negotiable) and
+ * this matches every existing outbox name; the frontmatter carries the full
+ * RFC3339 `timestamp:` separately.
+ */
+function compactStamp(d: Date): string {
+  const iso = d.toISOString();
+  // `17:34` → `1734` (drop the colon, illegal in win32 filenames).
+  const hhmm = iso.slice(11, 16).replace(':', '');
+  return `${iso.slice(0, 10)}T${hhmm}Z`;
+}
+
+/** Short, kebab filename slug (concise-dispatch-filename discipline: ~3-6 words). */
+function slugify(subject: string, explicit?: string): string {
+  const source = explicit !== undefined && explicit.trim().length > 0 ? explicit : subject;
+  const slug = source
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .split('-')
+    .filter((s) => s.length > 0)
+    .slice(0, 6)
+    .join('-')
+    .slice(0, 48);
+  return slug.length > 0 ? slug : 'dispatch';
+}
+
+/**
+ * First non-colliding outbox path for `<base>.md`, suffixing `-2`, `-3`, … on
+ * collision (two dispatches to the same recipient in the same minute with the
+ * same slug). Deterministic — no randomness.
+ */
+function uniqueOutboxPath(outboxDir: string, base: string): string {
+  let candidate = path.join(outboxDir, `${base}.md`);
+  let n = 2;
+  while (fs.existsSync(candidate)) {
+    candidate = path.join(outboxDir, `${base}-${n}.md`);
+    n += 1;
+  }
+  return candidate;
+}
+
+/**
+ * Compose + validate + write an outbound dispatch to the sender's own outbox.
+ * Structural validity is by construction; content warnings are returned (the
+ * CLI wrapper surfaces them loudly) and never block the write. The only HARD
+ * failures are usage errors (missing to/subject, unresolvable/ambiguous self,
+ * unreadable body-file) and actuation failure (a write that didn't land —
+ * fail-loud, Tenet 4, the opposite of the inv6 content case).
+ */
+export function mailSend(opts: MailSendOptions): MailSendResult {
+  const env = opts.env ?? process.env;
+  const repoRoot = path.resolve(opts.repoRoot ?? process.cwd());
+  const now = (opts.now ?? (() => new Date()))();
+
+  const to = opts.to.trim();
+  if (to.length === 0)
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      '--to <recipient> is required',
+      'pass --to <recipient-agent-id> (or "broadcast").',
+    );
+  // `to` is interpolated into the outbox filename + the frontmatter — block
+  // path-traversal here, same guard as `from` (GCA/Greptile/CR critical, mmnto-ai/totem#2134).
+  assertSafeAgentId(to, 'to');
+  const subject = opts.subject.trim();
+  if (subject.length === 0)
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      '--subject <text> is required',
+      'pass --subject "<text>".',
+    );
+
+  const from = resolveSelfSender(repoRoot, env, opts.from);
+  assertSafeAgentId(from, 'from');
+
+  // Body precedence: bodyFile > body > empty. A declared --body-file that can't
+  // be read is a hard usage error — the intended body is lost, never silently
+  // ship an empty dispatch in its place.
+  let body = opts.body ?? '';
+  if (opts.bodyFile !== undefined) {
+    try {
+      body = fs.readFileSync(opts.bodyFile, 'utf-8');
+      // totem-context: a declared --body-file that can't be read is a hard usage error (the user named a body source that doesn't resolve); rethrow as a clear message rather than degrade to an empty dispatch.
+    } catch (err) {
+      throw new TotemError(
+        'MAIL_SEND_FAILED',
+        `--body-file unreadable (${opts.bodyFile}): ${String(err)}`,
+        'check the --body-file path exists and is readable.',
+        err,
+      );
+    }
+  }
+
+  const header: DispatchHeader = {
+    schema: ADR098_SCHEMA,
+    from,
+    to,
+    timestamp: now.toISOString(),
+    subject,
+    expectedAction: opts.expectedAction?.trim() || 'none',
+    ...(opts.inReplyTo !== undefined ? { inReplyTo: opts.inReplyTo } : {}),
+    ...(opts.priority !== undefined ? { priority: opts.priority } : {}),
+    ...(opts.related !== undefined && opts.related.length > 0 ? { related: opts.related } : {}),
+  };
+
+  // Workspace-aware known set: a seat registered by its orchestration dir in
+  // ANY workspace repo is a known recipient (mmnto-ai/totem#2141) — same
+  // workspace resolution as `pollMail`, validation stays advisory (inv6).
+  const workspace = path.resolve(
+    opts.workspace ?? env['TOTEM_WORKSPACE'] ?? path.dirname(repoRoot),
+  );
+  const warnings = validateDispatchContent(
+    header,
+    opts.knownAgents ?? knownCohortAgents(workspace),
+  );
+
+  const outboxDir = path.join(repoRoot, '.totem', 'orchestration', from, 'outbox');
+  try {
+    fs.mkdirSync(outboxDir, { recursive: true });
+    // totem-context: a failed outbox mkdir (EACCES, read-only FS, a file where
+    // the dir should be) means the dispatch cannot land — fail LOUD (Tenet 4)
+    // with the path, never proceed to a write that will also fail (GCA mmnto-ai/totem#2134).
+  } catch (err) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `could not create outbox directory (${outboxDir}): ${String(err)}`,
+      'check write permissions on the repo .totem/orchestration tree.',
+      err,
+    );
+  }
+
+  const base = `${compactStamp(now)}-${fileToken(to)}-${slugify(subject, opts.slug)}`;
+  const filePath = uniqueOutboxPath(outboxDir, base);
+  const content = composeDispatch(header, body);
+
+  // Atomic write (ADR-106: temp + rename; readers never see a torn write).
+  const tmp = `${filePath}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf-8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    // Actuation failure is fail-LOUD (Tenet 4): a write that did not land is a
+    // silent drop — the inverse of the inv6 content-warn case. Best-effort
+    // remove any partial temp first (force suppresses ENOENT; maxRetries/
+    // retryDelay guard a transient win32 lock), then surface the original
+    // error with the path so the sender knows nothing shipped.
+    const hint = 'check outbox directory permissions and available disk space.';
+    try {
+      fs.rmSync(tmp, { force: true, maxRetries: 3, retryDelay: 50 });
+    } catch (cleanupErr) {
+      // A failed cleanup must not shadow the actuation error (GCA R2 on
+      // mmnto-ai/totem#2134): rethrow the ORIGINAL failure as the cause, with
+      // the stranded-temp note folded into the message so both stay visible.
+      throw new TotemError(
+        'MAIL_SEND_FAILED',
+        `write failed (${filePath}): ${String(err)} (temp file ${tmp} could not be removed: ${String(cleanupErr)})`,
+        hint,
+        err,
+      );
+    }
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `write failed (${filePath}): ${String(err)}`,
+      hint,
+      err,
+    );
+  }
+
+  return { filePath, fileName: path.basename(filePath), header, warnings };
+}
+
+/**
+ * `totem mail reply <source>` — syntactic sugar over `mailSend`. Reads the
+ * source dispatch (HARD error if missing/unparseable — reply structurally needs
+ * it to infer the recipient + subject), then sends with `to = source.from`
+ * (falling back to the source's outbox-dir agent, reader parity),
+ * `subject = "Re: <source.subject>"`, and `in-reply-to` set to the source's
+ * repo-relative wire form. Any field can still be overridden via opts.
+ */
+export function mailReply(
+  source: string,
+  opts: Omit<MailSendOptions, 'to' | 'subject' | 'inReplyTo'> & {
+    to?: string;
+    subject?: string;
+    /**
+     * Skip the atomic consume-mark (ADR-106 § A1.4; mmnto-ai/totem#2396).
+     * Default (undefined/false) copies the source into the replying seat's own
+     * `processed/` cursor the moment the reply lands — reply IS consumption, so
+     * the mark is a side-effect of the read tool (A1.3 "never a separate
+     * ritual"), never the dropped-copy step that re-surfaces as phantom-unread.
+     * `--no-mark` opts out for stage-only reply workflows.
+     */
+    noMark?: boolean;
+  } = {},
+): MailSendResult {
+  let content: string;
+  try {
+    content = fs.readFileSync(source, 'utf-8');
+    // totem-context: reply cannot proceed without the source (it infers to/subject from it) — a missing/unreadable source is a hard usage error, rethrown clearly, not a degraded send.
+  } catch (err) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `cannot read reply source dispatch (${source}): ${String(err)}`,
+      'check the reply <source> path exists and is readable.',
+      err,
+    );
+  }
+  const parsed = parseHeader(content);
+  if (!parsed.ok) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `reply source is not parseable mail (${source}): ${parsed.reason}`,
+      'the source must be an ADR-098 dispatch with a frontmatter block; use `mail send --to` for a fresh dispatch.',
+    );
+  }
+  // Reader-parity fallback (CR R3 on mmnto-ai/totem#2134): `pollMail` accepts
+  // a dispatch without `from:` by falling back to the outbox directory name,
+  // so a reply to such mail must not hard-fail where the reader succeeded —
+  // derive the sender from the `<agent>/outbox/<file>` layout.
+  const replyTo = opts.to ?? parsed.header.from ?? senderFromSourcePath(source) ?? '';
+  if (replyTo.trim().length === 0) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `reply source has no "from:" to reply to (${source})`,
+      'use `totem mail send --to <agent>` instead.',
+    );
+  }
+  const subject = opts.subject ?? `Re: ${parsed.header.subject ?? '(no subject)'}`;
+  // Keep the CLI-specific `noMark` flag OUT of the core actuator's options
+  // (GCA @1392): destructure it off before the spread so it can never be read
+  // as a `MailSendOptions` field.
+  const { noMark, ...sendOpts } = opts;
+  const result = mailSend({
+    ...sendOpts,
+    to: replyTo,
+    subject,
+    inReplyTo: portableSourceRef(source),
+  });
+  // Consume-marking (ADR-106 § A1.4; mmnto-ai/totem#2396): in the SAME command,
+  // AFTER the reply lands, mark the source processed — bound to the replying seat
+  // (`result.header.from` — the resolved sender IS the source's recipient, the
+  // consuming seat). Sequential fail-loud, not filesystem-atomic across two files:
+  // the reply is the primary actuation and lands first, so a mark that cannot
+  // land never suppresses a reply that did; `--no-mark` is the explicit
+  // stage-only opt-out.
+  if (noMark === true) return result;
+  let mark: MailMarkResult;
+  try {
+    mark = markSource(source, {
+      agentId: result.header.from,
+      repoRoot: opts.repoRoot,
+      env: opts.env,
+    });
+    // totem-context: the reply WAS written above (mailSend succeeded); only the consume-mark failed. Re-throw a DISTINGUISHABLE error naming the landed reply so the operator never re-runs `mail reply` (which would send a duplicate) — the recovery is the standalone `mail mark`, not a retry (greptile P1, the headline of the #2431 bot round).
+  } catch (err) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `reply written to ${result.filePath}, but marking the source consumed failed (${source}): ${err instanceof Error ? err.message : String(err)}`,
+      `do NOT retry mail reply — the reply landed; run \`totem mail mark ${source}\` to complete the mark.`,
+      err,
+    );
+  }
+  return { ...result, mark };
+}
+
+/**
+ * Derive the sender agent-id from a dispatch path's `<agent>/outbox/<file>`
+ * layout — the same fallback `pollMail` applies when frontmatter omits
+ * `from:` (reader↔reply parity, CR R3 on mmnto-ai/totem#2134).
+ */
+function senderFromSourcePath(source: string): string | null {
+  const segments = path.resolve(source).split(/[/\\]/);
+  const outboxIdx = segments.lastIndexOf('outbox');
+  return outboxIdx > 0 ? (segments[outboxIdx - 1] ?? null) : null;
+}
+
+/**
+ * Reduce a reply-source path to the portable repo-relative wire form
+ * (`.totem/orchestration/<agent>/outbox/<file>` — the de-facto cohort shape
+ * for `in-reply-to:`) so an absolute local path never leaks machine-specific
+ * structure (drive letters, usernames) into shared frontmatter (GCA R3 on
+ * mmnto-ai/totem#2134). Falls back to the basename when the source lives
+ * outside a recognizable orchestration tree.
+ */
+function portableSourceRef(source: string): string {
+  const normalized = source.replace(/\\/g, '/');
+  const idx = normalized.lastIndexOf('.totem/orchestration/');
+  return idx >= 0 ? normalized.slice(idx) : path.basename(source);
+}
+
+// ─── Consume-marking: mail mark (mmnto-ai/totem#2396) ───
+//
+// ADR-106 § A1.3/A1.4: `processed/` is recipient-owned — the consuming seat
+// marks handled inbound in its OWN `processed/` subtree, AT CONSUMPTION TIME,
+// as a side-effect of the read/reply tool ("never a separate ritual"). Before
+// this, the copy-into-`processed/` step lived on no surface on any agent's path,
+// so it was dropped and the dispatch re-surfaced as phantom-unread on every
+// subsequent poll. A mark is a same-basename COPY of the source dispatch under
+// the seat's `processed/` (directed) or `processed/_broadcast/` (broadcast) —
+// the exact stores the reader (`buildProcessedMarkCounts`) drains and `ecl-gc`
+// compacts. Single-writer (§ A2.3): a seat marks only into ITS OWN subtree.
+
+export interface MailMarkOptions {
+  /**
+   * Seat whose `processed/` cursor receives the mark. Precedence mirrors the
+   * `ecl-gc` single-seat self-resolver (`resolveSelfSender`): explicit
+   * `--agent-id` > unambiguous resolved self > error. Ambiguous/zero self is a
+   * hard usage error — a seat may only mark into its OWN subtree (§ A2.3
+   * single-writer), so the command never guesses which seat consumed a dispatch.
+   */
+  agentId?: string;
+  /** Walk-start for the repo-root resolver (default: cwd — same contract as
+   * `pollMail`/`eclCompact`). Test injection point. */
+  repoRoot?: string;
+  /** Env override (default: process.env). Test injection point. */
+  env?: Record<string, string | undefined>;
+}
+
+export interface MailMarkResult {
+  /** Absolute path of the mark (written, or the pre-existing one on a no-op). */
+  markPath: string;
+  /** Basename of the mark — matches the source dispatch (the reader's dedupe key). */
+  fileName: string;
+  /** The seat whose `processed/` cursor now holds the mark. */
+  agent: string;
+  /** True iff the mark landed under `processed/_broadcast/` (source is a broadcast). */
+  broadcast: boolean;
+  /** True iff a same-basename mark already existed — the operation was an idempotent no-op. */
+  alreadyMarked: boolean;
+}
+
+/**
+ * `totem mail mark <source>` — copy a consumed dispatch into the consuming
+ * seat's own `processed/` cursor WITHOUT replying (read-and-acted-elsewhere).
+ * The binary-guaranteed path for the marking obligation ADR-106 § A1.3 puts on
+ * the recipient. Shared by the standalone command and `mailReply`'s atomic mark.
+ *
+ * HARD-errors (fail-loud, Tenet 4 — a dropped mark is the phantom-unread class
+ * this closes) on: an unreadable/unparseable source, an unresolvable/ambiguous
+ * seat, an unsafe agent-id, or a write that did not land. Idempotent: a
+ * same-basename mark already present is a no-op (safe to run twice).
+ */
+export function markSource(source: string, opts: MailMarkOptions = {}): MailMarkResult {
+  const env = opts.env ?? process.env;
+  // Walk-start, not definitive root (CR @1480): use the SAME resolver as
+  // `pollMail` (mail.ts) and `eclCompact` (ecl-gc.ts) so a subdirectory
+  // invocation lands the mark in the REAL repo root's `processed/` store — where
+  // the poll reads it — instead of writing a phantom `<subdir>/.totem` mark that
+  // no poll would ever find. A marker-less start (bare test fixture) is used
+  // as-is by the resolver's own fallback.
+  const repoRoot = resolveTotemRepoRootSync(opts.repoRoot, process.cwd());
+
+  // Read + parse the source (HARD error if missing/unparseable — parity with
+  // `mailReply`): the `to:` field selects the broadcast-vs-directed store, and a
+  // stray non-dispatch must never be silently copied into `processed/`.
+  let content: string;
+  try {
+    content = fs.readFileSync(source, 'utf-8');
+    // totem-context: mark cannot proceed without the source (it copies it into processed/ and reads its to: to pick the store) — a missing/unreadable source is a hard usage error, rethrown clearly, never a silent no-op.
+  } catch (err) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `cannot read mark source dispatch (${source}): ${String(err)}`,
+      'check the mark <source> path exists and is readable.',
+      err,
+    );
+  }
+  const parsed = parseHeader(content);
+  if (!parsed.ok) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `mark source is not parseable mail (${source}): ${parsed.reason}`,
+      'the source must be an ADR-098 dispatch with a frontmatter block; a stray file is not markable.',
+    );
+  }
+
+  // Single-writer seat resolution (§ A2.3): resolve EXACTLY one seat, same
+  // precedence as `ecl-gc` compaction. Ambiguous/zero self is a usage error —
+  // never guess which seat consumed the dispatch.
+  let agent: string;
+  try {
+    agent = resolveSelfSender(repoRoot, env, opts.agentId);
+    // totem-context: an unresolvable/ambiguous consuming seat is a hard usage error — a mark must land in exactly one seat's own processed/ (single-writer); rethrow with the ecl-gc-parity hint (--agent-id, not send's --from).
+  } catch (err) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `cannot resolve the consuming seat whose processed/ cursor to mark: ${err instanceof Error ? err.message : String(err)}`,
+      'set TOTEM_SELF_AGENT or pass --agent-id <agent-id>.',
+      err,
+    );
+  }
+  assertSafeAgentId(agent, 'agent-id');
+
+  // Placement store: a broadcast dispatch's mark lives under
+  // `processed/_broadcast/` (per-seat consumable, mmnto-ai/totem#2412), a
+  // directed dispatch's under `processed/`. The reader drains BOTH into the
+  // seat's mark set, so subtraction is correct either way; the split keeps
+  // `ecl-gc`'s per-store compaction honest (it reads/deletes each store
+  // separately). `to:` is the authoritative broadcast signal (the reader's
+  // filename token is only a zero-I/O proxy it uses because it can't parse
+  // every file — here we already have the parsed header).
+  const broadcast = parsed.header.to.trim().toLowerCase() === 'broadcast';
+
+  // Directed-mark ownership (CR @1532): directed subtraction is ANY-seat, so a
+  // mark written into seat B's store for mail addressed to seat A would suppress
+  // A's dispatch in a multi-seat union poll. `to:` is SINGLE-VALUED in ADR-098
+  // (`parseHeader` captures one scalar `/^to:\s*(.+)$/`; `DispatchHeader.to` is a
+  // string — no comma-list form exists anywhere), so equality is the correct
+  // membership test: refuse to mark a directed dispatch whose recipient is not
+  // the resolving seat. `broadcast` is addressed to every seat, so it is exempt.
+  const directedTo = parsed.header.to.trim();
+  if (!broadcast && directedTo.toLowerCase() !== agent.toLowerCase()) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `refusing to mark directed dispatch (to: "${directedTo}") into a different seat's cursor — resolving seat is "${agent}" (${source})`,
+      `pass the recipient seat with --agent-id ${directedTo}, or run mail mark from that seat.`,
+    );
+  }
+
+  const processedBase = path.join(repoRoot, '.totem', 'orchestration', agent, 'processed');
+  const markDir = broadcast ? path.join(processedBase, '_broadcast') : processedBase;
+  // Store under the SANITIZED basename (mmnto-ai/totem#2431): a colon-bearing
+  // source name (a legacy inbound) written verbatim would be silently corrupted
+  // into a 0-byte NTFS ADS base file that `readdirSync` never lists — the mark
+  // would exist yet never subtract, and `mail mark` would still report success.
+  // The reader matches the inbound through the same sanitizer, so the sanitized
+  // mark still subtracts the colon-bearing dispatch.
+  const fileName = sanitizeEclBasename(path.basename(source));
+  const markPath = path.join(markDir, fileName);
+
+  // Idempotent (§ A2.3): a same-basename mark already present is a no-op — the
+  // binary-guaranteed path is safe to run twice, and re-copying could only
+  // clobber a mark the seat already owns.
+  if (fs.existsSync(markPath)) {
+    return { markPath, fileName, agent, broadcast, alreadyMarked: true };
+  }
+
+  try {
+    fs.mkdirSync(markDir, { recursive: true });
+    // totem-context: a failed processed/ mkdir (EACCES, read-only FS, a file where the dir should be) means the mark cannot land — fail LOUD (Tenet 4) with the path; a dropped mark is the phantom-unread class this command exists to close.
+  } catch (err) {
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `could not create processed/ directory (${markDir}): ${String(err)}`,
+      'check write permissions on the repo .totem/orchestration tree.',
+      err,
+    );
+  }
+
+  // Atomic write (ADR-106 § A1.2: temp + rename; a reader never sees a torn
+  // mark, and the `.tmp` suffix is invisible to the `.md`-only drain). The mark
+  // is a full COPY of the source so the recipient retains forensic evidence
+  // after the sender sweeps its outbox (§ A1.4 falsifying test (a)). The temp
+  // suffix is UNIQUE per invocation (`.<pid>.tmp`) so two concurrent same-seat
+  // marks cannot delete each other's shared temp and spuriously fail (CR @1568
+  // / greptile @1476, partial): single-writer § A2.3 remains the contract, this
+  // just keeps an out-of-contract double-launch benign.
+  const tmp = `${markPath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, content, 'utf-8');
+    fs.renameSync(tmp, markPath);
+  } catch (err) {
+    // Best-effort remove our own partial temp first.
+    const hint = 'check processed/ directory permissions and available disk space.';
+    try {
+      fs.rmSync(tmp, { force: true, maxRetries: 3, retryDelay: 50 });
+    } catch (cleanupErr) {
+      throw new TotemError(
+        'MAIL_SEND_FAILED',
+        `mark write failed (${markPath}): ${String(err)} (temp file ${tmp} could not be removed: ${String(cleanupErr)})`,
+        hint,
+        err,
+      );
+    }
+    // Race-benign (CR @1568 / greptile @1476): if the destination now exists, a
+    // concurrent same-seat writer won the rename — both carry identical bytes, so
+    // overwrite/no-op are equally benign. Report already-marked rather than a
+    // spurious failure. (The `alreadyMarked:false` double-report under an
+    // out-of-contract double-launch is an accepted cosmetic residual.)
+    if (fs.existsSync(markPath)) {
+      return { markPath, fileName, agent, broadcast, alreadyMarked: true };
+    }
+    // Otherwise actuation genuinely failed — fail LOUD (Tenet 4).
+    throw new TotemError(
+      'MAIL_SEND_FAILED',
+      `mark write failed (${markPath}): ${String(err)}`,
+      hint,
+      err,
+    );
+  }
+
+  return { markPath, fileName, agent, broadcast, alreadyMarked: false };
+}
+
+/**
+ * CLI wrapper for `mail send` / `mail reply`. Surfaces content warnings LOUDLY
+ * on stderr at emit-time (inv6: the dispatch still wrote — this is the typo
+ * backstop, not a block), then confirms the written path.
+ */
+export async function mailSendCommand(result: MailSendResult): Promise<MailSendResult> {
+  const { log } = await import('../ui.js');
+  for (const w of result.warnings) log.warn(TAG, w);
+  log.success(TAG, `Dispatch written: ${path.relative(process.cwd(), result.filePath)}`);
+  log.info(
+    TAG,
+    `  to: ${result.header.to} · from: ${result.header.from} · ${result.header.timestamp}`,
+  );
+  // Consume-atomicity confirmation (mmnto-ai/totem#2396): a reply marked the
+  // source processed in the same command. Present only on `mailReply` (absent
+  // on plain `mailSend` and `--no-mark`).
+  if (result.mark !== undefined) {
+    const rel = path.relative(process.cwd(), result.mark.markPath);
+    log.info(
+      TAG,
+      result.mark.alreadyMarked
+        ? `  source already marked processed (${result.mark.agent}): ${rel}`
+        : `  source marked processed (${result.mark.agent}): ${rel}`,
+    );
+  }
+  return result;
+}
+
+/**
+ * CLI wrapper for `mail mark`. Confirms the mark (or reports the idempotent
+ * no-op) on stderr — the informational, non-primary-data path the mail surface
+ * uses throughout.
+ */
+export async function mailMarkCommand(result: MailMarkResult): Promise<MailMarkResult> {
+  const { log } = await import('../ui.js');
+  const rel = path.relative(process.cwd(), result.markPath);
+  if (result.alreadyMarked) {
+    log.info(TAG, `Already marked processed (${result.agent}): ${rel}`);
+  } else {
+    log.success(
+      TAG,
+      `Marked processed (${result.agent}${result.broadcast ? ', broadcast' : ''}): ${rel}`,
+    );
+  }
+  return result;
+}

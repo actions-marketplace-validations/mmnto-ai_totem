@@ -5,8 +5,11 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { Embedder } from '../embedders/embedder.js';
+import { NO_EMBEDDER_AVAILABLE_MESSAGE } from '../embedders/embedder.js';
+import { TotemConfigError } from '../errors.js';
+import { cleanTmpDir } from '../test-utils.js';
 import type { Chunk } from '../types.js';
-import { LanceStore } from './lance-store.js';
+import { escapeSqlString, LanceStore } from './lance-store.js';
 
 /** Deterministic fake embedder — hashes text into a fixed-dimension vector. */
 class FakeEmbedder implements Embedder {
@@ -38,6 +41,31 @@ function makeChunk(overrides: Partial<Chunk> = {}): Chunk {
   };
 }
 
+describe('escapeSqlString', () => {
+  it('doubles single quotes', () => {
+    expect(escapeSqlString("it's")).toBe("it''s");
+  });
+
+  it('handles strings with no special characters', () => {
+    expect(escapeSqlString('src/index.ts')).toBe('src/index.ts');
+  });
+
+  it('preserves backslashes (DataFusion treats them as literals)', () => {
+    expect(escapeSqlString('foo\\bar\\baz')).toBe('foo\\bar\\baz');
+  });
+
+  it('escapes quotes adjacent to backslashes', () => {
+    // Input: foo\'bar (actual chars: f,o,o,\,',b,a,r)
+    // Only the quote is doubled; backslash is literal in DataFusion SQL.
+    expect(escapeSqlString("foo\\'bar")).toBe("foo\\''bar");
+  });
+
+  it('escapes trailing backslash-quote sequences', () => {
+    // Input: foo\' (actual chars: f,o,o,\,')
+    expect(escapeSqlString("foo\\'")).toBe("foo\\''");
+  });
+});
+
 describe('LanceStore', () => {
   let tmpDir: string;
   let store: LanceStore;
@@ -46,12 +74,12 @@ describe('LanceStore', () => {
   beforeEach(async () => {
     tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lance-test-'));
     embedder = new FakeEmbedder();
-    store = new LanceStore(tmpDir, embedder);
+    store = new LanceStore(tmpDir, embedder, { absolutePathRoot: tmpDir });
     await store.connect();
   });
 
   afterEach(async () => {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
   });
 
   describe('insert + isEmpty', () => {
@@ -82,6 +110,43 @@ describe('LanceStore', () => {
       const stats = await store.stats();
       expect(stats.totalChunks).toBe(3);
       expect(stats.byType).toEqual({ code: 2, spec: 1 });
+    });
+  });
+
+  describe('count', () => {
+    it('returns 0 when empty', async () => {
+      expect(await store.count()).toBe(0);
+    });
+
+    it('returns total row count after inserts', async () => {
+      await store.insert([
+        makeChunk({ type: 'code', content: 'a' }),
+        makeChunk({ type: 'spec', content: 'b' }),
+      ]);
+      expect(await store.count()).toBe(2);
+    });
+  });
+
+  describe('getDistinctPaths', () => {
+    it('returns one entry per distinct filePath, deduped', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'src/a.ts', content: 'a1' }),
+        makeChunk({ filePath: 'src/a.ts', content: 'a2', label: 'fn b' }),
+        makeChunk({ filePath: 'src/b.ts', content: 'b1' }),
+      ]);
+      expect((await store.getDistinctPaths()).sort()).toEqual(['src/a.ts', 'src/b.ts']);
+    });
+
+    it('returns [] for an empty store', async () => {
+      expect(await store.getDistinctPaths()).toEqual([]);
+    });
+
+    it('preserves the raw stored path (no normalization) and round-trips through deleteByFile (#2151 W1)', async () => {
+      await store.insert([makeChunk({ filePath: 'src\\legacy.ts', content: 'legacy' })]);
+      expect(await store.getDistinctPaths()).toEqual(['src\\legacy.ts']);
+      // The raw backslash path must match the stored literal on delete.
+      await store.deleteByFile('src\\legacy.ts');
+      expect(await store.getDistinctPaths()).toEqual([]);
     });
   });
 
@@ -137,6 +202,30 @@ describe('LanceStore', () => {
       expect(stats.totalChunks).toBe(1);
     });
 
+    it('handles paths with backslash-quote (adversarial)', async () => {
+      await store.insert([
+        makeChunk({ filePath: "foo\\'bar", content: 'adversarial bq' }),
+        makeChunk({ filePath: 'src/safe.ts', content: 'safe file' }),
+      ]);
+
+      await store.deleteByFile("foo\\'bar");
+
+      const stats = await store.stats();
+      expect(stats.totalChunks).toBe(1);
+    });
+
+    it('handles paths with only backslashes (adversarial)', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'foo\\bar\\baz', content: 'backslash path' }),
+        makeChunk({ filePath: 'src/safe.ts', content: 'safe file' }),
+      ]);
+
+      await store.deleteByFile('foo\\bar\\baz');
+
+      const stats = await store.stats();
+      expect(stats.totalChunks).toBe(1);
+    });
+
     it('handles camelCase paths', async () => {
       await store.insert([
         makeChunk({ filePath: 'src/myComponent/CamelCase.tsx', content: 'camel' }),
@@ -181,6 +270,178 @@ describe('LanceStore', () => {
       const results = await store.search({ query: 'content', typeFilter: 'spec', maxResults: 10 });
       expect(results.every((r) => r.type === 'spec')).toBe(true);
     });
+
+    it('filters by boundary (file path prefix)', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'packages/core/src/compiler.ts', content: 'core compiler logic' }),
+        makeChunk({ filePath: 'packages/mcp/src/tools.ts', content: 'mcp tool handler' }),
+        makeChunk({ filePath: 'packages/cli/src/index.ts', content: 'cli entry point' }),
+      ]);
+
+      const results = await store.search({
+        query: 'logic handler entry',
+        boundary: 'packages/mcp/',
+        maxResults: 10,
+      });
+      expect(results.length).toBeGreaterThan(0);
+      expect(results.every((r) => r.filePath.startsWith('packages/mcp'))).toBe(true);
+    });
+
+    it('returns all results when boundary is omitted', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'packages/core/src/a.ts', content: 'alpha content' }),
+        makeChunk({ filePath: 'packages/mcp/src/b.ts', content: 'beta content' }),
+      ]);
+
+      const results = await store.search({ query: 'content', maxResults: 10 });
+      expect(results.length).toBe(2);
+    });
+
+    it('filters by array boundary (OR across prefixes)', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'packages/core/src/a.ts', content: 'core logic delta' }),
+        makeChunk({ filePath: 'packages/mcp/src/b.ts', content: 'mcp handler delta' }),
+        makeChunk({ filePath: 'packages/cli/src/c.ts', content: 'cli command delta' }),
+      ]);
+
+      const results = await store.search({
+        query: 'delta',
+        boundary: ['packages/core/', 'packages/mcp/'],
+        maxResults: 10,
+      });
+      expect(results.length).toBe(2);
+      expect(
+        results.every(
+          (r) => r.filePath.startsWith('packages/core/') || r.filePath.startsWith('packages/mcp/'),
+        ),
+      ).toBe(true);
+    });
+
+    it('ignores empty string boundary', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'packages/core/src/a.ts', content: 'gamma content' }),
+      ]);
+
+      const results = await store.search({ query: 'gamma', boundary: '', maxResults: 10 });
+      expect(results.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('allowFtsFallback (mmnto-ai/totem#2463)', () => {
+    /**
+     * Throws the exact no-embedder error that LazyEmbedder.doResolve raises —
+     * via the shared constant, so a wording change at the throw site cannot
+     * silently decouple this suite from the detector it exercises.
+     */
+    class NoEmbedder implements Embedder {
+      readonly dimensions = 8;
+      async embed(): Promise<number[][]> {
+        throw new TotemConfigError(NO_EMBEDDER_AVAILABLE_MESSAGE, 'hint', 'CONFIG_MISSING');
+      }
+    }
+
+    /** Throws a NON-embedder error — must always propagate, never degrade. */
+    class BrokenEmbedder implements Embedder {
+      readonly dimensions = 8;
+      async embed(): Promise<number[][]> {
+        throw new Error('LanceDB vector search exploded');
+      }
+    }
+
+    it('degrades to FTS-only when embedder is unavailable, FTS exists, and the flag is set', async () => {
+      // Seed the index + FTS with a working embedder (the outer `store`).
+      await store.insert([
+        makeChunk({ content: 'handles user authentication and login', label: 'auth' }),
+        makeChunk({ content: 'renders the dashboard component', label: 'dash' }),
+      ]);
+      await store.createFtsIndex();
+
+      // A second store over the SAME dir whose embedder cannot resolve.
+      const degraded = new LanceStore(tmpDir, new NoEmbedder(), { absolutePathRoot: tmpDir });
+      await degraded.connect();
+
+      const results = await degraded.search({
+        query: 'authentication',
+        allowFtsFallback: true,
+      });
+
+      expect(results.length).toBeGreaterThan(0);
+      // Success-shaped, method fts, and NO relevance signal on keyword hits.
+      for (const r of results) {
+        expect(r.searchMethod).toBe('fts');
+        expect(r.relevance).toBeUndefined();
+      }
+    });
+
+    it('invokes onFtsFallback when the degradation engages (out-of-band signal for the zero-row case)', async () => {
+      await store.insert([makeChunk({ content: 'authentication content', label: 'auth' })]);
+      await store.createFtsIndex();
+
+      const degraded = new LanceStore(tmpDir, new NoEmbedder(), { absolutePathRoot: tmpDir });
+      await degraded.connect();
+
+      let fired = false;
+      await degraded.search({
+        query: 'authentication',
+        allowFtsFallback: true,
+        onFtsFallback: () => {
+          fired = true;
+        },
+      });
+      expect(fired).toBe(true);
+    });
+
+    it('does not invoke onFtsFallback on a healthy search', async () => {
+      await store.insert([makeChunk({ content: 'authentication content', label: 'auth' })]);
+      await store.createFtsIndex();
+
+      let fired = false;
+      const results = await store.search({
+        query: 'authentication',
+        allowFtsFallback: true,
+        onFtsFallback: () => {
+          fired = true;
+        },
+      });
+      expect(results.length).toBeGreaterThan(0);
+      expect(fired).toBe(false);
+    });
+
+    it('rethrows the embedder failure when the flag is OFF (today behavior)', async () => {
+      await store.insert([makeChunk({ content: 'authentication content', label: 'auth' })]);
+      await store.createFtsIndex();
+
+      const degraded = new LanceStore(tmpDir, new NoEmbedder(), { absolutePathRoot: tmpDir });
+      await degraded.connect();
+
+      await expect(degraded.search({ query: 'authentication' })).rejects.toThrow(
+        'No embedding provider available',
+      );
+    });
+
+    it('rethrows the embedder failure when the flag is set but NO FTS index exists', async () => {
+      // Seed WITHOUT createFtsIndex → hybrid path off, vector-only, no fallback.
+      await store.insert([makeChunk({ content: 'authentication content', label: 'auth' })]);
+
+      const degraded = new LanceStore(tmpDir, new NoEmbedder(), { absolutePathRoot: tmpDir });
+      await degraded.connect();
+
+      await expect(
+        degraded.search({ query: 'authentication', allowFtsFallback: true }),
+      ).rejects.toThrow('No embedding provider available');
+    });
+
+    it('propagates a NON-embedder error even with the flag set and FTS present', async () => {
+      await store.insert([makeChunk({ content: 'authentication content', label: 'auth' })]);
+      await store.createFtsIndex();
+
+      const broken = new LanceStore(tmpDir, new BrokenEmbedder(), { absolutePathRoot: tmpDir });
+      await broken.connect();
+
+      await expect(
+        broken.search({ query: 'authentication', allowFtsFallback: true }),
+      ).rejects.toThrow('LanceDB vector search exploded');
+    });
   });
 
   describe('reset', () => {
@@ -198,6 +459,264 @@ describe('LanceStore', () => {
       await store.insert([makeChunk()]);
       await store.reconnect();
       expect(await store.isEmpty()).toBe(false);
+    });
+  });
+
+  describe('stale-handle resilience (mmnto/totem#1418)', () => {
+    it('surfaces rows written by a separate instance without explicit reconnect', async () => {
+      // Reader connects to an empty directory first.
+      const readerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lance-stale-'));
+      const readerEmbedder = new FakeEmbedder();
+      const reader = new LanceStore(readerDir, readerEmbedder, { absolutePathRoot: readerDir });
+      await reader.connect();
+
+      try {
+        // First query on an empty store: zero results, refresh counter ticks.
+        const initial = await reader.search({ query: 'alpha' });
+        expect(initial).toEqual([]);
+        const refreshAfterFirst = reader.readRefreshCount;
+        expect(refreshAfterFirst).toBeGreaterThan(0);
+
+        // A separate LanceStore (standing in for `totem sync` as an external
+        // process) writes rows into the SAME directory. The reader holds a
+        // stale view at this point in the timeline.
+        const writerEmbedder = new FakeEmbedder();
+        const writer = new LanceStore(readerDir, writerEmbedder, {
+          absolutePathRoot: readerDir,
+        });
+        await writer.connect();
+        await writer.insert([
+          makeChunk({ content: 'alpha fresh content from external writer', label: 'alpha-row' }),
+          makeChunk({ content: 'beta fresh content from external writer', label: 'beta-row' }),
+        ]);
+
+        // Reader queries again WITHOUT calling reconnect(). The fix reopens
+        // the LanceDB handle inside search(), so the externally-written rows
+        // become visible on this next call.
+        const refreshed = await reader.search({ query: 'alpha content' });
+        expect(refreshed.length).toBeGreaterThan(0);
+        expect(refreshed.some((r) => r.label === 'alpha-row')).toBe(true);
+
+        // Every search() call reopens. Confirms the reopen-per-query contract
+        // the fix relies on.
+        expect(reader.readRefreshCount).toBe(refreshAfterFirst + 1);
+      } finally {
+        cleanTmpDir(readerDir);
+      }
+    });
+
+    it('increments readRefreshCount on every search call', async () => {
+      await store.insert([makeChunk({ content: 'counter test content' })]);
+      const before = store.readRefreshCount;
+      await store.search({ query: 'counter' });
+      await store.search({ query: 'counter' });
+      await store.search({ query: 'counter' });
+      expect(store.readRefreshCount).toBe(before + 3);
+    });
+
+    it('increments readRefreshCount on searchFts call', async () => {
+      await store.insert([makeChunk({ content: 'fts counter content' })]);
+      await store.createFtsIndex();
+      const before = store.readRefreshCount;
+      await store.searchFts({ query: 'fts' });
+      expect(store.readRefreshCount).toBe(before + 1);
+    });
+
+    it('handles concurrent searches without one closing the other handle', async () => {
+      // Shield CRITICAL guard: the reopen-per-query strategy used to close
+      // `this.db` on every call, which would invalidate an in-flight query
+      // launched by a concurrent caller. Per-call snapshots scoped to each
+      // caller eliminate that race; this test keeps the contract locked in.
+      await store.insert([
+        makeChunk({ content: 'concurrent alpha content', label: 'alpha' }),
+        makeChunk({ content: 'concurrent beta content', label: 'beta' }),
+        makeChunk({ content: 'concurrent gamma content', label: 'gamma' }),
+      ]);
+
+      const before = store.readRefreshCount;
+      const results = await Promise.all([
+        store.search({ query: 'concurrent alpha' }),
+        store.search({ query: 'concurrent beta' }),
+        store.search({ query: 'concurrent gamma' }),
+      ]);
+
+      // Every call reopens; none fail from a sibling closing its connection.
+      expect(store.readRefreshCount).toBe(before + 3);
+      for (const r of results) {
+        expect(r.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe('healthCheck', () => {
+    it('returns healthy for a populated index', async () => {
+      await store.insert([
+        makeChunk({ content: 'alpha content' }),
+        makeChunk({ content: 'beta content' }),
+      ]);
+
+      const result = await store.healthCheck();
+
+      expect(result.healthy).toBe(true);
+      expect(result.dimensionMatch).toBe(true);
+      expect(result.canarySearchOk).toBe(true);
+      expect(result.totalChunks).toBe(2);
+      expect(result.expectedDimensions).toBe(embedder.dimensions);
+      expect(result.storedDimensions).toBe(embedder.dimensions);
+      expect(result.issues).toEqual([]);
+      expect(result.durationMs).toBeGreaterThanOrEqual(0); // totem-ignore — timing floor check, not a set count
+    });
+
+    it('returns healthy with storedDimensions null for an empty index', async () => {
+      const result = await store.healthCheck();
+
+      expect(result.healthy).toBe(true);
+      expect(result.storedDimensions).toBeNull();
+      expect(result.dimensionMatch).toBe(true);
+      expect(result.canarySearchOk).toBe(true);
+      expect(result.totalChunks).toBe(0);
+      expect(result.issues).toEqual([]);
+    });
+
+    it('reports FTS availability', async () => {
+      await store.insert([makeChunk({ content: 'fts test content' })]);
+      await store.createFtsIndex();
+
+      const result = await store.healthCheck();
+
+      expect(result.healthy).toBe(true);
+      expect(result.ftsAvailable).toBe(true);
+    });
+
+    it('reports ftsAvailable false when no FTS index exists', async () => {
+      await store.insert([makeChunk({ content: 'no fts here' })]);
+
+      const result = await store.healthCheck();
+
+      expect(result.ftsAvailable).toBe(false);
+    });
+  });
+
+  describe('manifestDocuments', () => {
+    it('returns empty array when store is empty', async () => {
+      const docs = await store.manifestDocuments();
+      expect(docs).toEqual([]);
+    });
+
+    it('groups rows by filePath with row counts', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'src/a.ts', content: 'a1' }),
+        makeChunk({ filePath: 'src/a.ts', content: 'a2' }),
+        makeChunk({ filePath: 'src/b.ts', content: 'b1' }),
+      ]);
+
+      const docs = await store.manifestDocuments();
+
+      expect(docs).toHaveLength(2);
+      const a = docs.find((d) => d.sourceFile === 'src/a.ts');
+      const b = docs.find((d) => d.sourceFile === 'src/b.ts');
+      expect(a?.rowCount).toBe(2);
+      expect(b?.rowCount).toBe(1);
+    });
+
+    it('returns docs sorted by sourceFile', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'z/last.ts', content: 'z' }),
+        makeChunk({ filePath: 'a/first.ts', content: 'a' }),
+        makeChunk({ filePath: 'm/middle.ts', content: 'm' }),
+      ]);
+
+      const docs = await store.manifestDocuments();
+
+      expect(docs.map((d) => d.sourceFile)).toEqual(['a/first.ts', 'm/middle.ts', 'z/last.ts']);
+    });
+
+    it('derives origin "local" for repo paths', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'src/foo.ts', content: 'x' }),
+        makeChunk({ filePath: '.totem/lessons/lesson-abc.md', content: 'y', type: 'spec' }),
+        makeChunk({ filePath: 'docs/readme.md', content: 'z', type: 'spec' }),
+      ]);
+
+      const docs = await store.manifestDocuments();
+
+      for (const d of docs) {
+        expect(d.origin).toBe('local');
+      }
+    });
+
+    it('derives origin from node_modules pkg name (scoped)', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'node_modules/@mmnto/totem/dist/index.js', content: 'x' }),
+      ]);
+
+      const docs = await store.manifestDocuments();
+
+      expect(docs[0]?.origin).toBe('@mmnto/totem');
+    });
+
+    it('derives origin from node_modules pkg name (unscoped)', async () => {
+      await store.insert([makeChunk({ filePath: 'node_modules/lodash/index.js', content: 'x' })]);
+
+      const docs = await store.manifestDocuments();
+
+      expect(docs[0]?.origin).toBe('lodash');
+    });
+
+    it('derives origin correctly from Windows-style backslash paths', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'node_modules\\@mmnto\\totem\\dist\\index.js', content: 'x' }),
+        makeChunk({ filePath: 'node_modules\\lodash\\index.js', content: 'y' }),
+      ]);
+
+      const docs = await store.manifestDocuments();
+      const scoped = docs.find((d) => d.sourceFile.includes('@mmnto'));
+      const unscoped = docs.find((d) => d.sourceFile.includes('lodash'));
+
+      expect(scoped?.origin).toBe('@mmnto/totem');
+      expect(unscoped?.origin).toBe('lodash');
+    });
+
+    it('does not special-case any specific filename or path identity', async () => {
+      // Regression guard: a hardcoded `.totem/lessons` path-identity branch
+      // previously existed in the writer (tagged for status-Gemini mock-data
+      // matching). Stripped per Tenet 14 — origin must derive from structural
+      // signal (node_modules presence) only, not path-identity matches.
+      await store.insert([
+        makeChunk({
+          filePath: '.totem/lessons/lesson-agent-orientation.md',
+          content: 'x',
+          type: 'spec',
+        }),
+      ]);
+
+      const docs = await store.manifestDocuments();
+
+      expect(docs[0]?.origin).toBe('local');
+    });
+
+    it('populates lastSynced as ISO timestamp', async () => {
+      await store.insert([makeChunk({ filePath: 'src/x.ts', content: 'x' })]);
+
+      const docs = await store.manifestDocuments();
+
+      expect(docs[0]?.lastSynced).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    });
+
+    it('uses the supplied writtenAt for every doc lastSynced (manifest-write invariant)', async () => {
+      await store.insert([
+        makeChunk({ filePath: 'src/a.ts', content: 'a' }),
+        makeChunk({ filePath: 'src/b.ts', content: 'b' }),
+        makeChunk({ filePath: 'src/c.ts', content: 'c' }),
+      ]);
+
+      const writtenAt = new Date('2026-05-07T12:34:56.789Z');
+      const docs = await store.manifestDocuments(writtenAt);
+
+      expect(docs).toHaveLength(3);
+      for (const d of docs) {
+        expect(d.lastSynced).toBe('2026-05-07T12:34:56.789Z');
+      }
     });
   });
 });

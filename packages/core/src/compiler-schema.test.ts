@@ -1,0 +1,1342 @@
+import { describe, expect, it } from 'vitest';
+
+import { canonicalStringify } from './compile-manifest.js';
+import type { RuleEventCallback } from './compiler-schema.js';
+import {
+  AstGrepYamlRuleSchema,
+  AuthoredFixtureSchema,
+  AuthoredProvenanceRecordSchema,
+  CompiledRuleSchema,
+  CompilerOutputSchema,
+  deriveRuleClass,
+  isAuthoredProvenance,
+  isMinedProvenance,
+  LEDGER_RETRY_PENDING_CODES,
+  LegitimacySchema,
+  MinedProvenanceWireSchema,
+  NapiConfigSchema,
+  NonCompilableEntryReadSchema,
+  NonCompilableEntryWriteSchema,
+  NonCompilableReasonCodeSchema,
+  PreimageSourceSchema,
+  provenanceKind,
+  ProvenanceRecordSchema,
+  shouldWriteToLedger,
+} from './compiler-schema.js';
+
+// ─── NapiConfigSchema / AstGrepYamlRuleSchema ────────
+
+describe('NapiConfigSchema', () => {
+  it('accepts a minimal compound rule with a rule key', () => {
+    const parsed = NapiConfigSchema.parse({
+      rule: { pattern: 'foo($A)' },
+    });
+    expect(parsed.rule).toBeDefined();
+  });
+
+  it('accepts nested combinators (all / any / inside)', () => {
+    const parsed = NapiConfigSchema.parse({
+      rule: {
+        all: [{ pattern: 'foo($A)' }, { inside: { kind: 'function_declaration' } }],
+      },
+    });
+    expect(parsed.rule).toBeDefined();
+  });
+
+  it('rejects an object missing the rule key at parse time', () => {
+    expect(() => NapiConfigSchema.parse({ notRule: {} })).toThrow();
+  });
+
+  it('is exported as an alias under AstGrepYamlRuleSchema', () => {
+    const input = { rule: { pattern: 'foo($A)' } };
+    const viaNapi = NapiConfigSchema.parse(input);
+    const viaAlias = AstGrepYamlRuleSchema.parse(input);
+    expect(viaAlias).toEqual(viaNapi);
+  });
+});
+
+// ─── CompiledRuleSchema mutual exclusion ─────────────
+
+describe('CompiledRuleSchema mutual exclusion', () => {
+  const baseRule = {
+    lessonHash: 'abc123def456',
+    lessonHeading: 'Test rule',
+    pattern: '',
+    message: 'Use the right thing',
+    engine: 'ast-grep' as const,
+    compiledAt: '2026-04-13T12:00:00Z',
+  };
+
+  it('accepts ast-grep engine with only astGrepPattern', () => {
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      astGrepPattern: 'console.log($A)',
+    });
+    expect(parsed.astGrepPattern).toBe('console.log($A)');
+    expect(parsed.astGrepYamlRule).toBeUndefined();
+  });
+
+  it('accepts ast-grep engine with only astGrepYamlRule', () => {
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      astGrepYamlRule: { rule: { pattern: 'console.log($A)' } },
+    });
+    expect(parsed.astGrepYamlRule).toBeDefined();
+    expect(parsed.astGrepPattern).toBeUndefined();
+  });
+
+  it('CompiledRule rejects ast-grep engine with both pattern and yaml definitions', () => {
+    expect(() =>
+      CompiledRuleSchema.parse({
+        ...baseRule,
+        astGrepPattern: 'console.log($A)',
+        astGrepYamlRule: { rule: { pattern: 'console.log($A)' } },
+      }),
+    ).toThrow(/cannot define both astGrepPattern and astGrepYamlRule/);
+  });
+
+  it('CompiledRule rejects ast-grep engine with neither pattern nor yaml definitions', () => {
+    expect(() => CompiledRuleSchema.parse(baseRule)).toThrow(
+      /must define either astGrepPattern or astGrepYamlRule/,
+    );
+  });
+
+  it('treats empty-string astGrepPattern as "not present" for mutual exclusion', () => {
+    // Empty-string pattern + yaml object is the legit compound-rule shape because
+    // engineFields writes pattern: '' for ast-grep rules.
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      astGrepPattern: '',
+      astGrepYamlRule: { rule: { pattern: 'foo' } },
+    });
+    expect(parsed.astGrepYamlRule).toBeDefined();
+  });
+
+  it('accepts regex engine without either ast-grep field', () => {
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      engine: 'regex',
+      pattern: '\\bfoo\\b',
+    });
+    expect(parsed.engine).toBe('regex');
+  });
+
+  it('accepts ast engine without either ast-grep field', () => {
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      engine: 'ast',
+      astQuery: '(catch_clause) @c',
+    });
+    expect(parsed.engine).toBe('ast');
+  });
+});
+
+// ─── CompilerOutputSchema parallels ──────────────────
+
+describe('CompilerOutputSchema mutual exclusion', () => {
+  it('rejects compiler output with both ast-grep fields', () => {
+    expect(() =>
+      CompilerOutputSchema.parse({
+        compilable: true,
+        engine: 'ast-grep',
+        message: 'msg',
+        astGrepPattern: 'foo($A)',
+        astGrepYamlRule: { rule: { pattern: 'foo($A)' } },
+      }),
+    ).toThrow(/cannot define both astGrepPattern and astGrepYamlRule/);
+  });
+
+  it('accepts compiler output with only astGrepYamlRule', () => {
+    // Post mmnto-ai/totem#1409: every compilable ast-grep output must
+    // carry a non-empty badExample, so the happy path here includes one.
+    const parsed = CompilerOutputSchema.parse({
+      compilable: true,
+      engine: 'ast-grep',
+      message: 'msg',
+      astGrepYamlRule: { rule: { pattern: 'foo($A)' } },
+      badExample: 'foo(1)',
+      goodExample: 'bar(1)',
+    });
+    expect(parsed.astGrepYamlRule).toBeDefined();
+  });
+});
+
+// ─── CompiledRule badExample optional field ──────────
+
+describe('CompiledRule badExample field', () => {
+  const baseRule = {
+    lessonHash: 'abc123def456',
+    lessonHeading: 'Test rule',
+    pattern: '\\bfoo\\b',
+    message: 'No foo',
+    engine: 'regex' as const,
+    compiledAt: '2026-04-13T12:00:00Z',
+  };
+
+  it('accepts a CompiledRule with badExample set', () => {
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      badExample: 'const foo = 1;',
+    });
+    expect(parsed.badExample).toBe('const foo = 1;');
+  });
+
+  it('accepts a CompiledRule without badExample (optional on the persisted shape)', () => {
+    // CompiledRule stays optional because Pipeline 1 (manual) rules
+    // have not yet been taught to emit badExample — that work is
+    // deferred to mmnto-ai/totem#1414. Only CompilerOutput (the LLM
+    // gate) flips to required in mmnto-ai/totem#1409.
+    const parsed = CompiledRuleSchema.parse(baseRule);
+    expect(parsed.badExample).toBeUndefined();
+  });
+});
+
+// ─── CompiledRule archivedAt field (mmnto-ai/totem#1589) ─────
+
+describe('CompiledRule archivedAt field', () => {
+  const baseArchivedRule = {
+    lessonHash: 'abc123def456',
+    lessonHeading: 'Archived rule',
+    pattern: '\\bfoo\\b',
+    message: 'No foo',
+    engine: 'regex' as const,
+    compiledAt: '2026-04-13T12:00:00Z',
+    status: 'archived' as const,
+    archivedReason: 'Over-matching pattern',
+    archivedAt: '2026-04-13T12:05:00Z',
+  };
+
+  it('accepts a CompiledRule with archivedAt set', () => {
+    const parsed = CompiledRuleSchema.parse(baseArchivedRule);
+    expect(parsed.archivedAt).toBe('2026-04-13T12:05:00Z');
+  });
+
+  it('preserves archivedAt across a parse → serialize → parse round-trip', () => {
+    // The pre-#1589 bug: CompiledRuleBaseSchema had no archivedAt field,
+    // so Zod silently stripped it on every round-trip. Every compile-write
+    // cycle erased prior archivedAt values from compiled-rules.json,
+    // eroding the institutional first-archive-provenance ledger.
+    const firstParse = CompiledRuleSchema.parse(baseArchivedRule);
+    const serialized: unknown = JSON.parse(JSON.stringify(firstParse));
+    const secondParse = CompiledRuleSchema.parse(serialized);
+    expect(secondParse.archivedAt).toBe('2026-04-13T12:05:00Z');
+    expect(secondParse.archivedReason).toBe('Over-matching pattern');
+    expect(secondParse.status).toBe('archived');
+  });
+
+  it('accepts an active CompiledRule without archivedAt (optional, absent for active rules)', () => {
+    const activeRule = {
+      lessonHash: 'abc123def456',
+      lessonHeading: 'Active rule',
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex' as const,
+      compiledAt: '2026-04-13T12:00:00Z',
+    };
+    const parsed = CompiledRuleSchema.parse(activeRule);
+    expect(parsed.archivedAt).toBeUndefined();
+    expect(parsed.status).toBeUndefined();
+  });
+
+  it('preserves the full archive tuple (status + archivedReason + archivedAt) together', () => {
+    // Pins the invariant that the three archive-related fields survive
+    // together so `totem doctor` telemetry and the postmerge ledger have
+    // a complete record. Archive scripts set all three via raw JSON
+    // mutation; the schema must not strip any of them.
+    const parsed = CompiledRuleSchema.parse(baseArchivedRule);
+    expect(parsed.status).toBe('archived');
+    expect(parsed.archivedReason).toBe('Over-matching pattern');
+    expect(parsed.archivedAt).toBe('2026-04-13T12:05:00Z');
+  });
+});
+
+// ─── Stage 4 Verify-Against-Codebase schema deltas (mmnto-ai/totem#1682) ──
+
+describe('CompiledRule status field — Stage 4 untested-against-codebase value', () => {
+  const stage4UntestedRule = {
+    lessonHash: 'abc123def456',
+    lessonHeading: 'Stage 4 untested rule',
+    pattern: '\\bfoo\\b',
+    message: 'No foo',
+    engine: 'regex' as const,
+    compiledAt: '2026-04-30T12:00:00Z',
+    status: 'untested-against-codebase' as const,
+  };
+
+  it("accepts a CompiledRule with status 'untested-against-codebase'", () => {
+    const parsed = CompiledRuleSchema.parse(stage4UntestedRule);
+    expect(parsed.status).toBe('untested-against-codebase');
+  });
+
+  it("preserves status: 'untested-against-codebase' across round-trip", () => {
+    const firstParse = CompiledRuleSchema.parse(stage4UntestedRule);
+    const serialized: unknown = JSON.parse(JSON.stringify(firstParse));
+    const secondParse = CompiledRuleSchema.parse(serialized);
+    expect(secondParse.status).toBe('untested-against-codebase');
+  });
+
+  it('rejects an unknown status value', () => {
+    const bogus = { ...stage4UntestedRule, status: 'unknown-status' };
+    expect(() => CompiledRuleSchema.parse(bogus)).toThrow();
+  });
+});
+
+// ─── Stage 4 pack pending-verification value (mmnto-ai/totem#1684) ─────
+
+describe("CompiledRule status field — pack 'pending-verification' value", () => {
+  const pendingRule = {
+    lessonHash: 'def456abc789',
+    lessonHeading: 'Pack pending rule',
+    pattern: '\\bbar\\b',
+    message: 'No bar',
+    engine: 'regex' as const,
+    compiledAt: '2026-05-01T12:00:00Z',
+    status: 'pending-verification' as const,
+  };
+
+  it("accepts a CompiledRule with status 'pending-verification'", () => {
+    const parsed = CompiledRuleSchema.parse(pendingRule);
+    expect(parsed.status).toBe('pending-verification');
+  });
+
+  it("preserves status: 'pending-verification' across round-trip", () => {
+    const firstParse = CompiledRuleSchema.parse(pendingRule);
+    const serialized: unknown = JSON.parse(JSON.stringify(firstParse));
+    const secondParse = CompiledRuleSchema.parse(serialized);
+    expect(secondParse.status).toBe('pending-verification');
+  });
+});
+
+describe('CompiledRule confidence field (mmnto-ai/totem#1682)', () => {
+  const baseRule = {
+    lessonHash: 'abc123def456',
+    lessonHeading: 'High-confidence rule',
+    pattern: '\\bfoo\\b',
+    message: 'No foo',
+    engine: 'regex' as const,
+    compiledAt: '2026-04-30T12:00:00Z',
+  };
+
+  it("accepts a CompiledRule with confidence: 'high'", () => {
+    const parsed = CompiledRuleSchema.parse({ ...baseRule, confidence: 'high' });
+    expect(parsed.confidence).toBe('high');
+  });
+
+  it('accepts a CompiledRule without a confidence field (absent = unset)', () => {
+    const parsed = CompiledRuleSchema.parse(baseRule);
+    expect(parsed.confidence).toBeUndefined();
+  });
+
+  it('rejects an unknown confidence value', () => {
+    const bogus = { ...baseRule, confidence: 'medium' };
+    expect(() => CompiledRuleSchema.parse(bogus)).toThrow();
+  });
+
+  it('preserves confidence across a round-trip', () => {
+    const firstParse = CompiledRuleSchema.parse({ ...baseRule, confidence: 'high' });
+    const serialized: unknown = JSON.parse(JSON.stringify(firstParse));
+    const secondParse = CompiledRuleSchema.parse(serialized);
+    expect(secondParse.confidence).toBe('high');
+  });
+
+  it("survives concurrently with status: 'untested-against-codebase' (orthogonal axes)", () => {
+    const parsed = CompiledRuleSchema.parse({
+      ...baseRule,
+      status: 'untested-against-codebase' as const,
+      confidence: 'high' as const,
+    });
+    expect(parsed.status).toBe('untested-against-codebase');
+    expect(parsed.confidence).toBe('high');
+  });
+});
+
+describe("NonCompilableReasonCodeSchema 'stage4-out-of-scope-match' (mmnto-ai/totem#1682)", () => {
+  it("accepts 'stage4-out-of-scope-match' as a valid reason code", () => {
+    expect(() => NonCompilableReasonCodeSchema.parse('stage4-out-of-scope-match')).not.toThrow();
+  });
+
+  it("includes 'stage4-out-of-scope-match' in the enum options", () => {
+    const values = NonCompilableReasonCodeSchema.options;
+    expect(values).toContain('stage4-out-of-scope-match');
+  });
+
+  it("treats 'stage4-out-of-scope-match' as terminal (NOT in LEDGER_RETRY_PENDING_CODES)", () => {
+    // Stage 4 archive is structural — re-running compile re-evaluates against
+    // the current codebase, but the rule is not retry-eligible the way
+    // `pattern-zero-match` or `verify-retry-exhausted` are. shouldWriteToLedger
+    // returns true, meaning ledger writes record the audit trail.
+    expect(LEDGER_RETRY_PENDING_CODES.has('stage4-out-of-scope-match')).toBe(false);
+    expect(shouldWriteToLedger('stage4-out-of-scope-match')).toBe(true);
+  });
+});
+
+// ─── CompilerOutput badExample required per engine (mmnto-ai/totem#1409) ──
+
+describe('CompilerOutput badExample required by engine', () => {
+  it('accepts a regex CompilerOutput with a non-empty badExample', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: 'const foo = 1;',
+      goodExample: 'const bar = 1;',
+    });
+    expect(parsed.badExample).toBe('const foo = 1;');
+  });
+
+  it('accepts an ast-grep CompilerOutput with a non-empty badExample', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: true,
+      message: 'No console.log',
+      engine: 'ast-grep',
+      astGrepPattern: 'console.log($A)',
+      badExample: 'console.log("debug");',
+      goodExample: 'logger.info("debug");',
+    });
+    expect(parsed.badExample).toBe('console.log("debug");');
+  });
+
+  it('rejects a regex CompilerOutput missing badExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a regex CompilerOutput with an empty badExample string', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: '',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an ast-grep CompilerOutput missing badExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      message: 'No console.log',
+      engine: 'ast-grep',
+      astGrepPattern: 'console.log($A)',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an ast-grep compound CompilerOutput missing badExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      message: 'No const inside for-loop',
+      engine: 'ast-grep',
+      astGrepYamlRule: {
+        rule: {
+          pattern: 'const $VAR = $VAL',
+          inside: { kind: 'for_statement', stopBy: 'end' },
+        },
+      },
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts an ast engine CompilerOutput without badExample (exempt engine)', () => {
+    // Tree-sitter S-expression rules are not covered by the smoke gate
+    // in mmnto-ai/totem#1408, so the schema does not force a badExample
+    // on them. The exemption is load-bearing: removing it would reject
+    // every ast-engine rule the LLM emits today.
+    const parsed = CompilerOutputSchema.parse({
+      compilable: true,
+      message: 'AST check',
+      engine: 'ast',
+      astQuery: '(catch_clause) @c',
+    });
+    expect(parsed.engine).toBe('ast');
+    expect(parsed.badExample).toBeUndefined();
+  });
+
+  it('accepts a non-compilable CompilerOutput without badExample', () => {
+    // When compilable is false, there is no rule to smoke-test, so
+    // badExample stays optional. The reason field is what matters.
+    const parsed = CompilerOutputSchema.parse({
+      compilable: false,
+      reason: 'Conceptual architectural principle',
+    });
+    expect(parsed.compilable).toBe(false);
+  });
+
+  it('rejects a CompilerOutput with no engine field but no badExample (defaults to regex)', () => {
+    // buildCompiledRule defaults a missing engine to regex, so the
+    // schema treats the absent case the same way for gate purposes.
+    // This closes the back door where the LLM could omit engine to
+    // skip the required badExample.
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bnpm\\b',
+      message: 'Use pnpm instead of npm',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a regex CompilerOutput with a whitespace-only badExample', () => {
+    // Flagged by CodeRabbit on mmnto-ai/totem#1591: a blank string passes
+    // `length > 0` but the smoke gate's early-return on `trim().length === 0`
+    // would treat it as a no-op, so the required-field check must use
+    // `.trim().length > 0` to close the hole.
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: '   \t\n  ',
+      goodExample: 'const bar = 1;',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ─── CompilerOutput goodExample required per engine (mmnto-ai/totem#1580) ──
+
+describe('CompilerOutput goodExample required by engine', () => {
+  it('accepts a regex CompilerOutput with a non-empty goodExample', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: 'const foo = 1;',
+      goodExample: 'const bar = 1;',
+    });
+    expect(parsed.goodExample).toBe('const bar = 1;');
+  });
+
+  it('rejects a regex CompilerOutput missing goodExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: 'const foo = 1;',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a regex CompilerOutput with an empty goodExample string', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: 'const foo = 1;',
+      goodExample: '',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a regex CompilerOutput with a whitespace-only goodExample', () => {
+    // The case CodeRabbit flagged directly on mmnto-ai/totem#1591: a
+    // blank string satisfies `length > 0` but has zero over-matching
+    // coverage because the smoke gate treats it as no-op.
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: '\\bfoo\\b',
+      message: 'No foo',
+      engine: 'regex',
+      badExample: 'const foo = 1;',
+      goodExample: '   \t\n  ',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('accepts an ast engine CompilerOutput without goodExample (exempt engine)', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: true,
+      message: 'AST check',
+      engine: 'ast',
+      astQuery: '(catch_clause) @c',
+    });
+    expect(parsed.engine).toBe('ast');
+    expect(parsed.goodExample).toBeUndefined();
+  });
+
+  it('rejects an ast-grep CompilerOutput missing goodExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      message: 'No console.log',
+      engine: 'ast-grep',
+      astGrepPattern: 'console.log($A)',
+      badExample: 'console.log("debug");',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an ast-grep CompilerOutput with a whitespace-only goodExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      message: 'No console.log',
+      engine: 'ast-grep',
+      astGrepPattern: 'console.log($A)',
+      badExample: 'console.log("debug");',
+      goodExample: '   \n\t ',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects an ast-grep compound CompilerOutput missing goodExample', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      message: 'No const inside for-loop',
+      engine: 'ast-grep',
+      astGrepYamlRule: {
+        rule: {
+          pattern: 'const $VAR = $VAL',
+          inside: { kind: 'for_statement', stopBy: 'end' },
+        },
+      },
+      badExample: 'for (let i = 0; i < 10; i++) { const x = 1; }',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ─── RuleEventCallback discriminator (mmnto/totem#1408) ─────
+
+describe('RuleEventCallback discriminator', () => {
+  it('accepts the three distinct event variants without conflating them', () => {
+    const events: string[] = [];
+    const cb: RuleEventCallback = (event, hash, context) => {
+      events.push(`${event}:${hash}:${context?.failureReason ?? ''}`);
+    };
+
+    cb('trigger', 'h1');
+    cb('suppress', 'h2', { file: 'f', line: 1, justification: 'ok' });
+    cb('failure', 'h3', { file: 'f', line: 1, failureReason: 'napi panic' });
+
+    expect(events).toEqual(['trigger:h1:', 'suppress:h2:', 'failure:h3:napi panic']);
+  });
+
+  it('keeps suppress and failure as separate values per the #1412 postmerge GCA boundary', () => {
+    // The two discriminator values are not string-equal and must be handled on
+    // distinct code paths. This test locks that in at the type level so a
+    // future refactor that collapses them fails here loudly.
+    const suppress: 'trigger' | 'suppress' | 'failure' = 'suppress';
+    const failure: 'trigger' | 'suppress' | 'failure' = 'failure';
+    expect(suppress).not.toBe(failure);
+  });
+});
+
+// ─── NonCompilableReasonCode 'context-required' (mmnto-ai/totem#1598) ────
+
+describe("NonCompilableReasonCodeSchema 'context-required'", () => {
+  it('accepts the context-required reason code', () => {
+    expect(() => NonCompilableReasonCodeSchema.parse('context-required')).not.toThrow();
+  });
+
+  it('keeps legacy-unknown as the terminal enum value', () => {
+    const values = NonCompilableReasonCodeSchema.options;
+    expect(values[values.length - 1]).toBe('legacy-unknown');
+    expect(values).toContain('context-required');
+  });
+
+  it('round-trips a NonCompilable ledger entry carrying context-required', () => {
+    const entry = {
+      hash: 'a'.repeat(16),
+      title: 'sim.tick() must not advance inside _process',
+      reasonCode: 'context-required' as const,
+      reason: 'Lesson constrains scope to an enclosing function; regex cannot capture the guard.',
+    };
+    const written = NonCompilableEntryWriteSchema.parse(entry);
+    const read = NonCompilableEntryReadSchema.parse(written);
+    expect(read).toEqual(entry);
+  });
+});
+
+describe('CompilerOutputSchema context-required reasonCode', () => {
+  it('accepts a non-compilable output with reasonCode context-required', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: false,
+      reasonCode: 'context-required',
+      reason:
+        'Lesson references an enclosing scope ("inside _process") the pattern cannot express.',
+    });
+    expect(parsed.compilable).toBe(false);
+    expect(parsed.reasonCode).toBe('context-required');
+  });
+
+  it('accepts a non-compilable output without a reasonCode (falls back to generic out-of-scope)', () => {
+    // Backward compatibility: LLM responses that set compilable:false without
+    // a reasonCode continue to route through the existing out-of-scope exit.
+    const parsed = CompilerOutputSchema.parse({
+      compilable: false,
+      reason: 'Conceptual architectural principle.',
+    });
+    expect(parsed.compilable).toBe(false);
+    expect(parsed.reasonCode).toBeUndefined();
+  });
+
+  it('rejects compilable output with a reasonCode (reasonCode is for non-compilable exits only)', () => {
+    const result = CompilerOutputSchema.safeParse({
+      compilable: true,
+      pattern: 'foo',
+      badExample: 'foo()',
+      goodExample: 'bar()',
+      reasonCode: 'context-required',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a reasonCode value outside the LLM-emittable vocabulary', () => {
+    // Internal codes like verify-retry-exhausted are emitted by core routing,
+    // never by the LLM. Locking this in prevents the LLM from bypassing core
+    // classification by emitting an internal sentinel.
+    const result = CompilerOutputSchema.safeParse({
+      compilable: false,
+      reasonCode: 'verify-retry-exhausted',
+      reason: 'stolen sentinel',
+    });
+    expect(result.success).toBe(false);
+  });
+});
+
+// ─── NonCompilableReasonCode 'semantic-analysis-required' (mmnto-ai/totem#1634) ────
+
+describe("NonCompilableReasonCodeSchema 'semantic-analysis-required'", () => {
+  it('accepts the semantic-analysis-required reason code', () => {
+    expect(() => NonCompilableReasonCodeSchema.parse('semantic-analysis-required')).not.toThrow();
+  });
+
+  it('keeps legacy-unknown as the terminal enum value after the #1634 addition', () => {
+    const values = NonCompilableReasonCodeSchema.options;
+    expect(values[values.length - 1]).toBe('legacy-unknown');
+    expect(values).toContain('semantic-analysis-required');
+  });
+
+  it('round-trips a NonCompilable ledger entry carrying semantic-analysis-required', () => {
+    const entry = {
+      hash: 'b'.repeat(16),
+      title: 'Parallel float reductions break lockstep determinism',
+      reasonCode: 'semantic-analysis-required' as const,
+      reason:
+        'Closure-body AST analysis required to detect captured-float assignment inside par_iter_mut().for_each.',
+    };
+    const written = NonCompilableEntryWriteSchema.parse(entry);
+    const read = NonCompilableEntryReadSchema.parse(written);
+    expect(read).toEqual(entry);
+  });
+});
+
+describe('CompilerOutputSchema semantic-analysis-required reasonCode', () => {
+  it('accepts a non-compilable output with reasonCode semantic-analysis-required', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: false,
+      reasonCode: 'semantic-analysis-required',
+      reason: 'Hazard requires walking the SystemParam tuple; pattern cannot see other params.',
+    });
+    expect(parsed.compilable).toBe(false);
+    expect(parsed.reasonCode).toBe('semantic-analysis-required');
+  });
+
+  it('still accepts context-required (existing #1598 value stays in the narrow enum)', () => {
+    const parsed = CompilerOutputSchema.parse({
+      compilable: false,
+      reasonCode: 'context-required',
+      reason: 'Enclosing-function guard.',
+    });
+    expect(parsed.reasonCode).toBe('context-required');
+  });
+});
+
+// ─── LEDGER_RETRY_PENDING_CODES + shouldWriteToLedger (mmnto-ai/totem#1627) ───
+
+describe('LEDGER_RETRY_PENDING_CODES', () => {
+  it('is a strict subset of NonCompilableReasonCodeSchema.options', () => {
+    // Locks in that every retry-pending code is a legitimate enum member.
+    // A typo like 'patern-syntax-invalid' would fail here before it ships.
+    const enumValues = new Set<string>(NonCompilableReasonCodeSchema.options);
+    for (const code of LEDGER_RETRY_PENDING_CODES) {
+      expect(enumValues.has(code)).toBe(true);
+    }
+  });
+
+  it('does not include legacy-unknown (legacy is a migration sentinel, not retry-eligible)', () => {
+    expect(LEDGER_RETRY_PENDING_CODES.has('legacy-unknown')).toBe(false);
+  });
+
+  it('does not include terminal classifier codes (out-of-scope, context-required, semantic-analysis-required, self-suppressing-pattern)', () => {
+    // These describe structural incapacity — the rule will never compile
+    // cleanly no matter how many retries. They are permanent ledger entries.
+    expect(LEDGER_RETRY_PENDING_CODES.has('out-of-scope')).toBe(false);
+    expect(LEDGER_RETRY_PENDING_CODES.has('context-required')).toBe(false);
+    expect(LEDGER_RETRY_PENDING_CODES.has('semantic-analysis-required')).toBe(false);
+    expect(LEDGER_RETRY_PENDING_CODES.has('security-rule-rejected')).toBe(false);
+    // mmnto-ai/totem#1664: self-suppression is structural (the pattern would
+    // match totem-ignore / totem-context tokens at runtime). Retrying compile
+    // produces the same self-suppressing pattern, so it is terminal.
+    expect(LEDGER_RETRY_PENDING_CODES.has('self-suppressing-pattern')).toBe(false);
+  });
+
+  it('includes every known smoke-gate + LLM-output transient failure code', () => {
+    // Explicit whitelist so a future refactor that narrows the set fails
+    // here loudly rather than silently re-introducing ledger pollution.
+    expect(LEDGER_RETRY_PENDING_CODES.has('pattern-syntax-invalid')).toBe(true);
+    expect(LEDGER_RETRY_PENDING_CODES.has('pattern-zero-match')).toBe(true);
+    expect(LEDGER_RETRY_PENDING_CODES.has('verify-retry-exhausted')).toBe(true);
+    expect(LEDGER_RETRY_PENDING_CODES.has('missing-badexample')).toBe(true);
+    expect(LEDGER_RETRY_PENDING_CODES.has('missing-goodexample')).toBe(true);
+    expect(LEDGER_RETRY_PENDING_CODES.has('matches-good-example')).toBe(true);
+  });
+});
+
+describe('shouldWriteToLedger', () => {
+  it('writes permanent classifier codes to the ledger', () => {
+    expect(shouldWriteToLedger('out-of-scope')).toBe(true);
+    expect(shouldWriteToLedger('context-required')).toBe(true);
+    expect(shouldWriteToLedger('semantic-analysis-required')).toBe(true);
+    expect(shouldWriteToLedger('security-rule-rejected')).toBe(true);
+    expect(shouldWriteToLedger('no-pattern-found')).toBe(true);
+    expect(shouldWriteToLedger('no-pattern-generated')).toBe(true);
+    expect(shouldWriteToLedger('legacy-unknown')).toBe(true);
+    // mmnto-ai/totem#1664: self-suppressing-pattern is terminal (structural,
+    // not transient) — the audit trail in nonCompilable lets bot reviewers
+    // cite a stable reasonCode instead of synthesizing "missing from manifest".
+    expect(shouldWriteToLedger('self-suppressing-pattern')).toBe(true);
+  });
+
+  it('suppresses retry-pending smoke-gate and LLM-output failures from the ledger', () => {
+    // mmnto-ai/totem#1627: writing these to nonCompilable marks retriable
+    // transient failures as permanent, blocking future re-compile cycles
+    // from ever producing a rule once the prompt improves.
+    expect(shouldWriteToLedger('pattern-syntax-invalid')).toBe(false);
+    expect(shouldWriteToLedger('pattern-zero-match')).toBe(false);
+    expect(shouldWriteToLedger('verify-retry-exhausted')).toBe(false);
+    expect(shouldWriteToLedger('missing-badexample')).toBe(false);
+    expect(shouldWriteToLedger('missing-goodexample')).toBe(false);
+    expect(shouldWriteToLedger('matches-good-example')).toBe(false);
+  });
+});
+
+// ─── Legitimacy / ruleClass marker (mmnto-ai/totem#2183) ────
+
+describe('legitimacy / ruleClass marker (mmnto-ai/totem#2183)', () => {
+  const VALID_SHA = 'a'.repeat(40);
+  const baseRegexRule = {
+    lessonHash: 'abc123def456',
+    lessonHeading: 'Test rule',
+    pattern: 'console\\.log',
+    message: 'No console.log',
+    engine: 'regex' as const,
+    compiledAt: '2026-06-17T00:00:00Z',
+  };
+  const provenance = {
+    mergedPr: 2183,
+    reviewThread: 'https://github.com/mmnto-ai/totem/pull/2183#discussion_r1',
+    commitSha: VALID_SHA,
+  };
+  const passingLegitimacy = { provenance, positiveControl: true, negativeControl: true };
+
+  describe('deriveRuleClass truth table', () => {
+    it('returns advisory when legitimacy is absent', () => {
+      expect(deriveRuleClass({})).toBe('advisory');
+    });
+
+    it('returns hard only when legitimacy present, promoted, and both controls pass', () => {
+      expect(deriveRuleClass({ legitimacy: passingLegitimacy })).toBe('hard');
+    });
+
+    it('returns advisory when the rule is unpromoted (unverified: true)', () => {
+      expect(deriveRuleClass({ legitimacy: passingLegitimacy, unverified: true })).toBe('advisory');
+    });
+
+    it('returns advisory when the positive control failed', () => {
+      expect(
+        deriveRuleClass({ legitimacy: { ...passingLegitimacy, positiveControl: false } }),
+      ).toBe('advisory');
+    });
+
+    it('returns advisory when the negative control failed', () => {
+      expect(
+        deriveRuleClass({ legitimacy: { ...passingLegitimacy, negativeControl: false } }),
+      ).toBe('advisory');
+    });
+  });
+
+  describe('schema ⟺ invariant on CompiledRuleSchema', () => {
+    it('accepts a legacy rule with neither field (proxy fallback path)', () => {
+      expect(() => CompiledRuleSchema.parse(baseRegexRule)).not.toThrow();
+    });
+
+    it('accepts a consistent hard stamp', () => {
+      expect(() =>
+        CompiledRuleSchema.parse({
+          ...baseRegexRule,
+          legitimacy: passingLegitimacy,
+          ruleClass: 'hard',
+        }),
+      ).not.toThrow();
+    });
+
+    it('accepts a consistent advisory stamp (a failed control)', () => {
+      expect(() =>
+        CompiledRuleSchema.parse({
+          ...baseRegexRule,
+          legitimacy: { ...passingLegitimacy, positiveControl: false },
+          ruleClass: 'advisory',
+        }),
+      ).not.toThrow();
+    });
+
+    it('rejects ruleClass without legitimacy (forged hard stamp)', () => {
+      expect(() => CompiledRuleSchema.parse({ ...baseRegexRule, ruleClass: 'hard' })).toThrow(
+        /both present or both absent/,
+      );
+    });
+
+    it('rejects ruleClass:advisory without legitimacy (biconditional — both directions, CR #2186)', () => {
+      // The refinement fires on `hasLegitimacy !== hasRuleClass`, so a forged
+      // 'advisory' stamp with no legitimacy is rejected exactly like a forged
+      // 'hard' one — this documents the full ⟺ from tests alone.
+      expect(() => CompiledRuleSchema.parse({ ...baseRegexRule, ruleClass: 'advisory' })).toThrow(
+        /both present or both absent/,
+      );
+    });
+
+    it('rejects legitimacy without ruleClass (minted rule missing its marker)', () => {
+      expect(() =>
+        CompiledRuleSchema.parse({ ...baseRegexRule, legitimacy: passingLegitimacy }),
+      ).toThrow(/both present or both absent/);
+    });
+
+    it('rejects an inconsistent marker (advisory where derive says hard)', () => {
+      expect(() =>
+        CompiledRuleSchema.parse({
+          ...baseRegexRule,
+          legitimacy: passingLegitimacy,
+          ruleClass: 'advisory',
+        }),
+      ).toThrow(/inconsistent with the derived class 'hard'/);
+    });
+
+    it('rejects an inconsistent marker (hard where a control failed)', () => {
+      expect(() =>
+        CompiledRuleSchema.parse({
+          ...baseRegexRule,
+          legitimacy: { ...passingLegitimacy, negativeControl: false },
+          ruleClass: 'hard',
+        }),
+      ).toThrow(/inconsistent with the derived class 'advisory'/);
+    });
+  });
+
+  describe('ProvenanceRecordSchema validation (codex fold 1)', () => {
+    it('accepts a well-formed provenance record', () => {
+      expect(() => ProvenanceRecordSchema.parse(provenance)).not.toThrow();
+    });
+
+    it('rejects a non-positive mergedPr', () => {
+      expect(() => ProvenanceRecordSchema.parse({ ...provenance, mergedPr: 0 })).toThrow();
+    });
+
+    it('rejects a non-integer mergedPr', () => {
+      expect(() => ProvenanceRecordSchema.parse({ ...provenance, mergedPr: 2.5 })).toThrow();
+    });
+
+    it('rejects an empty or whitespace-only reviewThread', () => {
+      expect(() => ProvenanceRecordSchema.parse({ ...provenance, reviewThread: '' })).toThrow();
+      expect(() => ProvenanceRecordSchema.parse({ ...provenance, reviewThread: '   ' })).toThrow();
+    });
+
+    it('rejects a malformed commitSha (not 40-hex)', () => {
+      expect(() => ProvenanceRecordSchema.parse({ ...provenance, commitSha: 'abc123' })).toThrow();
+      expect(() =>
+        ProvenanceRecordSchema.parse({ ...provenance, commitSha: 'g'.repeat(40) }),
+      ).toThrow();
+    });
+
+    it('rejects an uppercase commitSha — canonical lowercase only, not /i (GCA #2186 declined)', () => {
+      // git emits canonical lowercase SHA-1; the canonical writer derives from
+      // git, so we validate the canonical form rather than accept (or normalize)
+      // a non-canonical uppercase value. See COMMIT_SHA_RE comment.
+      expect(() =>
+        ProvenanceRecordSchema.parse({ ...provenance, commitSha: 'A'.repeat(40) }),
+      ).toThrow();
+    });
+
+    it('does not mutate a whitespace-padded reviewThread (non-mutating validator, greptile/CR #2186)', () => {
+      const padded = '  pr#2183-thread  ';
+      // `reviewThread` lives on the MINED branch of the ADR-112 union; parse it
+      // through the mined wire schema directly (the union round-trip is covered
+      // by the dedicated ProvenanceRecord-union suite above).
+      const parsed = MinedProvenanceWireSchema.parse({ ...provenance, reviewThread: padded });
+      expect(parsed.reviewThread).toBe(padded);
+    });
+
+    it('requires both controls explicitly (no defaulting) when legitimacy is present', () => {
+      expect(() => LegitimacySchema.parse({ provenance, positiveControl: true })).toThrow();
+    });
+  });
+
+  describe('ProvenanceRecord union (ADR-112)', () => {
+    const minedWire = {
+      mergedPr: 2183,
+      reviewThread: 'pulls/2183/comments',
+      commitSha: 'a'.repeat(40),
+    };
+    const authored = {
+      kind: 'authored' as const,
+      author: 'totem-claude',
+      authoredAt: '2026-06-27',
+      targetDefect: 'float equality compared with == instead of a finite-tolerance check',
+      positiveFixtures: [
+        {
+          pr: 100,
+          // §4 FALLBACK source — commit-pair (land-then-fix).
+          preimageSource: {
+            kind: 'commit' as const,
+            preimageCommitSha: 'c'.repeat(40),
+            mergeCommitSha: 'b'.repeat(40),
+          },
+          filePath: 'src/physics/step.ts',
+          matchedSpan: 'L10-L12',
+          contentHash: 'deadbeefcafe',
+        },
+      ],
+    };
+    // §4 PRIMARY source — lesson-anchored (review-caught); same fixture, lesson preimageSource.
+    const authoredLesson = {
+      ...authored,
+      positiveFixtures: [
+        {
+          pr: 100,
+          preimageSource: {
+            kind: 'lesson' as const,
+            lessonRef: 'a1b2c3d4e5f60718', // 16-hex hashLesson codomain
+            badExample: 'if (a == b) { applyImpulse(); }',
+            goodExample: 'if (Math.abs(a - b) < EPS) { applyImpulse(); }',
+          },
+          filePath: 'src/physics/step.ts',
+          matchedSpan: 'L10-L12',
+          contentHash: 'deadbeefcafe',
+        },
+      ],
+    };
+
+    it('parses a legacy mined record (no kind) BYTE-IDENTICAL — no kind key added (manifest-hash safe)', () => {
+      const before = canonicalStringify(minedWire);
+      const parsed = ProvenanceRecordSchema.parse(minedWire);
+      const after = canonicalStringify(parsed);
+      expect(after).toBe(before);
+      expect(after).not.toContain('kind');
+      expect(provenanceKind(parsed)).toBe('mined');
+    });
+
+    it('reads an absent discriminator as mined; a present one as authored', () => {
+      expect(provenanceKind(ProvenanceRecordSchema.parse(minedWire))).toBe('mined');
+      expect(provenanceKind(ProvenanceRecordSchema.parse(authored))).toBe('authored');
+    });
+
+    it('discriminates the two branches with the type guards', () => {
+      const m = ProvenanceRecordSchema.parse(minedWire);
+      const a = ProvenanceRecordSchema.parse(authored);
+      expect(isMinedProvenance(m)).toBe(true);
+      expect(isAuthoredProvenance(m)).toBe(false);
+      expect(isAuthoredProvenance(a)).toBe(true);
+      expect(isMinedProvenance(a)).toBe(false);
+    });
+
+    it('accepts an explicit kind:mined and still round-trips it', () => {
+      const explicit = { ...minedWire, kind: 'mined' as const };
+      const parsed = MinedProvenanceWireSchema.parse(explicit);
+      expect(parsed.kind).toBe('mined');
+      expect(canonicalStringify(parsed)).toBe(canonicalStringify(explicit));
+    });
+
+    it('rejects an authored record with zero positiveFixtures (ADR-112 §3 ≥1)', () => {
+      expect(() =>
+        AuthoredProvenanceRecordSchema.parse({ ...authored, positiveFixtures: [] }),
+      ).toThrow();
+    });
+
+    it('rejects an authored record with an empty author or targetDefect', () => {
+      expect(() => AuthoredProvenanceRecordSchema.parse({ ...authored, author: '  ' })).toThrow();
+      expect(() =>
+        AuthoredProvenanceRecordSchema.parse({ ...authored, targetDefect: '' }),
+      ).toThrow();
+    });
+
+    it('validates authoredAt as a real ISO-8601 calendar date — rejects free text + impossible dates, accepts real dates/timestamps (#2259)', () => {
+      // '2026-02-31' + non-leap '2026-02-29' are the Date.parse-normalization trap (CR re-review):
+      // Date.parse rolls them into March rather than rejecting, so the calendar round-trip must catch them.
+      for (const bad of [
+        'last tuesday',
+        '2026-13-45',
+        '06/27/2026',
+        '',
+        '2026-02-31',
+        '2026-02-29',
+      ]) {
+        expect(() =>
+          AuthoredProvenanceRecordSchema.parse({ ...authored, authoredAt: bad }),
+        ).toThrow();
+      }
+      for (const ok of ['2026-06-27', '2026-06-27T12:00:00.000Z', '2024-02-29']) {
+        expect(() =>
+          AuthoredProvenanceRecordSchema.parse({ ...authored, authoredAt: ok }),
+        ).not.toThrow();
+      }
+    });
+
+    it('accepts both §4 preimageSource kinds and preserves the discriminator + branch fields', () => {
+      const commit = AuthoredProvenanceRecordSchema.parse(authored);
+      const lesson = AuthoredProvenanceRecordSchema.parse(authoredLesson);
+      const cSrc = commit.positiveFixtures[0].preimageSource;
+      const lSrc = lesson.positiveFixtures[0].preimageSource;
+      expect(cSrc.kind).toBe('commit');
+      if (cSrc.kind === 'commit') expect(cSrc.preimageCommitSha).toBe('c'.repeat(40));
+      expect(lSrc.kind).toBe('lesson');
+      if (lSrc.kind === 'lesson') {
+        expect(lSrc.lessonRef).toBe('a1b2c3d4e5f60718');
+        expect(lSrc.badExample).toBe('if (a == b) { applyImpulse(); }');
+      }
+    });
+
+    // The §4 commit branch carries TWO SHAs; the old flat test only guarded preimageCommitSha.
+    // Each malformed-SHA case keeps the OTHER SHA valid so the rejection can ONLY be the regex
+    // under test — not a missing-field throw (the rewrap landmine: a bad value must live INSIDE
+    // preimageSource; a top-level leftover SHA is now rejected by the strict outer object too).
+    // The asserted message text is the GCA-requested regression guard (the message is wired).
+    it('rejects a commit preimageSource with a malformed preimageCommitSha (other SHA valid)', () => {
+      expect(() =>
+        AuthoredFixtureSchema.parse({
+          ...authored.positiveFixtures[0],
+          preimageSource: {
+            kind: 'commit',
+            preimageCommitSha: 'nope',
+            mergeCommitSha: 'b'.repeat(40),
+          },
+        }),
+      ).toThrow(/preimageCommitSha must be a 40-character lowercase hex commit SHA/);
+    });
+
+    it('rejects a commit preimageSource with a malformed mergeCommitSha (other SHA valid)', () => {
+      expect(() =>
+        AuthoredFixtureSchema.parse({
+          ...authored.positiveFixtures[0],
+          preimageSource: {
+            kind: 'commit',
+            preimageCommitSha: 'c'.repeat(40),
+            mergeCommitSha: 'nope',
+          },
+        }),
+      ).toThrow(/mergeCommitSha must be a 40-character lowercase hex commit SHA/);
+    });
+
+    it('rejects a fixture carrying a leftover flat SHA alongside preimageSource (strict outer — CR outside-diff)', () => {
+      // A partial migration (preimageSource added but a stale flat mergeCommitSha left behind) must
+      // fail LOUD under `.strict()`, never validate-and-silently-strip the leftover key (FM(d)).
+      expect(() =>
+        AuthoredFixtureSchema.parse({
+          ...authored.positiveFixtures[0],
+          mergeCommitSha: 'b'.repeat(40), // leftover flat field — unknown to the strict fixture
+        }),
+      ).toThrow();
+    });
+
+    // ANTI-VACUITY fast-fail (GCA finding; strategy#767-blessed). Identical preimage/postimage sides
+    // are an UNCONDITIONALLY vacuous control — rejected at intake. This is NOT the §4 differential
+    // (that's C/D); it only catches the degenerate identical-sides case (zero-false-positive).
+    it('rejects a lesson fixture whose badExample equals its goodExample (vacuous — identical sides)', () => {
+      expect(() =>
+        AuthoredFixtureSchema.parse({
+          ...authoredLesson.positiveFixtures[0],
+          preimageSource: {
+            kind: 'lesson',
+            lessonRef: 'a1b2c3d4e5f60718',
+            badExample: 'if (a == b) {}',
+            goodExample: '  if (a == b) {}  ', // trim-equal → still vacuous (non-mutating compare)
+          },
+        }),
+      ).toThrow(/identical sides|must differ/i);
+    });
+
+    it('rejects a commit fixture whose preimageCommitSha equals its mergeCommitSha (vacuous — identical sides)', () => {
+      expect(() =>
+        AuthoredFixtureSchema.parse({
+          ...authored.positiveFixtures[0],
+          preimageSource: {
+            kind: 'commit',
+            preimageCommitSha: 'a'.repeat(40),
+            mergeCommitSha: 'a'.repeat(40),
+          },
+        }),
+      ).toThrow(/identical pre\/post commit|must differ/i);
+    });
+
+    it('rejects a lesson preimageSource whose lessonRef is a path or mutable alias (immutable 16-hex id only)', () => {
+      for (const badRef of [
+        'docs/lessons/foo.md',
+        'latest',
+        'a1b2c3d4e5f60718x',
+        'A1B2C3D4E5F60718',
+      ]) {
+        expect(() =>
+          PreimageSourceSchema.parse({
+            kind: 'lesson',
+            lessonRef: badRef,
+            badExample: 'x == y',
+            goodExample: 'abs(x - y) < EPS',
+          }),
+        ).toThrow();
+      }
+    });
+
+    it('rejects a lesson preimageSource with a whitespace-only badExample or goodExample (vacuous control)', () => {
+      const base = { kind: 'lesson' as const, lessonRef: 'a1b2c3d4e5f60718' };
+      expect(() =>
+        PreimageSourceSchema.parse({ ...base, badExample: '   ', goodExample: 'ok' }),
+      ).toThrow();
+      expect(() =>
+        PreimageSourceSchema.parse({ ...base, badExample: 'bad', goodExample: '  ' }),
+      ).toThrow();
+    });
+
+    it('rejects a fixture missing preimageSource entirely (§4 source is required)', () => {
+      const { preimageSource: _omit, ...noSource } = authored.positiveFixtures[0];
+      void _omit;
+      expect(() => AuthoredFixtureSchema.parse(noSource)).toThrow();
+    });
+
+    it('rejects a preimageSource with a missing or unknown kind (discriminated union)', () => {
+      const validLessonBody = {
+        lessonRef: 'a1b2c3d4e5f60718',
+        badExample: 'x == y',
+        goodExample: 'abs(x - y) < EPS',
+      };
+      // No kind at all, and a bogus kind on an otherwise-valid lesson body — both fail the discriminator.
+      expect(() => PreimageSourceSchema.parse(validLessonBody)).toThrow();
+      expect(() => PreimageSourceSchema.parse({ kind: 'bogus', ...validLessonBody })).toThrow();
+    });
+
+    it('rejects a cross-branch leak — a lesson key under kind:commit (strict branch, FM(d))', () => {
+      expect(() =>
+        PreimageSourceSchema.parse({
+          kind: 'commit',
+          preimageCommitSha: 'c'.repeat(40),
+          mergeCommitSha: 'b'.repeat(40),
+          badExample: 'x == y', // foreign key — strict branch fails LOUD, never silently stripped
+        }),
+      ).toThrow();
+    });
+
+    it('does not mutate whitespace-padded (but non-empty) lesson exemplars (non-mutating validator)', () => {
+      const padded = '  if (a == b) {}  ';
+      const parsed = PreimageSourceSchema.parse({
+        kind: 'lesson',
+        lessonRef: 'a1b2c3d4e5f60718',
+        badExample: padded,
+        goodExample: padded,
+      });
+      if (parsed.kind === 'lesson') {
+        expect(parsed.badExample).toBe(padded);
+        expect(parsed.goodExample).toBe(padded);
+      }
+    });
+
+    it('accepts a SILENCE-ONLY nearMissSource negative fixture (lesson + commit kinds) — strategy#770', () => {
+      const withNeg = AuthoredProvenanceRecordSchema.parse({
+        ...authored,
+        negativeFixtures: [
+          {
+            filePath: 'src/x.ts',
+            matchedSpan: 'L9',
+            nearMissSource: { kind: 'lesson', example: 'logger.debug("ok")' },
+          },
+          {
+            filePath: 'src/y.ts',
+            matchedSpan: 'L3',
+            nearMissSource: { kind: 'commit', commitSha: 'c'.repeat(40) },
+          },
+        ],
+      });
+      expect(withNeg.negativeFixtures?.[0].nearMissSource.kind).toBe('lesson');
+      expect(withNeg.negativeFixtures?.[1].nearMissSource.kind).toBe('commit');
+    });
+
+    it('rejects the OLD positiveFixtures bad/good-pair shape as a negative (wrong arity, strict — strategy#770)', () => {
+      // The migration's whole point: a §6 negative is one-leg silence-only, not the
+      // two-leg preimageSource pair. A leftover positiveFixtures-shaped negative (carrying
+      // `pr`/`preimageSource`/`contentHash`) must fail LOUD, never validate-and-strip (FM(d)).
+      expect(() =>
+        AuthoredProvenanceRecordSchema.parse({
+          ...authored,
+          negativeFixtures: authoredLesson.positiveFixtures,
+        }),
+      ).toThrow();
+    });
+
+    it('rejects a near-miss carrying a stray pr or a cross-branch source key (strict, FM(d))', () => {
+      const base = { filePath: 'src/x.ts', matchedSpan: 'L9' };
+      // a leftover `pr` (positiveFixtures key) — strict object rejects it
+      expect(() =>
+        AuthoredProvenanceRecordSchema.parse({
+          ...authored,
+          negativeFixtures: [{ ...base, pr: 7, nearMissSource: { kind: 'lesson', example: 'ok' } }],
+        }),
+      ).toThrow();
+      // a commit key under kind:lesson — strict branch fails loud
+      expect(() =>
+        AuthoredProvenanceRecordSchema.parse({
+          ...authored,
+          negativeFixtures: [
+            {
+              ...base,
+              nearMissSource: { kind: 'lesson', example: 'ok', commitSha: 'c'.repeat(40) },
+            },
+          ],
+        }),
+      ).toThrow();
+    });
+
+    it('round-trips a fixture-bearing authored record byte-identically (manifest-hash safe)', () => {
+      for (const rec of [authored, authoredLesson]) {
+        const before = canonicalStringify(rec);
+        const after = canonicalStringify(AuthoredProvenanceRecordSchema.parse(rec));
+        expect(after).toBe(before);
+      }
+    });
+
+    it('does not let an authored record masquerade as mined (kind required on authored branch)', () => {
+      // An authored-shaped payload tagged kind:'mined' must validate as NEITHER branch: it lacks
+      // the mined wire's required fields (mergedPr/reviewThread/commitSha) AND fails the authored
+      // discriminator — so the union REJECTS it rather than letting it round-trip as mined (#2259).
+      expect(() => ProvenanceRecordSchema.parse({ ...authored, kind: 'mined' as const })).toThrow();
+      // And a genuine mined record is never read as authored.
+      expect(isAuthoredProvenance(ProvenanceRecordSchema.parse(minedWire))).toBe(false);
+    });
+  });
+
+  describe('manifest-hash stability', () => {
+    it('serializes a legacy rule byte-identically through a parse round-trip', () => {
+      const before = canonicalStringify(baseRegexRule);
+      const parsed = CompiledRuleSchema.parse(baseRegexRule);
+      const after = canonicalStringify(parsed);
+      expect(after).toBe(before);
+      expect(after).not.toContain('legitimacy');
+      expect(after).not.toContain('ruleClass');
+    });
+
+    it('serializes a STAMPED rule byte-identically across parse round-trips (greptile #2186)', () => {
+      // No schema field mutates a stamped rule's value, so parse →
+      // canonicalStringify → re-parse → canonicalStringify is a fixed point.
+      // Guards the spine-minted rule's hash against silent drift on load.
+      const stamped = { ...baseRegexRule, legitimacy: passingLegitimacy, ruleClass: 'hard' };
+      const first = canonicalStringify(CompiledRuleSchema.parse(stamped));
+      const second = canonicalStringify(CompiledRuleSchema.parse(JSON.parse(first)));
+      expect(second).toBe(first);
+      expect(first).toContain('legitimacy');
+      expect(first).toContain('ruleClass');
+    });
+  });
+});

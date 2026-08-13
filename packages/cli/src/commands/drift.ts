@@ -1,11 +1,3 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-
-import { detectDrift, parseLessonsFile } from '@mmnto/totem';
-
-import { bold, errorColor, log, success as successColor } from '../ui.js';
-import { loadConfig, resolveConfigPath, sanitize } from '../utils.js';
-
 // ─── Constants ──────────────────────────────────────────
 
 const TAG = 'Drift';
@@ -13,19 +5,17 @@ const TAG = 'Drift';
 // ─── Main command ───────────────────────────────────────
 
 export async function driftCommand(): Promise<void> {
+  const path = await import('node:path');
+  const { bold, errorColor, log, success: successColor } = await import('../ui.js');
+  const { loadConfig, resolveConfigPath, sanitize } = await import('../utils.js');
+  const { detectDrift, readAllLessons, TotemError } = await import('@mmnto/totem');
+
   const cwd = process.cwd();
   const configPath = resolveConfigPath(cwd);
   const config = await loadConfig(configPath);
 
-  const lessonsPath = path.join(cwd, config.totemDir, 'lessons.md');
-
-  if (!fs.existsSync(lessonsPath)) {
-    log.dim(TAG, 'No lessons file found — nothing to check.'); // totem-ignore
-    return;
-  }
-
-  const content = fs.readFileSync(lessonsPath, 'utf-8');
-  const lessons = parseLessonsFile(content);
+  const totemDir = path.join(cwd, config.totemDir);
+  const lessons = readAllLessons(totemDir);
 
   if (lessons.length === 0) {
     log.dim(TAG, 'No lessons found — nothing to check.'); // totem-ignore
@@ -56,7 +46,11 @@ export async function driftCommand(): Promise<void> {
   const label = errorColor(bold('FAIL'));
   log.warn(
     TAG,
-    `${label} — ${totalRefs} stale reference(s) across ${drift.length} lesson(s). Run \`totem sync --prune\` to fix.`, // totem-ignore
+    `${label} — ${totalRefs} stale reference(s) across ${drift.length} lesson(s).`, // totem-ignore
   );
-  process.exit(1);
+  throw new TotemError(
+    'DRIFT_FAILED',
+    `${totalRefs} stale reference(s) across ${drift.length} lesson(s).`,
+    'Run `totem sync --prune` to fix.',
+  );
 }

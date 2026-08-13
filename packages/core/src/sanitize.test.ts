@@ -1,7 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ContentType } from './config-schema.js';
-import { sanitize, sanitizeForIngestion } from './sanitize.js';
+import {
+  compileCustomSecrets,
+  isRegexSafe,
+  maskSecrets,
+  sanitize,
+  sanitizeForIngestion,
+} from './sanitize.js';
+import type { CustomSecret } from './secrets.js';
 
 // ─── Base sanitize() ────────────────────────────────
 
@@ -46,6 +53,23 @@ describe('sanitizeForIngestion', () => {
     expect(onWarn).toHaveBeenCalledWith(
       'BiDi override characters detected in docs/evil.md — stripped',
     );
+  });
+
+  // --- Regex statefulness regression (lastIndex drift) ---
+
+  it('strips BiDi overrides at the START of a string', () => {
+    // Regression: .test() on a /g regex advances lastIndex, so .replace()
+    // would miss characters before that position.
+    const result = sanitizeForIngestion('\u202Eleading override', { chunkType: 'spec' });
+    expect(result).toBe('leading override');
+  });
+
+  it('produces identical output on consecutive calls (no lastIndex drift)', () => {
+    const input = '\u202Ebidi\u2066 content';
+    const first = sanitizeForIngestion(input, { chunkType: 'spec' });
+    const second = sanitizeForIngestion(input, { chunkType: 'spec' });
+    expect(first).toBe('bidi content');
+    expect(second).toBe(first);
   });
 
   // --- Invisible characters (prose only) ---
@@ -174,7 +198,7 @@ describe('sanitizeForIngestion', () => {
 
   // --- Content type coverage ---
 
-  it.each(['code', 'spec', 'session_log'] satisfies ContentType[])(
+  it.each(['code', 'spec', 'session_log', 'lesson'] satisfies ContentType[])(
     'handles %s content type without throwing',
     (type) => {
       expect(() => sanitizeForIngestion('normal text', { chunkType: type })).not.toThrow();
@@ -196,5 +220,165 @@ describe('sanitizeForIngestion', () => {
     expect(result).not.toContain('\u2066');
     expect(result).not.toContain('\u2069');
     expect(onWarn).toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DLP Secret Masking
+// ---------------------------------------------------------------------------
+
+describe('maskSecrets', () => {
+  it('masks OpenAI API keys', () => {
+    expect(maskSecrets('key is sk-abc123def456ghi789jkl012mno')).toContain('[REDACTED]');
+  });
+
+  it('masks GitHub tokens', () => {
+    expect(maskSecrets('token ghp_abc123def456ghi789jkl012mno345')).toContain('[REDACTED]');
+  });
+
+  it('masks AWS access keys', () => {
+    expect(maskSecrets('AKIAIOSFODNN7EXAMPLE')).toContain('[REDACTED]');
+  });
+
+  it('masks npm tokens', () => {
+    expect(maskSecrets('npm_abcdefghijklmnopqrstu')).toContain('[REDACTED]');
+  });
+
+  it('masks Google API keys', () => {
+    expect(maskSecrets('AIzaSyD1234567890abcdefghijklmnopqrstuv')).toContain('[REDACTED]');
+  });
+
+  it('masks quoted secret assignments preserving key name', () => {
+    expect(maskSecrets('api_key = "sk_live_abc123def456ghi789"')).toBe('api_key = "[REDACTED]"');
+    expect(maskSecrets("password: 'supersecrettoken12345678'")).toBe("password: '[REDACTED]'");
+  });
+
+  it('masks unquoted secret assignments', () => {
+    expect(maskSecrets('api_key=sk_live_abc123def456ghi789')).toContain('[REDACTED]');
+    expect(maskSecrets('SECRET=myverylongsecrettokenvalue1234')).toContain('[REDACTED]');
+  });
+
+  it('preserves normal text', () => {
+    const text = 'This is a normal code comment about authentication.';
+    expect(maskSecrets(text)).toBe(text);
+  });
+
+  it('preserves short strings that look like keys', () => {
+    // Too short to be a real key
+    expect(maskSecrets('sk-short')).toBe('sk-short');
+  });
+
+  it('fully redacts sk-proj- tokens without partial leakage', () => {
+    const token = 'sk-proj-abcdef1234567890abcdef1234567890';
+    const result = maskSecrets(`key is ${token}`);
+    expect(result).toBe('key is [REDACTED]');
+    expect(result).not.toContain('sk-proj-');
+  });
+
+  it('still redacts plain sk- tokens', () => {
+    const token = 'sk-abcdef1234567890abcdef1234567890';
+    const result = maskSecrets(`key is ${token}`);
+    expect(result).toBe('key is [REDACTED]');
+    expect(result).not.toContain('sk-');
+  });
+
+  // --- Custom secrets (user-defined DLP patterns) ---
+
+  describe('custom secrets', () => {
+    it('properly escapes literal secrets with regex control characters', () => {
+      const customs: CustomSecret[] = [{ type: 'literal', value: 'sk_token+xyz$' }];
+      const result = maskSecrets('my key is sk_token+xyz$ ok', customs);
+      expect(result).toBe('my key is [REDACTED_CUSTOM] ok');
+    });
+
+    it('handles pattern type secrets', () => {
+      const customs: CustomSecret[] = [{ type: 'pattern', value: 'internal-service-\\d+' }];
+      const result = maskSecrets('calling internal-service-42 now', customs);
+      expect(result).toBe('calling [REDACTED_CUSTOM] now');
+    });
+
+    it('applies custom secrets after built-in patterns', () => {
+      const customs: CustomSecret[] = [{ type: 'literal', value: 'my-corp-token-abc123' }];
+      const input = 'keys: sk-abc123def456ghi789jkl012mno and my-corp-token-abc123';
+      const result = maskSecrets(input, customs);
+      expect(result).toContain('[REDACTED]');
+      expect(result).toContain('[REDACTED_CUSTOM]');
+      expect(result).not.toContain('sk-abc123def456ghi789jkl012mno');
+      expect(result).not.toContain('my-corp-token-abc123');
+    });
+
+    it('ignores invalid regex patterns without crashing', () => {
+      const customs: CustomSecret[] = [
+        { type: 'pattern', value: '[unclosed bracket' },
+        { type: 'literal', value: 'valid-secret-1234' },
+      ];
+      const result = maskSecrets('found valid-secret-1234 here', customs);
+      expect(result).toBe('found [REDACTED_CUSTOM] here');
+    });
+
+    it('with no custom secrets works as before', () => {
+      const text = 'This is a normal code comment about authentication.';
+      expect(maskSecrets(text)).toBe(text);
+      expect(maskSecrets(text, undefined)).toBe(text);
+      expect(maskSecrets(text, [])).toBe(text);
+    });
+
+    it('uses [REDACTED_CUSTOM] tag for custom secrets', () => {
+      const customs: CustomSecret[] = [{ type: 'literal', value: 'super-secret-value!' }];
+      const result = maskSecrets('data: super-secret-value! end', customs);
+      expect(result).toBe('data: [REDACTED_CUSTOM] end');
+      expect(result).not.toContain('[REDACTED]');
+    });
+  });
+});
+
+// ─── isRegexSafe() ─────────────────────────────────
+
+describe('isRegexSafe', () => {
+  it('accepts safe patterns', () => {
+    expect(isRegexSafe('[A-Z0-9]{10,}')).toBe(true);
+    expect(isRegexSafe('CORP-[A-Z]{5}')).toBe(true);
+    expect(isRegexSafe('sk-[a-zA-Z0-9_-]{20,}')).toBe(true);
+  });
+
+  it('rejects catastrophic backtracking patterns', () => {
+    expect(isRegexSafe('(a+)+$')).toBe(false);
+    expect(isRegexSafe('(a+){10,}$')).toBe(false);
+    expect(isRegexSafe('(.*a){20}')).toBe(false);
+  });
+
+  it('returns false for invalid regex', () => {
+    expect(isRegexSafe('[unclosed')).toBe(false);
+  });
+});
+
+// ─── compileCustomSecrets() safe-regex ─────────────
+
+describe('compileCustomSecrets safe-regex validation', () => {
+  it('skips unsafe patterns and calls onWarn', () => {
+    const warnings: string[] = [];
+    const secrets: CustomSecret[] = [
+      { type: 'pattern', value: '(a+)+$' },
+      { type: 'pattern', value: '[A-Z]{5}' },
+    ];
+    const result = compileCustomSecrets(secrets, (msg) => warnings.push(msg));
+    expect(result).toHaveLength(1);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('ReDoS');
+  });
+
+  it('allows safe patterns through', () => {
+    const secrets: CustomSecret[] = [
+      { type: 'pattern', value: 'CORP-[A-Z0-9]{10,}' },
+      { type: 'literal', value: 'my-secret' },
+    ];
+    const result = compileCustomSecrets(secrets);
+    expect(result).toHaveLength(2);
+  });
+
+  it('does not validate literal secrets (they are escaped)', () => {
+    const secrets: CustomSecret[] = [{ type: 'literal', value: '(a+)+$' }];
+    const result = compileCustomSecrets(secrets);
+    expect(result).toHaveLength(1);
   });
 });

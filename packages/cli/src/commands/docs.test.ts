@@ -6,7 +6,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { DocTarget } from '@mmnto/totem';
 
-import { DOCS_SYSTEM_PROMPT, docsCommand, extractUpdatedDocument } from './docs.js';
+import { cleanTmpDir } from '../test-utils.js';
+import {
+  assemblePrompt,
+  DOCS_SYSTEM_PROMPT,
+  docsCommand,
+  extractUpdatedDocument,
+  resolveIsUserFacing,
+  stripIssueRefs,
+  stripMarketingTerms,
+} from './docs.js';
 
 // ─── Mocks ──────────────────────────────────────────────
 
@@ -71,7 +80,12 @@ function mockConfig(docs?: DocTarget[]): void {
     totemDir: '.totem',
     lanceDir: '.lancedb',
     ignorePatterns: [],
+    indexIgnorePatterns: [],
+    shieldIgnorePatterns: [],
+    shieldAutoLearn: false,
     contextWarningThreshold: 40_000,
+    searchRelevanceFloor: 0.25,
+    review: { sourceExtensions: ['.ts', '.tsx', '.js', '.jsx'] },
   });
 }
 
@@ -80,6 +94,8 @@ function mockConfig(docs?: DocTarget[]): void {
 describe('docsCommand', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Suppress expected stderr from saga validator rejections and doc processing (#547)
+    vi.spyOn(console, 'error').mockImplementation(() => {});
     // Reset return values (clearAllMocks only clears call records, not implementations)
     vi.mocked(isFileDirty).mockReturnValue(false);
     vi.mocked(runOrchestrator).mockResolvedValue(
@@ -91,7 +107,7 @@ describe('docsCommand', () => {
 
   afterEach(() => {
     vi.restoreAllMocks();
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    cleanTmpDir(tmpDir);
   });
 
   it('throws when no docs configured', async () => {
@@ -117,13 +133,13 @@ describe('docsCommand', () => {
   it('filters docs with --only', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' },
     ]);
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
-    writeDoc(tmpDir, 'docs/roadmap.md', '# Old Roadmap\n');
+    writeDoc(tmpDir, 'docs/wiki/roadmap.md', '# Old Roadmap\n');
 
-    await docsCommand([], { only: 'readme' });
+    await docsCommand([], { only: 'readme', yes: true });
 
     // Only one orchestrator call (for README.md)
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
@@ -143,8 +159,8 @@ describe('docsCommand', () => {
     vi.mocked(isFileDirty).mockReturnValue(true);
     writeDoc(tmpDir, 'README.md', '# Old README\n');
 
-    // Should not throw
-    await docsCommand([], { dryRun: true });
+    // Should not throw (dry-run still needs --yes for non-TTY)
+    await docsCommand([], { dryRun: true, yes: true });
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
 
     // File should NOT be modified in dry-run
@@ -157,7 +173,7 @@ describe('docsCommand', () => {
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
 
-    await docsCommand([], {});
+    await docsCommand([], { yes: true });
 
     const content = fs.readFileSync(path.join(tmpDir, 'README.md'), 'utf-8');
     expect(content).toContain('Updated README');
@@ -166,21 +182,21 @@ describe('docsCommand', () => {
   it('skips files that do not exist', async () => {
     mockConfig([{ path: 'nonexistent.md', description: 'missing', trigger: 'post-release' }]);
 
-    // Should not throw — just skip
-    await docsCommand([], {});
+    // Should not throw — just skip (needs --yes for non-TTY)
+    await docsCommand([], { yes: true });
     expect(runOrchestrator).not.toHaveBeenCalled();
   });
 
   it('processes multiple docs sequentially', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' },
     ]);
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
-    writeDoc(tmpDir, 'docs/roadmap.md', '# Old Roadmap\n');
+    writeDoc(tmpDir, 'docs/wiki/roadmap.md', '# Old Roadmap\n');
 
-    await docsCommand([], {});
+    await docsCommand([], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(2);
   });
@@ -196,7 +212,7 @@ describe('docsCommand', () => {
       '<updated_document>\n# Roadmap\n\n- [ ] Phase 1 complete\n- [ ] Phase 2\n</updated_document>',
     );
 
-    await docsCommand([], {});
+    await docsCommand([], { yes: true });
 
     // File should NOT be modified — original preserved
     const content = fs.readFileSync(path.join(tmpDir, 'README.md'), 'utf-8');
@@ -214,7 +230,7 @@ describe('docsCommand', () => {
       '<updated_document>\n# Big Doc\n\nTiny.\n</updated_document>',
     );
 
-    await docsCommand([], {});
+    await docsCommand([], { yes: true });
 
     // File should NOT be modified — original preserved
     const content = fs.readFileSync(path.join(tmpDir, 'README.md'), 'utf-8');
@@ -229,7 +245,7 @@ describe('docsCommand', () => {
     // Simulate truncated response — opening tag but no closing tag
     vi.mocked(runOrchestrator).mockResolvedValue('<updated_document>\n# Truncated content');
 
-    await docsCommand([], {});
+    await docsCommand([], { yes: true });
 
     // File should NOT be modified
     const content = fs.readFileSync(path.join(tmpDir, 'README.md'), 'utf-8');
@@ -241,13 +257,13 @@ describe('docsCommand', () => {
   it('targets a single doc by path', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' as const },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
     ]);
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
-    writeDoc(tmpDir, 'docs/roadmap.md', '# Old Roadmap\n');
+    writeDoc(tmpDir, 'docs/wiki/roadmap.md', '# Old Roadmap\n');
 
-    await docsCommand(['README.md'], {});
+    await docsCommand(['README.md'], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
   });
@@ -255,15 +271,19 @@ describe('docsCommand', () => {
   it('targets multiple docs by path', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' as const },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
-      { path: 'docs/architecture.md', description: 'arch', trigger: 'post-release' as const },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
+      {
+        path: 'docs/reference/architecture.md',
+        description: 'arch',
+        trigger: 'post-release' as const,
+      },
     ]);
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
-    writeDoc(tmpDir, 'docs/roadmap.md', '# Old Roadmap\n');
-    writeDoc(tmpDir, 'docs/architecture.md', '# Old Arch\n');
+    writeDoc(tmpDir, 'docs/wiki/roadmap.md', '# Old Roadmap\n');
+    writeDoc(tmpDir, 'docs/reference/architecture.md', '# Old Arch\n');
 
-    await docsCommand(['README.md', 'docs/roadmap.md'], {});
+    await docsCommand(['README.md', 'docs/wiki/roadmap.md'], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(2);
   });
@@ -271,12 +291,12 @@ describe('docsCommand', () => {
   it('normalizes ./prefix in positional paths', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' as const },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
     ]);
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
 
-    await docsCommand(['./README.md'], {});
+    await docsCommand(['./README.md'], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
   });
@@ -294,7 +314,7 @@ describe('docsCommand', () => {
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
 
-    await docsCommand(['README.md', 'README.md'], {});
+    await docsCommand(['README.md', 'README.md'], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
   });
@@ -304,7 +324,7 @@ describe('docsCommand', () => {
 
     writeDoc(tmpDir, 'README.md', '# Old README\n');
 
-    await docsCommand(['README.md', './README.md'], {});
+    await docsCommand(['README.md', './README.md'], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
   });
@@ -312,7 +332,7 @@ describe('docsCommand', () => {
   it('throws when both positional paths and --only are provided', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' as const },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
     ]);
 
     await expect(docsCommand(['README.md'], { only: 'roadmap' })).rejects.toThrow(
@@ -326,7 +346,7 @@ describe('docsCommand', () => {
     writeDoc(tmpDir, 'README.md', '# Old README\n');
 
     // Absolute path should resolve to the same relative config key
-    await docsCommand([path.join(tmpDir, 'README.md')], {});
+    await docsCommand([path.join(tmpDir, 'README.md')], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
   });
@@ -334,18 +354,30 @@ describe('docsCommand', () => {
   it('scopes dirty check to targeted docs only', async () => {
     mockConfig([
       { path: 'README.md', description: 'readme', trigger: 'post-release' as const },
-      { path: 'docs/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
+      { path: 'docs/wiki/roadmap.md', description: 'roadmap', trigger: 'post-release' as const },
     ]);
 
     // Only roadmap is dirty, but we're targeting README
-    vi.mocked(isFileDirty).mockImplementation((_cwd, filePath) => filePath === 'docs/roadmap.md');
+    vi.mocked(isFileDirty).mockImplementation(
+      (_cwd, filePath) => filePath === 'docs/wiki/roadmap.md',
+    );
     writeDoc(tmpDir, 'README.md', '# Old README\n');
-    writeDoc(tmpDir, 'docs/roadmap.md', '# Old Roadmap\n');
+    writeDoc(tmpDir, 'docs/wiki/roadmap.md', '# Old Roadmap\n');
 
     // Should succeed — README is not dirty
-    await docsCommand(['README.md'], {});
+    await docsCommand(['README.md'], { yes: true });
 
     expect(runOrchestrator).toHaveBeenCalledTimes(1);
+  });
+
+  // ─── Confirmation gate (#847) ─────────────────────────
+
+  it('rejects docs command without --yes in non-interactive environment', async () => {
+    mockConfig([{ path: 'README.md', description: 'readme', trigger: 'post-release' }]);
+    writeDoc(tmpDir, 'README.md', '# Old README\n');
+
+    // Explicitly set isTTY: false for deterministic test behavior
+    await expect(docsCommand([], { isTTY: false })).rejects.toThrow(/non-interactive/);
   });
 });
 
@@ -371,9 +403,60 @@ describe('DOCS_SYSTEM_PROMPT', () => {
     expect(DOCS_SYSTEM_PROMPT).not.toMatch(/\d+ characters/);
   });
 
-  it('limits PR reference density', () => {
-    expect(DOCS_SYSTEM_PROMPT).toContain('PR References');
-    expect(DOCS_SYSTEM_PROMPT).toContain('1-3 per sub-bullet');
+  it('prohibits issue/PR references in user-facing docs', () => {
+    expect(DOCS_SYSTEM_PROMPT).toContain('No Issue/PR References');
+    expect(DOCS_SYSTEM_PROMPT).toContain('NEVER include GitHub issue or PR references');
+  });
+
+  it('prohibits internal jargon', () => {
+    expect(DOCS_SYSTEM_PROMPT).toContain('No Internal Jargon');
+    expect(DOCS_SYSTEM_PROMPT).toContain('Pipeline 1');
+  });
+
+  it('includes pinned content to protect the tagline', () => {
+    expect(DOCS_SYSTEM_PROMPT).toContain('## Pinned Content');
+    expect(DOCS_SYSTEM_PROMPT).toContain('brilliant goldfish');
+    expect(DOCS_SYSTEM_PROMPT).toContain('Commitment section');
+  });
+
+  it('injects staleness protocol into system prompt', () => {
+    expect(DOCS_SYSTEM_PROMPT).toContain('Staleness Protocol');
+    expect(DOCS_SYSTEM_PROMPT).toContain('Ground Truth');
+    expect(DOCS_SYSTEM_PROMPT).not.toContain('Conservative Updates');
+  });
+});
+
+// ─── assemblePrompt ─────────────────────────────────────
+
+describe('assemblePrompt', () => {
+  it('includes ground truth header when activeWork is provided', async () => {
+    const doc = { path: 'README.md', description: 'readme', trigger: 'post-release' as const };
+    const result = await assemblePrompt(
+      doc,
+      '# README\n',
+      { tag: 'v1.0.0', gitLog: 'abc feat: test', closedIssues: '' },
+      '# Active Work\n- ticket 1',
+      'system prompt',
+      '/fake/cwd',
+      '.totem',
+    );
+    expect(result).toContain('GROUND TRUTH');
+    expect(result).toContain('active_work');
+  });
+
+  it('includes safety instruction when activeWork is empty', async () => {
+    const doc = { path: 'README.md', description: 'readme', trigger: 'post-release' as const };
+    const result = await assemblePrompt(
+      doc,
+      '# README\n',
+      { tag: 'v1.0.0', gitLog: 'abc feat: test', closedIssues: '' },
+      '',
+      'system prompt',
+      '/fake/cwd',
+      '.totem',
+    );
+    expect(result).toContain('may be stale');
+    expect(result).not.toContain('GROUND TRUTH');
   });
 });
 
@@ -396,5 +479,181 @@ describe('extractUpdatedDocument', () => {
   it('handles extra whitespace around tags', () => {
     const input = '  <updated_document>\n# Content\n  </updated_document>  ';
     expect(extractUpdatedDocument(input)).toBe('# Content');
+  });
+});
+
+// ─── stripIssueRefs ─────────────────────────────────────
+
+describe('stripIssueRefs', () => {
+  it('strips parenthesized single refs', () => {
+    expect(stripIssueRefs('security hardening (#714)')).toBe('security hardening');
+  });
+
+  it('strips parenthesized multi refs', () => {
+    expect(stripIssueRefs('fixes (#714, #801)')).toBe('fixes');
+  });
+
+  it('strips "fixes #NNN" style refs', () => {
+    expect(stripIssueRefs('applied patch (fixes #793)')).toBe('applied patch');
+  });
+
+  it('strips standalone refs in prose', () => {
+    expect(stripIssueRefs('security hardening #801 was applied')).toBe(
+      'security hardening was applied',
+    );
+  });
+
+  it('preserves markdown anchors', () => {
+    expect(stripIssueRefs('[link](#my-heading)')).toBe('[link](#my-heading)');
+  });
+
+  it('preserves short numbers', () => {
+    expect(stripIssueRefs('use #42 as the answer')).toBe('use #42 as the answer');
+  });
+
+  it('cleans double spaces left behind', () => {
+    expect(stripIssueRefs('feature (#714) is ready')).toBe('feature is ready');
+  });
+});
+
+// ─── stripMarketingTerms ────────────────────────────────
+
+describe('stripMarketingTerms', () => {
+  it('replaces "comprehensive" with "thorough"', () => {
+    expect(stripMarketingTerms('A comprehensive review of the system')).toBe(
+      'A thorough review of the system',
+    );
+  });
+
+  it('replaces "robust" with "reliable"', () => {
+    expect(stripMarketingTerms('robust error handling')).toBe('reliable error handling');
+  });
+
+  it('replaces "guarantees" with "ensures"', () => {
+    expect(stripMarketingTerms('This guarantees compliance')).toBe('This ensures compliance');
+  });
+
+  it('preserves capitalization pattern during replacement', () => {
+    expect(stripMarketingTerms('COMPREHENSIVE and Robust')).toBe('THOROUGH and Reliable');
+    expect(stripMarketingTerms('Seamlessly integrated')).toBe('Smoothly integrated');
+  });
+
+  it('preserves content without marketing terms', () => {
+    const clean = 'This system uses deterministic rules for enforcement.';
+    expect(stripMarketingTerms(clean)).toBe(clean);
+  });
+
+  it('preserves marketing terms inside code blocks', () => {
+    const withCode = 'A comprehensive API.\n\n```ts\nconst robust = true;\n```\n\nRobust system.';
+    const result = stripMarketingTerms(withCode);
+    expect(result).toContain('const robust = true;');
+    expect(result).toContain('A thorough API.');
+    expect(result).toContain('Reliable system.');
+  });
+
+  it('preserves marketing terms inside inline code', () => {
+    expect(stripMarketingTerms('Use `comprehensive` flag')).toBe('Use `comprehensive` flag');
+  });
+
+  it('replaces singular "guarantee"', () => {
+    expect(stripMarketingTerms('we guarantee compatibility')).toBe('we ensure compatibility');
+  });
+
+  it('preserves marketing terms inside URLs', () => {
+    expect(stripMarketingTerms('See https://example.com/state-of-the-art for details')).toBe(
+      'See https://example.com/state-of-the-art for details',
+    );
+  });
+
+  it('preserves marketing terms inside Markdown link targets', () => {
+    expect(stripMarketingTerms('[guide](https://robust-api.com/docs)')).toBe(
+      '[guide](https://robust-api.com/docs)',
+    );
+  });
+
+  it('preserves manual_content blocks from marketing term replacement (#866)', () => {
+    const input =
+      'A comprehensive guide. <manual_content>comprehensive and robust</manual_content> A robust API.';
+    const result = stripMarketingTerms(input);
+    expect(result).toContain('<manual_content>comprehensive and robust</manual_content>');
+    expect(result).toContain('A thorough guide.');
+    expect(result).toContain('A reliable API.');
+  });
+
+  it('preserves manual_content blocks with attributes (#866)', () => {
+    const input = '<manual_content id="intro">comprehensive overview</manual_content>';
+    expect(stripMarketingTerms(input)).toBe(input);
+  });
+
+  it('preserves manual_content blocks containing code blocks (#866)', () => {
+    const input =
+      '<manual_content>\n```js\nconst comprehensive = true;\n```\nA comprehensive guide.\n</manual_content>';
+    expect(stripMarketingTerms(input)).toBe(input);
+  });
+});
+
+// ─── DOCS_SYSTEM_PROMPT includes marketing ban ──────────
+
+describe('DOCS_SYSTEM_PROMPT marketing ban', () => {
+  it('includes banned marketing terms in system prompt', () => {
+    expect(DOCS_SYSTEM_PROMPT).toContain('comprehensive');
+    expect(DOCS_SYSTEM_PROMPT).toContain('robust');
+    expect(DOCS_SYSTEM_PROMPT).toContain('seamless');
+    expect(DOCS_SYSTEM_PROMPT).toContain('No Marketing Language');
+  });
+});
+
+// ─── resolveIsUserFacing ────────────────────────────────
+
+describe('resolveIsUserFacing', () => {
+  it('returns true for readme.md when userFacing is undefined', () => {
+    expect(
+      resolveIsUserFacing({ path: 'README.md', description: 'readme', trigger: 'post-release' }),
+    ).toBe(true);
+  });
+
+  it('returns true for readme.md regardless of case when userFacing is undefined', () => {
+    expect(
+      resolveIsUserFacing({ path: 'Readme.md', description: 'readme', trigger: 'post-release' }),
+    ).toBe(true);
+    expect(
+      resolveIsUserFacing({
+        path: 'docs/readme.md',
+        description: 'readme',
+        trigger: 'post-release',
+      }),
+    ).toBe(true);
+  });
+
+  it('returns false for non-readme files when userFacing is undefined', () => {
+    expect(
+      resolveIsUserFacing({
+        path: 'docs/wiki/roadmap.md',
+        description: 'roadmap',
+        trigger: 'post-release',
+      }),
+    ).toBe(false);
+  });
+
+  it('returns true for non-readme files when userFacing is true', () => {
+    expect(
+      resolveIsUserFacing({
+        path: 'docs/reference/architecture.md',
+        description: 'arch',
+        trigger: 'post-release',
+        userFacing: true,
+      }),
+    ).toBe(true);
+  });
+
+  it('returns false for readme files when userFacing is false', () => {
+    expect(
+      resolveIsUserFacing({
+        path: 'README.md',
+        description: 'readme',
+        trigger: 'post-release',
+        userFacing: false,
+      }),
+    ).toBe(false);
   });
 });

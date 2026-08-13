@@ -1,10 +1,12 @@
-import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { globSync } from 'glob';
 
 import type { IngestTarget } from '../config-schema.js';
 import { DEFAULT_IGNORE_PATTERNS } from '../config-schema.js';
+import { describeSafeExecError, safeExec } from '../sys/exec.js';
+import { sanitizeForTerminal } from '../terminal-sanitize.js';
 
 export interface ResolvedFile {
   absolutePath: string;
@@ -13,32 +15,53 @@ export interface ResolvedFile {
 }
 
 /**
+ * Parse null-delimited git output into normalized forward-slash paths.
+ */
+function parseGitPaths(output: string): string[] {
+  return output
+    .split('\0')
+    .filter(Boolean)
+    .map((f) => f.replace(/\\/g, '/'));
+}
+
+/**
  * Get the set of non-gitignored files in the project.
+ * Includes files inside git submodules via --recurse-submodules.
  * Returns null if git is unavailable or the project is not a git repo.
  */
 function getGitNonIgnoredFiles(
   projectRoot: string,
   onWarn?: (msg: string) => void,
 ): Set<string> | null {
+  const execOpts = { cwd: projectRoot };
+
   try {
-    const output = execFileSync(
+    // Parent repo: tracked + untracked (non-ignored) files
+    const output = safeExec(
       'git',
       ['ls-files', '-z', '--cached', '--others', '--exclude-standard'],
-      {
-        cwd: projectRoot,
-        encoding: 'utf-8',
-        maxBuffer: 10 * 1024 * 1024,
-        shell: process.platform === 'win32',
-      },
+      execOpts,
     );
-    return new Set(
-      output
-        .split('\0')
-        .filter(Boolean)
-        .map((f) => f.replace(/\\/g, '/')),
-    );
+    const files = new Set(parseGitPaths(output));
+
+    // Submodules: --recurse-submodules only supports --cached,
+    // but submodule files we care about are always committed.
+    try {
+      const subOutput = safeExec(
+        'git',
+        ['ls-files', '-z', '--cached', '--recurse-submodules'],
+        execOpts,
+      );
+      for (const f of parseGitPaths(subOutput)) {
+        files.add(f);
+      }
+    } catch {
+      // --recurse-submodules unsupported or no submodules — ignore
+    }
+
+    return files;
   } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
+    const errorMsg = describeSafeExecError(err);
     const msg =
       errorMsg.includes('ENOENT') || errorMsg.includes('not found')
         ? `Command 'git' not found. Cannot use .gitignore for filtering. Falling back to ignorePatterns only.`
@@ -74,8 +97,34 @@ export function resolveFiles(
       if (nonIgnored && !nonIgnored.has(relativePath)) continue;
       seen.add(relativePath);
 
+      const absolutePath = path.join(projectRoot, rawPath);
+
+      // Symlink guard (mmnto-ai/totem#2354): the downstream read follows the
+      // link (fs.readFileSync), so a symlink under an ingest glob would pull its
+      // TARGET content into the index — a link escaping the repo
+      // (e.g. -> /etc/passwd, -> ~/.ssh/id_rsa) exfiltrates host files into a
+      // queryable store, and the git-tracked-set gate does NOT catch it
+      // (a symlink is a valid git entry, mode 120000). Skip symlinks entirely,
+      // mirroring run-compiled-rules.ts's mode-120000 exclusion, and surface
+      // each skip loudly so the drop is never silent (Tenet 13 sensor).
+      let isSymlink = false;
+      try {
+        isSymlink = fs.lstatSync(absolutePath).isSymbolicLink();
+        // totem-context: intentional fall-through — a raced/ENOENT lstat means there is no stat-able target at this path; treat it as a non-symlink and let the downstream read (which has its own error guard) degrade to honest-absent. Aborting sync over one unstattable path would be inconsistent with that skip-don't-abort read behavior.
+      } catch {
+        // degrade to non-symlink — see totem-context above
+      }
+      if (isSymlink) {
+        if (onWarn) {
+          onWarn(
+            `Skipping symlink under ingest target (not indexed): ${sanitizeForTerminal(relativePath)}`,
+          );
+        }
+        continue;
+      }
+
       results.push({
-        absolutePath: path.join(projectRoot, rawPath),
+        absolutePath,
         relativePath,
         target,
       });
@@ -89,6 +138,63 @@ export function resolveFiles(
 const SAFE_GIT_REF = /^[a-zA-Z0-9_./:~^{}\-]+$/;
 
 /**
+ * Files changed since a git ref, with the tracked-diff and untracked sets kept
+ * SEPARATE (mmnto-ai/totem#2562). The semantics differ: "tracked and in the
+ * diff" means the file moved since the ref, but "untracked" only means git has
+ * no history for it — an untracked file is a PERMANENT member of that set, so
+ * treating membership as "changed since the ref" would re-classify it forever.
+ * The full-sync resume consumes only the `tracked` half (its moved-since-epoch
+ * signal for everything else is mtime); `getChangedFiles` below unions both
+ * for the incremental diff, where "new file ⇒ index it" is exactly right.
+ */
+export function getChangedFilesDetailed(
+  projectRoot: string,
+  sinceRef: string = 'HEAD~1',
+  onWarn?: (msg: string) => void,
+): { tracked: string[]; untracked: string[] } | null {
+  if (!SAFE_GIT_REF.test(sinceRef)) {
+    if (onWarn) {
+      onWarn(`Invalid git ref "${sinceRef}" — falling back to full sync.`);
+    }
+    return null;
+  }
+
+  const splitZ = (out: string): string[] =>
+    out
+      .split('\0')
+      .map((p) => p.replace(/\\/g, '/'))
+      .filter(Boolean);
+
+  try {
+    const diffOutput = safeExec('git', ['diff', '-z', '--name-only', sinceRef], {
+      cwd: projectRoot,
+    });
+
+    // Also pick up untracked files (new files not yet committed)
+    let untrackedOutput = '';
+    try {
+      untrackedOutput = safeExec('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
+        cwd: projectRoot,
+      });
+    } catch (err) {
+      if (onWarn) {
+        onWarn(`Failed to list untracked files: ${describeSafeExecError(err)}`);
+      }
+    }
+
+    const tracked = new Set(splitZ(diffOutput));
+    const untracked = new Set(splitZ(untrackedOutput));
+    return { tracked: [...tracked], untracked: [...untracked] };
+  } catch (err) {
+    const msg = `Failed to get changed files from git. Error: ${describeSafeExecError(err)}`;
+    if (onWarn) {
+      onWarn(msg);
+    }
+    return null;
+  }
+}
+
+/**
  * Get files changed since a given git ref (e.g., HEAD~1 or a commit SHA).
  * Also includes untracked files so new files are picked up on incremental sync.
  * Uses -z for null-delimited output consistent with getGitNonIgnoredFiles.
@@ -98,51 +204,9 @@ export function getChangedFiles(
   sinceRef: string = 'HEAD~1',
   onWarn?: (msg: string) => void,
 ): string[] | null {
-  if (!SAFE_GIT_REF.test(sinceRef)) {
-    if (onWarn) {
-      onWarn(`Invalid git ref "${sinceRef}" — falling back to full sync.`);
-    }
-    return null;
-  }
-
-  try {
-    const diffOutput = execFileSync('git', ['diff', '-z', '--name-only', sinceRef], {
-      cwd: projectRoot,
-      encoding: 'utf-8',
-      shell: process.platform === 'win32',
-    });
-
-    // Also pick up untracked files (new files not yet committed)
-    let untrackedOutput = '';
-    try {
-      untrackedOutput = execFileSync('git', ['ls-files', '-z', '--others', '--exclude-standard'], {
-        cwd: projectRoot,
-        encoding: 'utf-8',
-        shell: process.platform === 'win32',
-      });
-    } catch (err) {
-      if (onWarn) {
-        onWarn(
-          `Failed to list untracked files: ${err instanceof Error ? err.message : String(err)}`,
-        );
-      }
-    }
-
-    const paths = new Set(
-      (diffOutput + untrackedOutput)
-        .split('\0')
-        .map((p) => p.replace(/\\/g, '/'))
-        .filter(Boolean),
-    );
-
-    return [...paths];
-  } catch (err) {
-    const msg = `Failed to get changed files from git. Error: ${err instanceof Error ? err.message : String(err)}`;
-    if (onWarn) {
-      onWarn(msg);
-    }
-    return null;
-  }
+  const detailed = getChangedFilesDetailed(projectRoot, sinceRef, onWarn);
+  if (detailed === null) return null;
+  return [...new Set([...detailed.tracked, ...detailed.untracked])];
 }
 
 /**
@@ -150,14 +214,12 @@ export function getChangedFiles(
  */
 export function getHeadSha(projectRoot: string, onWarn?: (msg: string) => void): string | null {
   try {
-    return execFileSync('git', ['rev-parse', 'HEAD'], {
+    return safeExec('git', ['rev-parse', 'HEAD'], {
       cwd: projectRoot,
-      encoding: 'utf-8',
-      shell: process.platform === 'win32',
-    }).trim();
+    });
   } catch (err) {
     if (onWarn) {
-      onWarn(`Failed to read HEAD SHA: ${err instanceof Error ? err.message : String(err)}`);
+      onWarn(`Failed to read HEAD SHA: ${describeSafeExecError(err)}`);
     }
     return null;
   }

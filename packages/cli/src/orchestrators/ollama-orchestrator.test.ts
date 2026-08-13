@@ -121,14 +121,25 @@ describe('invokeOllamaOrchestrator', () => {
   it('suggests ollama serve in connection error', async () => {
     mockFetch.mockRejectedValueOnce(new Error('ECONNREFUSED'));
 
-    await expect(invokeOllamaOrchestrator(baseOpts)).rejects.toThrow('ollama serve');
+    await expect(invokeOllamaOrchestrator(baseOpts)).rejects.toSatisfy((err: Error) => {
+      return (
+        err.message.includes('Cannot connect to Ollama') &&
+        'recoveryHint' in err &&
+        (err as { recoveryHint: string }).recoveryHint.includes('ollama serve')
+      );
+    });
   });
 
   it('throws VRAM-friendly error on 500 with numCtx', async () => {
     mockFetch.mockResolvedValueOnce(new Response('out of memory', { status: 500 }));
 
-    await expect(invokeOllamaOrchestrator({ ...baseOpts, numCtx: 32768 })).rejects.toThrow(
-      'lowering numCtx',
+    await expect(invokeOllamaOrchestrator({ ...baseOpts, numCtx: 32768 })).rejects.toSatisfy(
+      (err: Error) => {
+        return (
+          'recoveryHint' in err &&
+          (err as { recoveryHint: string }).recoveryHint.includes('lowering numCtx')
+        );
+      },
     );
   });
 
@@ -143,7 +154,12 @@ describe('invokeOllamaOrchestrator', () => {
   it('throws VRAM-friendly error on 500 without numCtx', async () => {
     mockFetch.mockResolvedValueOnce(new Response('out of memory', { status: 500 }));
 
-    await expect(invokeOllamaOrchestrator(baseOpts)).rejects.toThrow('smaller numCtx');
+    await expect(invokeOllamaOrchestrator(baseOpts)).rejects.toSatisfy((err: Error) => {
+      return (
+        'recoveryHint' in err &&
+        (err as { recoveryHint: string }).recoveryHint.includes('smaller numCtx')
+      );
+    });
   });
 
   it('handles missing token counts gracefully', async () => {
@@ -162,11 +178,11 @@ describe('invokeOllamaOrchestrator', () => {
     expect(result.content).toBe('');
   });
 
-  it('wraps non-500 API errors', async () => {
+  it('throws model-not-installed for 404 with model not found', async () => {
     mockFetch.mockResolvedValueOnce(new Response('model not found', { status: 404 }));
 
     await expect(invokeOllamaOrchestrator(baseOpts)).rejects.toThrow(
-      '[Totem Error] Ollama API error (404)',
+      "Ollama model 'gemma2:27b' is not installed",
     );
   });
 
@@ -189,5 +205,47 @@ describe('invokeOllamaOrchestrator', () => {
     await expect(invokeOllamaOrchestrator(baseOpts)).rejects.toThrow(
       'Unexpected response from Ollama API',
     );
+  });
+
+  // ─── systemPrompt threading (mmnto/totem#1291 Phase 3 cascade fix) ──
+
+  describe('systemPrompt threading', { timeout: 15000 }, () => {
+    it('prepends a system role message when systemPrompt is provided', async () => {
+      mockFetch.mockResolvedValueOnce(okResponse({ message: { content: 'ok' }, done: true }));
+
+      await invokeOllamaOrchestrator({
+        ...baseOpts,
+        systemPrompt: 'COMPILER_SYSTEM_PROMPT',
+      });
+
+      const [, fetchOpts] = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(fetchOpts.body);
+      expect(body.messages).toEqual([
+        { role: 'system', content: 'COMPILER_SYSTEM_PROMPT' },
+        { role: 'user', content: 'test prompt' },
+      ]);
+    });
+
+    it('omits the system role message when systemPrompt is undefined (backward compat)', async () => {
+      mockFetch.mockResolvedValueOnce(okResponse({ message: { content: 'ok' }, done: true }));
+
+      await invokeOllamaOrchestrator(baseOpts);
+
+      const [, fetchOpts] = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(fetchOpts.body);
+      expect(body.messages).toEqual([{ role: 'user', content: 'test prompt' }]);
+    });
+
+    it('treats an empty systemPrompt the same as undefined (no system role message)', async () => {
+      // GCA round 2 SAFETY INVARIANT: some local model implementations
+      // behave unexpectedly when receiving empty role messages. Match the
+      // parallel checks in anthropic/gemini/openai by treating
+      // empty/undefined the same.
+      mockFetch.mockResolvedValueOnce(okResponse({ message: { content: 'ok' }, done: true }));
+      await invokeOllamaOrchestrator({ ...baseOpts, systemPrompt: '' });
+      const [, fetchOpts] = mockFetch.mock.calls[0]!;
+      const body = JSON.parse(fetchOpts.body);
+      expect(body.messages).toEqual([{ role: 'user', content: 'test prompt' }]);
+    });
   });
 });

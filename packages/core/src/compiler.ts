@@ -1,51 +1,96 @@
+/**
+ * Compiler facade — re-exports from focused modules.
+ *
+ * Schemas and types:  ./compiler-schema.ts
+ * Diff parsing:       ./diff-parser.ts
+ * Rule execution:     ./rule-engine.ts
+ *
+ * This file retains: hashing, regex validation, file I/O, and LLM response parsing.
+ */
+
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 
 import safeRegex from 'safe-regex2';
 import { z } from 'zod';
 
-// ─── Schemas ─────────────────────────────────────────
+import type {
+  AstGrepYamlRule,
+  CompiledRule,
+  CompiledRulesFile,
+  CompilerOutput,
+  NonCompilableEntry,
+  RegexValidation,
+} from './compiler-schema.js';
+import {
+  CompiledRulesFileSchema,
+  CompilerOutputSchema,
+  NonCompilableEntryWriteSchema,
+} from './compiler-schema.js';
+import { TotemParseError } from './errors.js';
 
-export const CompiledRuleSchema = z.object({
-  /** SHA-256 hash (first 16 hex chars) of heading + body — detects edits */
-  lessonHash: z.string(),
-  /** Human-readable heading from the lesson (for diagnostics) */
-  lessonHeading: z.string(),
-  /** Regex pattern to match against added diff lines */
-  pattern: z.string(),
-  /** Human-readable violation message shown when the pattern matches */
-  message: z.string(),
-  /** Engine type — only 'regex' for MVP */
-  engine: z.literal('regex'),
-  /** ISO timestamp of when this rule was compiled */
-  compiledAt: z.string(),
-  /** Optional file glob patterns — rule only applies to matching files (e.g., ["*.sh", "*.yml"]) */
-  fileGlobs: z.array(z.string()).optional(),
-});
+// ─── Re-exports (preserve public API) ──────────────
 
-export type CompiledRule = z.infer<typeof CompiledRuleSchema>;
+export type {
+  AstContext,
+  AstGrepYamlRule,
+  AuthoredFixture,
+  AuthoredProvenanceRecord,
+  CompiledRule,
+  CompiledRulesFile,
+  CompilerOutput,
+  DiffAddition,
+  Legitimacy,
+  MinedProvenanceRecord,
+  NapiConfig,
+  NonCompilableEntry,
+  NonCompilableReasonCode,
+  ProvenanceRecord,
+  RegexValidation,
+  RuleEventCallback,
+  RuleEventContext,
+  Violation,
+} from './compiler-schema.js';
+export {
+  AstGrepYamlRuleSchema,
+  AuthoredFixtureSchema,
+  type AuthoredNegativeFixture,
+  AuthoredNegativeFixtureSchema,
+  AuthoredProvenanceRecordSchema,
+  CompiledRuleSchema,
+  CompiledRulesFileSchema,
+  CompilerOutputSchema,
+  deriveRuleClass,
+  isAuthoredProvenance,
+  isMinedProvenance,
+  LEDGER_RETRY_PENDING_CODES,
+  LegitimacySchema,
+  MinedProvenanceWireSchema,
+  NapiConfigSchema,
+  type NearMissSource,
+  NearMissSourceSchema,
+  NonCompilableEntryReadSchema,
+  NonCompilableEntryWriteSchema,
+  NonCompilableReasonCodeSchema,
+  type PreimageSource,
+  PreimageSourceSchema,
+  provenanceKind,
+  ProvenanceRecordSchema,
+  shouldWriteToLedger,
+} from './compiler-schema.js';
+export { extractAddedLines } from './diff-parser.js';
+export {
+  applyAstRulesToAdditions,
+  applyRules,
+  applyRulesToAdditions,
+  type CoreLogger,
+  extractJustification,
+  fileMatchesGlobs,
+  matchesGlob,
+  type RuleEngineContext,
+} from './rule-engine.js';
 
-export const CompiledRulesFileSchema = z.object({
-  version: z.literal(1),
-  rules: z.array(CompiledRuleSchema),
-});
-
-export type CompiledRulesFile = z.infer<typeof CompiledRulesFileSchema>;
-
-// ─── Violation type ──────────────────────────────────
-
-export interface Violation {
-  /** The rule that was violated */
-  rule: CompiledRule;
-  /** The file path from the diff where the violation occurred */
-  file: string;
-  /** The matching line content */
-  line: string;
-  /** 1-based line number within the diff hunk (approximate) */
-  lineNumber: number;
-}
-
-// ─── Hashing ─────────────────────────────────────────
+// ─── Hashing ────────────────────────────────────────
 
 const HASH_SLICE_LEN = 16;
 
@@ -58,12 +103,7 @@ export function hashLesson(heading: string, body: string): string {
     .slice(0, HASH_SLICE_LEN);
 }
 
-// ─── Regex validation ────────────────────────────────
-
-export interface RegexValidation {
-  valid: boolean;
-  reason?: string;
-}
+// ─── Regex validation ───────────────────────────────
 
 /**
  * Validate that a pattern string is a syntactically valid RegExp
@@ -83,247 +123,89 @@ export function validateRegex(pattern: string): RegexValidation {
   return { valid: true };
 }
 
-// ─── Diff parsing ────────────────────────────────────
-
-/** Syntactic context of a diff line, determined by AST analysis. */
-export type AstContext = 'code' | 'string' | 'comment' | 'regex';
-
-export interface DiffAddition {
-  file: string;
-  line: string;
-  lineNumber: number;
-  /** Content of the preceding line in the new file (context or added), null if first in hunk */
-  precedingLine: string | null;
-  /** Syntactic context from AST analysis — undefined means not classified (fail-open as code) */
-  astContext?: AstContext;
-}
+// ─── File I/O ───────────────────────────────────────
 
 /**
- * Extract added lines from a unified diff.
- * Returns only lines that start with `+` (excluding `+++` file headers).
- * Tracks the preceding line content (context or added) for suppression support.
- */
-export function extractAddedLines(diff: string): DiffAddition[] {
-  const additions: DiffAddition[] = [];
-  let currentFile = '';
-  let lineNum = 0;
-  let prevLineContent: string | null = null;
-  let insideHunk = false;
-
-  for (const rawLine of diff.split('\n')) {
-    // New file block — reset hunk state
-    if (rawLine.startsWith('diff ')) {
-      insideHunk = false;
-      continue;
-    }
-
-    // Track current file from diff headers — only BEFORE the first hunk.
-    // Inside a hunk, a line starting with +++ is an added line whose
-    // content happens to start with ++ (e.g., template literal test fixtures
-    // containing embedded diff headers like "+++ b/some-file.ts").
-    if (!insideHunk && rawLine.startsWith('+++')) {
-      let pathPart = rawLine.slice(4); // strip "+++ "
-      // Strip surrounding quotes (git adds them for paths with spaces)
-      if (pathPart.startsWith('"') && pathPart.endsWith('"')) {
-        pathPart = pathPart.slice(1, -1);
-      }
-      // Strip the "b/" prefix git uses for the destination file
-      currentFile = pathPart.startsWith('b/') ? pathPart.slice(2) : pathPart;
-      prevLineContent = null;
-      continue;
-    }
-
-    // Parse hunk header for line numbers: @@ -X,Y +Z,W @@
-    const hunkMatch = rawLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
-    if (hunkMatch) {
-      insideHunk = true;
-      lineNum = parseInt(hunkMatch[1]!, 10) - 1; // will be incremented on first line
-      prevLineContent = null;
-      continue;
-    }
-
-    // Skip diff metadata lines
-    if (rawLine.startsWith('---') || rawLine.startsWith('index ')) {
-      continue;
-    }
-
-    // Count lines for position tracking
-    if (rawLine.startsWith('+')) {
-      lineNum++;
-      const lineContent = rawLine.slice(1); // strip the leading +
-      additions.push({
-        file: currentFile,
-        line: lineContent,
-        lineNumber: lineNum,
-        precedingLine: prevLineContent,
-      });
-      prevLineContent = lineContent;
-    } else if (rawLine.startsWith('-')) {
-      // Deleted line — NOT in new file, don't update prevLineContent or lineNum
-    } else if (rawLine.startsWith(' ')) {
-      // Context line — in new file
-      lineNum++;
-      prevLineContent = rawLine.slice(1);
-    }
-    // Ignore other lines (e.g., '\ No newline at end of file')
-  }
-
-  return additions;
-}
-
-// ─── Rule execution ──────────────────────────────────
-
-// ─── File glob matching ─────────────────────────────
-
-/**
- * Check if a file path matches a single glob pattern.
- * Supports: `*.ext`, `**\/*.ext`, `dir/**\/*.ext`, `dir/**`, literal filenames.
- */
-function matchesGlob(filePath: string, glob: string): boolean {
-  // Normalize separators
-  const normalized = filePath.replace(/\\/g, '/');
-  // *.ext — match file extension anywhere
-  if (glob.startsWith('*.')) {
-    return normalized.endsWith(glob.slice(1));
-  }
-  // **/*.ext — same as *.ext (match extension anywhere in path)
-  if (glob.startsWith('**/')) {
-    return matchesGlob(normalized, glob.slice(3));
-  }
-  // dir/**/*.ext or dir/** — directory-prefixed recursive glob
-  const dstarIdx = glob.indexOf('/**/');
-  if (dstarIdx > 0) {
-    const prefix = glob.slice(0, dstarIdx);
-    const suffix = glob.slice(dstarIdx + 4); // after "/**/"
-    if (!normalized.startsWith(prefix + '/')) return false;
-    const rest = normalized.slice(prefix.length + 1);
-    return suffix === '' || matchesGlob(rest, suffix);
-  }
-  // dir/** — match anything under directory (no trailing pattern)
-  if (glob.endsWith('/**')) {
-    const prefix = glob.slice(0, -3);
-    return normalized.startsWith(prefix + '/');
-  }
-  // Literal filename match (e.g., "Dockerfile")
-  return normalized === glob || normalized.endsWith('/' + glob);
-}
-
-function fileMatchesGlobs(filePath: string, globs: string[]): boolean {
-  const positive = globs.filter((g) => !g.startsWith('!'));
-  const negative = globs.filter((g) => g.startsWith('!')).map((g) => g.slice(1));
-
-  const positiveMatch = positive.length === 0 || positive.some((g) => matchesGlob(filePath, g));
-  const negativeMatch = negative.some((g) => matchesGlob(filePath, g));
-
-  return positiveMatch && !negativeMatch;
-}
-
-// ─── Rule execution ──────────────────────────────────
-
-// ─── Inline suppression ─────────────────────────────
-
-const SUPPRESS_MARKER = 'totem-ignore';
-const SUPPRESS_NEXT_LINE_MARKER = 'totem-ignore-next-line';
-
-/**
- * Check if a line should be suppressed via inline directives.
- * Supports two forms:
- * - Same-line: code(); // totem-ignore  (suppresses all rules on this line)
- * - Next-line: // totem-ignore-next-line on the preceding line (suppresses all rules on this line)
+ * Load compiled rules from a JSON file. Returns empty array if file missing.
  *
- * Syntax-agnostic: works with any comment style (//, #, HTML comments, block comments).
+ * Filters out rules with inert lifecycle status so the lint execution path,
+ * rule tester, and every other consumer that enforces rules treats them as
+ * silenced (#1336 — "The Archive Lie"). Three inert states qualify:
+ *   - `'archived'` — explicitly silenced via curation (#1336).
+ *   - `'untested-against-codebase'` — Stage 4 (mmnto-ai/totem#1682) ran
+ *     against the consumer's codebase and produced zero matches. The
+ *     rule's runtime behavior is unknown; the schema docstring at
+ *     `compiler-schema.ts:100-107` commits to inert-like-archived
+ *     semantics, and this filter is what enforces that contract.
+ *   - `'pending-verification'` — pack rule installed via `totem install`
+ *     in the cloud-compile bootstrap path (mmnto-ai/totem#1684). Stage 4
+ *     has not yet run on the consumer's codebase. The rule stays inert
+ *     until the first-lint promotion interceptor runs the verifier and
+ *     replaces the status with one of the three terminal lifecycle
+ *     values. The interceptor itself runs BEFORE this filter and reads
+ *     from the unfiltered manifest via {@link loadCompiledRulesFile}.
+ *
+ * Rules without a `status` field (legacy manifests compiled before the
+ * lifecycle state was added) are treated as active.
+ *
+ * Admin and write-path consumers that need to see archived rules (e.g.
+ * `totem doctor --pr` lifecycle management, `totem compile` pruning) should
+ * use {@link loadCompiledRulesFile} instead, which returns the unfiltered
+ * manifest so inert entries remain visible for telemetry and state
+ * transitions.
  */
-function isSuppressed(line: string, precedingLine: string | null): boolean {
-  // Same-line: 'totem-ignore' substring also matches 'totem-ignore-next-line',
-  // so directive lines themselves are inherently suppressed.
-  if (line.includes(SUPPRESS_MARKER)) return true;
-
-  // Next-line: preceding line (context or added) contains the next-line directive
-  if (precedingLine != null && precedingLine.includes(SUPPRESS_NEXT_LINE_MARKER)) return true;
-
-  return false;
-}
-
-/**
- * Apply compiled rules against pre-extracted diff additions.
- * Skips additions with non-code AST context (strings, comments, regex).
- */
-export function applyRulesToAdditions(
-  rules: CompiledRule[],
-  additions: DiffAddition[],
-): Violation[] {
-  if (additions.length === 0 || rules.length === 0) return [];
-
-  const violations: Violation[] = [];
-
-  for (const rule of rules) {
-    let re: RegExp;
-    try {
-      re = new RegExp(rule.pattern);
-    } catch {
-      // Skip invalid patterns (shouldn't happen if validation gate works)
-      continue;
-    }
-
-    for (const addition of additions) {
-      // Skip non-code lines when AST context is available
-      if (addition.astContext && addition.astContext !== 'code') continue;
-
-      // Skip if rule has fileGlobs and this file doesn't match
-      if (rule.fileGlobs && rule.fileGlobs.length > 0) {
-        if (!fileMatchesGlobs(addition.file, rule.fileGlobs)) continue;
-      }
-
-      // Skip if suppressed via inline directive
-      if (isSuppressed(addition.line, addition.precedingLine)) continue;
-
-      if (re.test(addition.line)) {
-        violations.push({
-          rule,
-          file: addition.file,
-          line: addition.line,
-          lineNumber: addition.lineNumber,
-        });
-      }
-    }
-  }
-
-  return violations;
-}
-
-/**
- * Apply compiled rules against added lines from a diff.
- * Returns all violations found.
- * @param excludeFiles — file paths to skip (e.g., compiled-rules.json to avoid self-matches)
- */
-export function applyRules(
-  rules: CompiledRule[],
-  diff: string,
-  excludeFiles?: string[],
-): Violation[] {
-  let additions = extractAddedLines(diff);
-  if (additions.length === 0 || rules.length === 0) return [];
-
-  if (excludeFiles && excludeFiles.length > 0) {
-    const excluded = new Set(excludeFiles);
-    additions = additions.filter((a) => !excluded.has(a.file));
-  }
-
-  return applyRulesToAdditions(rules, additions);
-}
-
-// ─── File I/O ────────────────────────────────────────
-
-/** Load compiled rules from a JSON file. Returns empty array if file missing or invalid. */
-export function loadCompiledRules(rulesPath: string): CompiledRule[] {
+export function loadCompiledRules(
+  rulesPath: string,
+  onWarn?: (msg: string) => void,
+): CompiledRule[] {
   if (!fs.existsSync(rulesPath)) return [];
 
   try {
     const raw = fs.readFileSync(rulesPath, 'utf-8');
-    const parsed = CompiledRulesFileSchema.parse(JSON.parse(raw));
-    return parsed.rules;
-  } catch {
+    const json = JSON.parse(raw) as unknown;
+    const parsed = CompiledRulesFileSchema.parse(json);
+    return parsed.rules.filter(
+      (r) =>
+        r.status !== 'archived' &&
+        r.status !== 'untested-against-codebase' &&
+        r.status !== 'pending-verification',
+    );
+  } catch (err) {
+    if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    if (err instanceof z.ZodError) {
+      throw new TotemParseError(
+        `Invalid compiled-rules.json: ${err.issues.map((i) => i.message).join('; ')}`,
+        "Delete the file and run 'totem compile' to regenerate it.",
+      );
+    }
+    onWarn?.(`Could not load compiled rules: ${err instanceof Error ? err.message : String(err)}`);
     return [];
+  }
+}
+
+/** Load the full compiled rules file (rules + non-compilable cache). */
+export function loadCompiledRulesFile(
+  rulesPath: string,
+  onWarn?: (msg: string) => void,
+): CompiledRulesFile {
+  if (!fs.existsSync(rulesPath)) return { version: 1, rules: [], nonCompilable: [] };
+
+  try {
+    const raw = fs.readFileSync(rulesPath, 'utf-8');
+    const json = JSON.parse(raw) as unknown;
+    return CompiledRulesFileSchema.parse(json);
+  } catch (err) {
+    if (err instanceof Error && (err as NodeJS.ErrnoException).code === 'ENOENT') {
+      return { version: 1, rules: [], nonCompilable: [] };
+    }
+    if (err instanceof z.ZodError) {
+      throw new TotemParseError(
+        `Invalid compiled-rules.json: ${err.issues.map((i) => i.message).join('; ')}`,
+        "Delete the file and run 'totem compile' to regenerate it.",
+      );
+    }
+    onWarn?.(`Could not load compiled rules: ${err instanceof Error ? err.message : String(err)}`);
+    return { version: 1, rules: [], nonCompilable: [] };
   }
 }
 
@@ -336,32 +218,192 @@ export function saveCompiledRules(rulesPath: string, rules: CompiledRule[]): voi
   });
 }
 
-// ─── LLM response parsing ───────────────────────────
+/**
+ * Save the full compiled rules file (rules + non-compilable cache).
+ *
+ * Every `nonCompilable` entry is validated through the strict Write schema
+ * before serialization per the Read/Write schema invariant (lesson
+ * 400fed87). If a caller ever passes Read-schema-shaped data back through
+ * save, we surface the bug as a `TotemParseError` rather than letting the
+ * permissive union silently re-accept legacy shapes on disk.
+ */
+export function saveCompiledRulesFile(rulesPath: string, data: CompiledRulesFile): void {
+  const validatedNonCompilable: NonCompilableEntry[] | undefined = data.nonCompilable?.map(
+    (entry, idx) => {
+      const parsed = NonCompilableEntryWriteSchema.safeParse(entry);
+      if (!parsed.success) {
+        throw new TotemParseError(
+          `nonCompilable[${idx}] failed strict write validation: ${parsed.error.issues
+            .map((i) => i.message)
+            .join('; ')}`,
+          'Route ledger writes through NonCompilableEntryWriteSchema so legacy shapes do not leak back to disk.',
+          parsed.error,
+        );
+      }
+      return parsed.data;
+    },
+  );
+  const payload: CompiledRulesFile = validatedNonCompilable
+    ? { ...data, nonCompilable: validatedNonCompilable }
+    : data;
+  fs.writeFileSync(rulesPath, JSON.stringify(payload, null, 2) + '\n', {
+    encoding: 'utf-8',
+    mode: 0o644,
+  });
+}
 
-/** Schema for the structured JSON the LLM returns when compiling a lesson. */
-export const CompilerOutputSchema = z.object({
-  compilable: z.boolean(),
-  pattern: z.string().optional(),
-  message: z.string().optional(),
-  fileGlobs: z.array(z.string()).optional(),
-});
-
-export type CompilerOutput = z.infer<typeof CompilerOutputSchema>;
+// ─── Glob sanitization ─────────────────────────────
 
 /**
- * Parse the LLM's compilation response. Extracts JSON from the response text,
- * validates it, and returns the structured output or null if unparseable.
+ * Expand brace patterns, normalize shallow globs, and strip unsupported syntax.
+ * e.g., "**\/*.{ts,js}" → ["**\/*.ts", "**\/*.js"]
+ * e.g., "*.ts" → "**\/*.ts" (shallow → recursive)
  */
+export function sanitizeFileGlobs(globs: unknown[]): string[] {
+  const result: string[] = [];
+  for (const glob of globs) {
+    if (typeof glob !== 'string') continue;
+    const trimmed = glob.trim();
+    if (!trimmed || trimmed === '!') continue;
+
+    // Expand brace patterns: **/*.{ts,js} → **/*.ts, **/*.js
+    const braceMatch = /^(.*?)\{([^}]+)\}(.*)$/.exec(trimmed);
+    if (braceMatch) {
+      const prefix = braceMatch[1]!;
+      const alternatives = braceMatch[2]!.split(',').map((s) => s.trim());
+      const suffix = braceMatch[3]!;
+      // Recursively expand remaining brace groups in each result
+      for (const alt of alternatives) {
+        result.push(...sanitizeFileGlobs([prefix + alt + suffix]));
+      }
+      continue;
+    }
+    result.push(normalizeShallowGlob(trimmed));
+  }
+  return result;
+}
+
+/**
+ * Normalize shallow glob patterns to recursive form for external tool compatibility.
+ * - `*.ts` → `**\/*.ts` (no `/` and doesn't start with `**\/`)
+ * - `*` → `**\/*` (bare wildcard)
+ * - `src/*.ts` → left alone (contains `/`, intentionally scoped)
+ * - `**\/*.ts` → left alone (already recursive)
+ * - `!*.ts` → `!**\/*.ts` (negated shallow glob)
+ */
+function normalizeShallowGlob(glob: string): string {
+  // Handle negation: strip prefix, normalize, re-add
+  const negated = glob.startsWith('!');
+  const bare = negated ? glob.slice(1) : glob;
+
+  // Already recursive or contains a directory separator → leave alone
+  if (bare.startsWith('**/') || bare.includes('/')) {
+    return glob;
+  }
+
+  // Shallow pattern — prepend **/
+  return `${negated ? '!' : ''}**/${bare}`;
+}
+
+/**
+ * Build engine-specific fields for a compiled rule.
+ *
+ * Overloaded so only the `'ast-grep'` branch accepts a compound
+ * `Record<string, unknown>`; `'regex'` and `'ast'` are string-only.
+ * This prevents callers from passing a compound object to the regex
+ * engine and silently producing `"[object Object]"` via `String(pattern)`.
+ */
+export function engineFields(
+  engine: 'regex' | 'ast',
+  pattern: string,
+): { pattern: string; astQuery?: string };
+export function engineFields(
+  engine: 'ast-grep',
+  pattern: string | Record<string, unknown>,
+): { pattern: string; astGrepPattern?: string; astGrepYamlRule?: AstGrepYamlRule };
+// Wildcard overload for callers whose `engine` discriminator is the
+// union `'regex' | 'ast' | 'ast-grep'` and is resolved at runtime
+// (e.g., compile-lesson.ts:buildManualRule). TypeScript cannot narrow
+// the overload without the literal, so we expose the implementation
+// signature explicitly. The superRefine on `CompiledRuleSchema` is
+// the load-bearing gate; this wildcard merely keeps the type system
+// honest at call sites that legitimately forward the union.
+export function engineFields(
+  engine: 'regex' | 'ast' | 'ast-grep',
+  pattern: string | Record<string, unknown>,
+): {
+  pattern: string;
+  astGrepPattern?: string;
+  astGrepYamlRule?: AstGrepYamlRule;
+  astQuery?: string;
+};
+export function engineFields(
+  engine: 'regex' | 'ast' | 'ast-grep',
+  pattern: string | Record<string, unknown>,
+): {
+  pattern: string;
+  astGrepPattern?: string;
+  astGrepYamlRule?: AstGrepYamlRule;
+  astQuery?: string;
+} {
+  switch (engine) {
+    case 'regex':
+      return { pattern: String(pattern) };
+    case 'ast-grep':
+      // Route strings to the flat field and objects to the compound field.
+      // mmnto/totem#1407 split the fields for explicit mutual exclusion; the
+      // caller is responsible for passing exactly one shape. The superRefine
+      // on CompiledRuleSchema gates the persisted rule.
+      if (typeof pattern === 'string') {
+        return { pattern: '', astGrepPattern: pattern };
+      }
+      return { pattern: '', astGrepYamlRule: pattern as AstGrepYamlRule };
+    case 'ast':
+      return { pattern: '', astQuery: String(pattern) };
+  }
+}
+
+// ─── LLM response parsing ──────────────────────────
+
+/** Strip leading/trailing backtick wrappers (e.g., `` `pattern` ``, `` ```regex\npattern\n``` ``). */
+function stripBacktickWrap(value: string): string {
+  const s = value.trim();
+  // Multi-line code fence: ```lang\n...\n``` or ~~~lang\n...\n~~~
+  const fenceMatch = s.match(/^(```|~~~)[^\n]*\n([\s\S]*?)\n?\1$/);
+  if (fenceMatch) return fenceMatch[2]!.trim();
+  // Single backtick wrap: `pattern` — only strip if content doesn't contain backticks
+  if (s.startsWith('`') && s.endsWith('`') && s.length > 2) {
+    const inner = s.slice(1, -1);
+    if (!inner.includes('`')) return inner.trim();
+  }
+  return s;
+}
+
 export function parseCompilerResponse(response: string): CompilerOutput | null {
   // Try to extract JSON from the response (LLMs often wrap in ```json blocks)
-  const jsonMatch = response.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-  const jsonStr = jsonMatch ? jsonMatch[1]! : response.trim();
+  const jsonMatch = response.match(/(```|~~~)(?:json)?\s*\n?([\s\S]*?)\n?\1/);
+  const jsonStr = (jsonMatch?.[2] ?? response).trim();
 
   try {
     const parsed = JSON.parse(jsonStr);
     const result = CompilerOutputSchema.safeParse(parsed);
     if (!result.success) return null;
-    return result.data;
+
+    const data = result.data;
+    // Strip backtick formatting hallucinations from pattern fields
+    if (typeof data.pattern === 'string' && data.pattern) {
+      data.pattern = stripBacktickWrap(data.pattern);
+    }
+    if (typeof data.astGrepPattern === 'string' && data.astGrepPattern) {
+      data.astGrepPattern = stripBacktickWrap(data.astGrepPattern);
+    }
+    if (typeof data.astQuery === 'string' && data.astQuery) {
+      data.astQuery = stripBacktickWrap(data.astQuery);
+    }
+    if (data.fileGlobs) {
+      data.fileGlobs = data.fileGlobs.map(stripBacktickWrap);
+    }
+    return data;
   } catch {
     return null;
   }

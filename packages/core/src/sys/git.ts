@@ -1,0 +1,578 @@
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import { TotemGitError } from '../errors.js';
+import { safeExec } from './exec.js';
+import { matchesGlob } from './glob.js';
+
+// ─── Constants ──────────────────────────────────────────
+
+const GIT_COMMAND_TIMEOUT_MS = 15_000;
+const GIT_DIFF_MAX_BUFFER = 10 * 1024 * 1024; // 10MB — large diffs (e.g., compiled-rules.json)
+
+/**
+ * Bound on the cause-chain walk in {@link containsNotAGitRepo}. Errors produced
+ * by `safeExec` wrap git stderr one level deep; we allow extra headroom in case
+ * a caller adds its own wrapping layer, but refuse to walk an unbounded chain.
+ */
+const ERROR_CAUSE_WALK_MAX_DEPTH = 8;
+
+function throwIfGitMissing(err: unknown): void {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (msg.includes('ENOENT') || msg.includes('not found')) {
+    throw new TotemGitError(
+      "'git' command not found.",
+      'Ensure Git is installed and in your PATH.',
+      err,
+    );
+  }
+}
+
+// ─── Git helpers ────────────────────────────────────────
+
+export function getGitBranch(cwd: string): string {
+  try {
+    return safeExec('git', ['branch', '--show-current'], { cwd });
+  } catch {
+    // totem-context: best-effort display query — caller surfaces "(unknown)" when git is unavailable, so fail-open is the documented contract (mmnto/totem#1440)
+    return '(unknown)';
+  }
+}
+
+export function getGitStatus(cwd: string): string {
+  try {
+    return safeExec('git', ['status', '--porcelain'], { cwd });
+  } catch {
+    // totem-context: best-effort status query — caller treats missing git as "no changes" for display purposes only (mmnto/totem#1440)
+    return '';
+  }
+}
+
+export function getGitDiff(mode: 'staged' | 'all', cwd: string): string {
+  const args = mode === 'staged' ? ['diff', '--staged'] : ['diff', 'HEAD'];
+  try {
+    return safeExec('git', args, {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+      maxBuffer: GIT_DIFF_MAX_BUFFER,
+    });
+  } catch (err) {
+    throwIfGitMissing(err);
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new TotemGitError(
+      `Failed to get git diff: ${msg}`,
+      'Check that you are inside a Git repository with at least one commit.',
+      err,
+    );
+  }
+}
+
+export function getGitDiffStat(cwd: string): string {
+  try {
+    return safeExec('git', ['diff', 'HEAD', '--stat'], {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+  } catch {
+    // totem-context: best-effort diff summary — empty string is a valid "no changes / git unavailable" surface for this cosmetic helper (mmnto/totem#1440)
+    return '';
+  }
+}
+
+/**
+ * Detect the default branch of the remote (e.g. main, master).
+ * Falls back to 'main' if detection fails.
+ */
+export function getDefaultBranch(cwd: string): string {
+  try {
+    const ref = safeExec('git', ['symbolic-ref', 'refs/remotes/origin/HEAD', '--short'], {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    // ref is like "origin/main" — strip the remote prefix
+    return ref.replace(/^origin\//, '');
+  } catch (err) {
+    throwIfGitMissing(err);
+
+    // Fallback: check local then remote refs for 'main' / 'master'
+    for (const branch of ['main', 'master']) {
+      for (const ref of [branch, `origin/${branch}`]) {
+        try {
+          safeExec('git', ['rev-parse', '--verify', ref], {
+            cwd,
+            timeout: GIT_COMMAND_TIMEOUT_MS,
+          });
+          return branch;
+        } catch {
+          // totem-context: intentional control flow — probing multiple branch candidates, outer function throws if none match (mmnto/totem#1440)
+          // Try next candidate
+        }
+      }
+    }
+    throw new TotemGitError(
+      "Could not determine default branch. Neither 'main' nor 'master' found locally, and 'git symbolic-ref' failed.",
+      "Run 'git remote set-head origin --auto' to configure the default branch, or pass --base explicitly.",
+      err,
+    );
+  }
+}
+
+/**
+ * The branch-vs-base diff PLUS the ref that actually produced it (mmnto-ai/totem#2106
+ * rev-5 item 3). `getGitBranchDiff` returns only the diff text, so a caller that also
+ * needs to know WHICH ref was diffed (for scope/lineage metadata) previously re-probed
+ * ref existence separately — but `origin/<base>` can EXIST yet its `...HEAD` diff FAIL
+ * (unrelated histories / no merge base), in which case the payload is local-based while
+ * a separate existence probe would mislabel it `origin/<base>`. Returning `resolvedBase`
+ * from the diff operation itself couples the recorded ref to the diff that actually ran.
+ */
+export interface GitBranchDiffResult {
+  /** The unified diff text of `<resolvedBase>...HEAD`. */
+  diff: string;
+  /** The ref that PRODUCED the diff — `origin/<base>` when its diff succeeded, else the local `<base>`. */
+  resolvedBase: string;
+}
+
+export function getGitBranchDiffResult(cwd: string, base?: string): GitBranchDiffResult {
+  const baseBranch = base ?? getDefaultBranch(cwd);
+  // Prefer the remote-tracking ref over the local branch (mmnto-ai/totem#2054).
+  // On a feature-branch workflow the local <base> is never checked out → stale,
+  // so `<base>...HEAD` re-includes already-merged code as "new" (false-CRITICALs
+  // in review/lint). `origin/<base>` is the current merged base and is a local
+  // ref (no network); three-dot `...HEAD` resolves merge-base = the true fork
+  // point. Falls back to local <base> when origin is absent (offline / no-remote).
+  // This audit (mmnto-ai/totem#2054) supersedes lesson-8d9946e1's "local before remote" default.
+  // Normalize off any `origin/` prefix first so an already-remote-prefixed base
+  // can't become `origin/origin/<base>` — an invalid ref + wasted spawn (mmnto-ai/totem#2074).
+  const localRef = baseBranch.replace(/^origin\//, '');
+  const refs = [`origin/${localRef}`, localRef];
+  for (const ref of refs) {
+    try {
+      const diff = safeExec('git', ['diff', `${ref}...HEAD`], {
+        cwd,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
+        maxBuffer: GIT_DIFF_MAX_BUFFER,
+      });
+      // The ref whose `...HEAD` diff SUCCEEDED is the one that produced the payload —
+      // record exactly it (rev-5 item 3), so remote-exists-but-diff-fails can never
+      // mislabel a local-based diff as origin-based.
+      return { diff, resolvedBase: ref };
+    } catch (err) {
+      throwIfGitMissing(err);
+      // If this was the last ref, throw
+      if (ref === refs[refs.length - 1]) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new TotemGitError(
+          `Failed to get branch diff (${localRef}...HEAD): ${msg}`,
+          `Ensure the base branch '${localRef}' exists locally or as a remote ref. Try 'git fetch origin ${localRef}'.`,
+          err,
+        );
+      }
+    }
+  }
+  // Unreachable — loop always returns or throws
+  return { diff: '', resolvedBase: localRef };
+}
+
+/**
+ * Branch-vs-base diff text only. Thin wrapper over {@link getGitBranchDiffResult} that
+ * discards `resolvedBase` — retained at its original `string` return so the many
+ * existing callers keep compiling (mmnto-ai/totem#2106 rev-5 item 3, additive change).
+ */
+export function getGitBranchDiff(cwd: string, base?: string): string {
+  return getGitBranchDiffResult(cwd, base).diff;
+}
+
+/**
+ * Run `git diff <range>` for an explicitly supplied ref range (e.g.
+ * `HEAD^..HEAD`, `main...feature`). Used by `totem review --diff` to
+ * bypass the implicit working-tree → staged → branch-vs-base fallback chain.
+ *
+ * Rejects ranges starting with `-` to defuse git-flag injection (e.g.
+ * `--diff --no-index`); `safeExec`'s arg-array form already prevents shell
+ * metacharacter expansion on the range itself.
+ */
+export function getGitDiffRange(cwd: string, range: string): string {
+  const trimmed = range.trim();
+  if (trimmed.length === 0) {
+    throw new TotemGitError(
+      'Empty ref range supplied to --diff.',
+      'Provide a non-empty range, e.g. --diff "HEAD^..HEAD" or --diff "main...feature".',
+    );
+  }
+  if (trimmed.startsWith('-')) {
+    throw new TotemGitError(
+      `Invalid ref range: ${trimmed}. Ranges may not start with '-' (git-flag injection guard).`,
+      'Provide a positional ref range such as "HEAD^..HEAD" without leading dashes.',
+    );
+  }
+  try {
+    return safeExec('git', ['diff', trimmed], {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+      maxBuffer: GIT_DIFF_MAX_BUFFER,
+    });
+  } catch (err) {
+    throwIfGitMissing(err);
+    throw new TotemGitError(
+      `Failed to compute diff for range '${trimmed}'.`,
+      `Verify the range is valid. Try 'git diff ${trimmed}' to confirm git accepts it; missing refs may need 'git fetch origin'.`,
+      err,
+    );
+  }
+}
+
+/**
+ * Get the author date of a tag in YYYY-MM-DD format.
+ * Returns null if tag doesn't exist or lookup fails.
+ */
+export function getTagDate(cwd: string, tag: string): string | null {
+  try {
+    const date = safeExec('git', ['log', '-1', '--format=%aI', tag], {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    return date.slice(0, 10) || null;
+  } catch {
+    // totem-context: best-effort tag lookup — null is the documented "not found / git unavailable" return (mmnto/totem#1440)
+    return null;
+  }
+}
+
+/**
+ * Get the most recent semver tag (e.g., "v0.14.0").
+ * Returns null if no tags exist.
+ */
+export function getLatestTag(cwd: string): string | null {
+  try {
+    return (
+      safeExec('git', ['describe', '--tags', '--abbrev=0'], {
+        cwd,
+        timeout: GIT_COMMAND_TIMEOUT_MS,
+      }) || null
+    );
+  } catch {
+    // totem-context: best-effort tag lookup — null is the documented "no tags / git unavailable" return (mmnto/totem#1440)
+    return null;
+  }
+}
+
+/**
+ * Get git log since a ref (tag or commit), or last N commits as fallback.
+ * Returns one-line-per-commit format: "hash subject".
+ */
+export function getGitLogSince(cwd: string, since?: string, maxCommits = 50): string {
+  const args = since
+    ? ['log', `${since}..HEAD`, '--oneline', `--max-count=${maxCommits}`]
+    : ['log', '--oneline', `-${maxCommits}`];
+  try {
+    return safeExec('git', args, {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+  } catch {
+    // totem-context: best-effort log query — empty string is a valid "no log / git unavailable" surface for briefing/status displays (mmnto/totem#1440)
+    return '';
+  }
+}
+
+/**
+ * Check if a specific file has uncommitted changes (staged or unstaged).
+ *
+ * Fails loud: throws `TotemGitError` when git is absent or errors, so callers
+ * cannot mistake "git broke" for "file is clean" (mmnto/totem#1440). The one
+ * documented silent-false case is "not a git repository" — a legitimate state
+ * for a working directory that happens to sit outside version control.
+ * Callers that truly want silent fallback for OTHER git failures must opt in
+ * explicitly with their own try/catch + `// totem-context:` annotation.
+ */
+export function isFileDirty(cwd: string, filePath: string): boolean {
+  try {
+    const output = safeExec('git', ['status', '--porcelain', '--', filePath], {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    return output.length > 0;
+  } catch (err) {
+    throwIfGitMissing(err);
+    // Narrow-false: mirror the `resolveGitRoot` pattern — "not a git
+    // repository" is a legit state, not a bug. Return false there so callers
+    // running in non-git contexts don't crash. All other git failures throw.
+    if (containsNotAGitRepo(err)) return false;
+    throw new TotemGitError(
+      `Failed to check dirty status for ${filePath}.`,
+      'Ensure you are inside a git repository and the file path is valid.',
+      err,
+    );
+  }
+}
+
+/**
+ * List git-tracked files under `dirAbs`, returned as `dirAbs`-relative
+ * forward-slash paths. Returns `null` (NOT an empty set) when the directory is
+ * outside a git repo OR git is unavailable/errors — the documented signal for
+ * callers to fall back to a filesystem walk rather than treat "git unavailable"
+ * as "nothing tracked." An empty set means the opposite: we ARE in a repo and
+ * genuinely nothing under `dirAbs` is tracked.
+ *
+ * Used by {@link generateInputHash} to exclude untracked working-tree lessons
+ * from the compile-manifest input hash — an untracked MCP scratch lesson must
+ * not diverge the hash and block an unrelated push (mmnto-ai/totem#2051 /
+ * mmnto-ai/totem#2055 working-tree-scope class). Fail-soft to `null` is
+ * deliberate: a git hiccup degrades to the legacy fs-walk (prior behavior),
+ * never a crash.
+ *
+ * Reads git's NUL-delimited output so paths with spaces or unicode parse
+ * exactly; the delimiter is built via `String.fromCharCode(0)` to keep this
+ * source free of a literal control byte.
+ */
+export function listTrackedFilesUnder(repoCwd: string, dirAbs: string): Set<string> | null {
+  const repoRoot = findRepoRootSync(repoCwd);
+  if (repoRoot === null) return null;
+  const prefix = path.relative(repoRoot, dirAbs).replace(/\\/g, '/');
+  // An empty prefix means dirAbs IS the repo root; git rejects an empty
+  // pathspec with a fatal "ambiguous argument", so scan from '.' in that case.
+  const pathspec = prefix === '' ? '.' : prefix;
+  try {
+    // git emits repo-root-relative forward-slash paths on all platforms.
+    const raw = safeExec('git', ['ls-files', '-z', '--', pathspec], {
+      cwd: repoRoot,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    const nul = String.fromCharCode(0);
+    const tracked = new Set<string>();
+    const prefixSlash = prefix === '' ? '' : `${prefix}/`;
+    for (const entry of raw.split(nul)) {
+      if (entry.length === 0) continue;
+      const rel =
+        prefixSlash && entry.startsWith(prefixSlash) ? entry.slice(prefixSlash.length) : entry;
+      tracked.add(rel);
+    }
+    return tracked;
+    // totem-context: fail-soft — git failure degrades to the caller's legacy fs-walk (prior behavior), never masks a real error as "clean" (mmnto-ai/totem#2051)
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the git repository root from any subdirectory.
+ * Returns the normalized absolute path when inside a git repo, or `null` only
+ * when the directory is genuinely outside any git repo (the documented "not
+ * in a git repo" case). Any OTHER git failure — git binary missing, permission
+ * error, timeout, corrupted index — throws `TotemGitError` so callers cannot
+ * confuse "not a repo" with "git broke" (mmnto/totem#1440).
+ */
+/**
+ * Bound the ancestor walk at a generous depth to defuse hypothetical symlink
+ * loops — `path.dirname` already terminates at filesystem roots via the
+ * `parent === current` check, but layered defense doesn't cost anything.
+ */
+const MAX_WALK_DEPTH = 64;
+
+/**
+ * Shared bounded ancestor walk: return the nearest ancestor of `start`
+ * (including `start` itself) satisfying `hasMarker`, else `null`. Single home
+ * for the depth bound + termination logic — it feeds destructive paths
+ * (`eclGc`'s outbox unlink), so the marker variants must not drift apart.
+ */
+function walkUpToMarker(start: string, hasMarker: (dir: string) => boolean): string | null {
+  let current = path.resolve(start);
+  for (let i = 0; i < MAX_WALK_DEPTH; i++) {
+    if (hasMarker(current)) return current;
+    const parent = path.dirname(current);
+    if (parent === current) return null;
+    current = parent;
+  }
+  return null;
+}
+
+/**
+ * Resolve the git repository root via a JS-side walk-up looking for `.git/`,
+ * rather than shelling out to `git rev-parse --show-toplevel`. Sibling to
+ * {@link resolveGitRoot}; prefer this variant when the caller will combine
+ * the returned root with paths derived from `process.cwd()` — git's output
+ * normalizes case + may resolve Windows 8.3 short names (`RUNNER~1`) to long
+ * names (`runneradmin`), and the divergence breaks `path.relative` even when
+ * both paths point at the same directory. A JS-side walk returns a path in
+ * cwd's own form, so downstream `path.relative` works portably.
+ *
+ * Returns `null` when `start` is not inside a git repository (or any parent
+ * is not). Never throws — best-effort by contract. No subprocess overhead.
+ */
+export function findRepoRootSync(start: string): string | null {
+  return walkUpToMarker(start, (dir) => fs.existsSync(path.join(dir, '.git')));
+}
+
+/**
+ * Walk up from `start` to the nearest ancestor that is a Totem repo root: a
+ * directory containing a `.totem/` marker OR a `.git` entry (a directory in a
+ * normal clone, a FILE in a linked worktree — `existsSync` matches both).
+ * Returns that ancestor's absolute path, or `null` when neither marker appears
+ * up to the filesystem root. Never throws — best-effort, pure fs, no git spawn.
+ *
+ * Sibling to {@link findRepoRootSync} (which keys on `.git` alone); this
+ * variant also stops at `.totem/` so a consumer invoked from a SUBDIRECTORY of
+ * a repo — e.g. `.totem/orchestration/<seat>/processed/` — resolves the true
+ * root instead of the subdir. Without it, a cwd-fragile derivation
+ * (`process.cwd()` + `path.dirname`) reads the wrong workspace and can render a
+ * false-clean verdict (mmnto-ai/totem#2312). The `.totem` marker is checked
+ * first so an orchestration-only tree still anchors even where `.git` is a
+ * worktree file the caller might not expect.
+ */
+export function findTotemRepoRootSync(start: string): string | null {
+  return walkUpToMarker(
+    start,
+    (dir) => fs.existsSync(path.join(dir, '.totem')) || fs.existsSync(path.join(dir, '.git')),
+  );
+}
+
+/**
+ * Resolve the effective Totem repo root for a command invoked with an optional
+ * `repoRoot` override: treat `repoRoot ?? cwd` as the WALK START and derive
+ * the root via {@link findTotemRepoRootSync}; a marker-less start (bare test
+ * fixture) is used as-is. Single home for the walk-start-not-definitive-root
+ * contract shared by `pollMail`, `eclGc`, and `eclCompact`
+ * (mmnto-ai/totem#2312).
+ */
+export function resolveTotemRepoRootSync(repoRootOpt: string | undefined, cwd: string): string {
+  const start = path.resolve(repoRootOpt ?? cwd);
+  return findTotemRepoRootSync(start) ?? start;
+}
+
+export function resolveGitRoot(cwd: string): string | null {
+  try {
+    const root = safeExec('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      timeout: GIT_COMMAND_TIMEOUT_MS,
+    });
+    // git returns forward slashes even on Windows — normalize for fs operations
+    return path.normalize(root);
+  } catch (err) {
+    throwIfGitMissing(err);
+    // Narrow-scope null: the only legitimate silent case is "not a git
+    // repository". All other failures re-throw so callers cannot confuse
+    // "not in a repo" with "git broke while asking." Walk the cause chain
+    // because safeExec wraps the git stderr inside `err.cause` while the
+    // outer `err.message` is a generic "Command failed: git rev-parse ..."
+    // wrapper.
+    if (containsNotAGitRepo(err)) return null;
+    throw new TotemGitError(
+      'Failed to resolve git root.',
+      'Check that the working directory is accessible and git is functional.',
+      err,
+    );
+  }
+}
+
+function containsNotAGitRepo(err: unknown): boolean {
+  let cursor: unknown = err;
+  // Walk the cause chain up to `ERROR_CAUSE_WALK_MAX_DEPTH` hops. Coerce each
+  // cursor to string via `.message` when available and `String(cursor)`
+  // otherwise so a cause that is a plain string or object (e.g., raw stderr
+  // surfaced via `Error.cause = stderrString`) still gets matched instead of
+  // silently terminating the chain walk.
+  for (let depth = 0; depth < ERROR_CAUSE_WALK_MAX_DEPTH && cursor != null; depth += 1) {
+    const msg = cursor instanceof Error ? cursor.message : String(cursor);
+    if (/not a git repository/i.test(msg)) return true;
+    cursor = cursor instanceof Error ? cursor.cause : null;
+  }
+  return false;
+}
+
+/**
+ * Filter a unified diff to exclude files matching ignore patterns.
+ * Splits on `diff --git` boundaries and removes sections for ignored files.
+ * Uses matchesGlob from core for consistent glob behavior.
+ */
+export function filterDiffByPatterns(diff: string, patterns: string[]): string {
+  if (patterns.length === 0) return diff;
+
+  const sections = diff.split(/^(?=diff --git )/m);
+  return sections
+    .filter((section) => {
+      // Extract destination path (b/) — handles renames correctly
+      const firstLine = section.substring(0, section.indexOf('\n'));
+      const quoted = firstLine.match(/^diff --git "a\/.*?" "b\/(.*?)"$/);
+      const unquoted = firstLine.match(/^diff --git a\/\S+ b\/(.+)$/);
+      const filePath = quoted?.[1] ?? unquoted?.[1];
+      if (!filePath) return true;
+      return !patterns.some((p) => matchesGlob(filePath, p));
+    })
+    .join(''); // totem-ignore (#669) — joining diff sections, not text fragments
+}
+
+export function extractChangedFiles(diff: string): string[] {
+  const files: string[] = [];
+  for (const line of diff.split('\n')) {
+    if (line.startsWith('diff --git')) {
+      // Handle quoted paths (spaces): diff --git "a/my file.ts" "b/my file.ts"
+      const quoted = line.match(/^diff --git "a\/.+" "b\/(.+)"$/); // totem-ignore — single line match, not iterating
+      if (quoted) {
+        files.push(quoted[1]!);
+        continue;
+      }
+      // Standard unquoted paths: diff --git a/file.ts b/file.ts
+      const unquoted = line.match(/^diff --git a\/.+ b\/(.+)$/); // totem-ignore — single line match
+      if (unquoted) files.push(unquoted[1]!);
+    }
+  }
+  return files;
+}
+
+// ─── Scope inference ───────────────────────────────────
+
+const CODE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.rs', '.go']);
+
+/**
+ * Infer a scope glob suggestion from a list of changed file paths.
+ * Returns glob patterns based on the common directory prefix,
+ * with default test file exclusions.
+ */
+export function inferScopeFromFiles(files: string[]): string[] {
+  // Filter to source code files only (ignore configs, docs, data files)
+  const codeFiles = files.filter((f) => {
+    const dot = f.lastIndexOf('.');
+    if (dot === -1) return false;
+    return CODE_EXTENSIONS.has(f.slice(dot).toLowerCase());
+  });
+
+  if (codeFiles.length === 0) return [];
+
+  // Compute common directory prefix
+  const dirs = codeFiles.map((f) => {
+    const slash = f.lastIndexOf('/');
+    return slash === -1 ? '' : f.slice(0, slash);
+  });
+
+  let prefix = dirs[0]!;
+  for (let i = 1; i < dirs.length; i++) {
+    while (prefix && dirs[i] !== prefix && !dirs[i]!.startsWith(prefix + '/')) {
+      const slash = prefix.lastIndexOf('/');
+      prefix = slash === -1 ? '' : prefix.slice(0, slash);
+    }
+    if (!prefix) break;
+  }
+
+  // No useful common prefix — files are scattered across the repo.
+  // Root-level files (prefix === '') also return empty — too broad to be useful.
+  if (!prefix) return [];
+
+  // Determine dominant extension
+  const extCounts = new Map<string, number>();
+  for (const f of codeFiles) {
+    const dot = f.lastIndexOf('.');
+    const ext = f.slice(dot).toLowerCase();
+    extCounts.set(ext, (extCounts.get(ext) ?? 0) + 1);
+  }
+  let dominantExt = '';
+  let maxCount = 0;
+  for (const [ext, count] of extCounts) {
+    if (count > maxCount) {
+      maxCount = count;
+      dominantExt = ext;
+    }
+  }
+
+  return [`${prefix}/**/*${dominantExt}`, '!**/*.test.*', '!**/*.spec.*'];
+}
