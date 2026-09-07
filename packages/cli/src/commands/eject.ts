@@ -9,6 +9,27 @@ import { writeFileAtomicSync } from '@mmnto/totem/fs-atomic';
 // ─── Constants ──────────────────────────────────────────
 
 const TAG = 'Eject';
+
+/**
+ * True iff `command` is a Totem-installed gate entry, in the exact grammar
+ * `gateCommand()` bakes: the Node executable (`node`, or a path ending in it),
+ * then the wrapper at its install path `.claude/hooks/gate-wrapper.cjs` (bare
+ * or quoted, an absolute or `./` prefix allowed), then `--event`
+ * (mmnto-ai/totem#2799). Anything else is not ours and survives an eject: a
+ * user hook that mentions the wrapper's basename, one that runs a wrapper of
+ * the same name from another directory, or one whose program is not node.
+ */
+export function isInstalledGateCommand(command: string): boolean {
+  const tokens = command
+    .split(/\s+/)
+    .filter((t) => t.length > 0)
+    .map((t) => t.replace(/^['"]|['"]$/g, ''));
+  const [program, wrapper, flag] = tokens;
+  if (program === undefined || wrapper === undefined || flag !== '--event') return false;
+  const isNode = /(^|[\\/])node(\.exe)?$/.test(program);
+  const isWrapper = /(^|[\\/])\.claude[\\/]hooks[\\/]gate-wrapper\.cjs$/.test(wrapper);
+  return isNode && isWrapper;
+}
 const TOTEM_HOOK_MARKER = '[totem] post-merge hook';
 const TOTEM_HOOK_END = '[totem] end post-merge';
 const TOTEM_CHECKOUT_MARKER = '[totem] post-checkout hook';
@@ -17,33 +38,135 @@ const TOTEM_CHECKOUT_END = '[totem] end post-checkout';
 // skills `<!-- [totem] auto-generated … -->` — the first-line gate matches both.
 const TOTEM_FILE_MARKER = '[totem] auto-generated';
 
-/** Files scaffolded by `totem init` that are fully owned by Totem.
+/** The Totem directory when the repo configures none. */
+export const DEFAULT_TOTEM_DIR = '.totem';
+
+/**
+ * Resolve the REPO-LOCAL `totemDir` for eject's removal roster
+ * (mmnto-ai/totem#2692 C5) — a repo that keeps its Totem state somewhere else
+ * must have that directory removed, not a `.totem/` that was never there.
+ *
+ * Repo-local ONLY: the global `~/.totem/` profile declares `totemDir: '.'`, and
+ * eject DELETES what this returns — a leaked global value would aim a recursive
+ * remove at the project root. The same reason the empty / dot / parent-escaping
+ * cases fall back to the default rather than being honored.
+ */
+export async function resolveEjectTotemDir(cwd: string): Promise<string> {
+  const { loadConfig, resolveConfigPath, isGlobalConfigPath } = await import('../utils.js');
+  let configPath: string;
+  try {
+    configPath = resolveConfigPath(cwd);
+    // totem-context: no config anywhere (resolveConfigPath throws CONFIG_MISSING) is the honest-default path — eject runs against half-installed and config-less projects by design.
+  } catch {
+    return DEFAULT_TOTEM_DIR;
+  }
+  if (isGlobalConfigPath(configPath)) return DEFAULT_TOTEM_DIR;
+
+  let candidate: unknown;
+  try {
+    candidate = (await loadConfig(configPath)).totemDir;
+    // totem-context: a repo-local config that exists but will not load is a LOUD default — the line below names the file and the failure, and eject proceeds on `.totem` rather than guessing (Greptile P1 on mmnto-ai/totem#2701).
+  } catch (err) {
+    const { log } = await import('../ui.js');
+    const reason = err instanceof Error ? err.message.split('\n')[0] : String(err);
+    log.warn(
+      'Eject',
+      `Could not load ${configPath} (${reason}) — ejecting the default \`${DEFAULT_TOTEM_DIR}/\`. If this repo keeps its Totem state elsewhere, fix the config and re-run, or remove that directory by hand.`,
+    );
+    return DEFAULT_TOTEM_DIR;
+  }
+  if (typeof candidate !== 'string') return DEFAULT_TOTEM_DIR;
+
+  const normalized = candidate.replace(/\\/g, '/').replace(/\/+$/, '').trim();
+  // A value that names the project root itself (or escapes it) is never a
+  // deletion target — eject removes Totem's directory, never the checkout. The
+  // segment test is backed by resolved-path containment (path.resolve +
+  // path.relative), the repo's stated guideline for configured paths.
+  if (normalized === '' || normalized === '.' || normalized.split('/').includes('..')) {
+    return DEFAULT_TOTEM_DIR;
+  }
+  const relative = path.relative(cwd, path.resolve(cwd, normalized)).replace(/\\/g, '/');
+  if (relative === '' || relative.startsWith('..') || path.isAbsolute(relative)) {
+    return DEFAULT_TOTEM_DIR;
+  }
+  return normalized;
+}
+
+/**
+ * Entries `totem init` / the CLI write into the Totem directory. `deleteArtifacts`
+ * recursively removes the CONFIGURED directory, so before it does it asks whether
+ * the directory holds any of these — a configured `totemDir` that names an
+ * ordinary project directory (`src`, `docs`, or `.git`) must never be swept
+ * (Greptile on mmnto-ai/totem#2701, "unverified recursive deletion target").
+ */
+export const TOTEM_DIR_ENTRIES = [
+  'lessons',
+  'lessons.md',
+  'cache',
+  'artifacts',
+  'specs',
+  'compiled-rules.json',
+  'compile-manifest.json',
+  'registry.json',
+  'ledger',
+  'hooks',
+  'prepare.cjs',
+  'orchestration',
+  'rulesets',
+  'prompts',
+  'verdicts',
+] as const;
+
+/** Whether `dirPath` holds at least one Totem-written entry (see {@link TOTEM_DIR_ENTRIES}). */
+export function looksLikeTotemDir(dirPath: string): boolean {
+  try {
+    const entries = new Set(fs.readdirSync(dirPath));
+    return TOTEM_DIR_ENTRIES.some((entry) => entries.has(entry));
+    // totem-context: intentional cleanup — an unreadable directory is "not Totem-owned" for deletion purposes; the caller reports the skip.
+  } catch {
+    return false;
+  }
+}
+
+/** Files scaffolded by `totem init` that are fully owned by Totem, rendered for
+ *  the repo's configured `totemDir` (mmnto-ai/totem#2692).
  *  Exported for the sense-roster set-equality test (mmnto-ai/totem#2620) —
  *  a sampled roster assertion cannot detect a dropped member. */
-export const TOTEM_SCAFFOLDED_FILES = [
-  // Current (BeforeTool: mmnto-ai/totem#2481; SessionStart: mmnto-ai/totem#2488) +
-  // the pre-migration `.js` each one renamed — eject removes both shapes so an
-  // upgraded-then-ejected consumer leaves no fail-open artifact behind.
-  '.gemini/hooks/SessionStart.cjs',
-  '.gemini/hooks/SessionStart.js',
-  '.gemini/hooks/BeforeTool.cjs',
-  '.gemini/hooks/BeforeTool.js',
-  '.gemini/skills/totem.md',
-  '.totem/hooks/shield-gate.cjs',
-  // Phase B PreWriteShield (mmnto-ai/totem#1853, eject parity closing
-  // mmnto-ai/totem#1852).
-  '.claude/hooks/PreWriteShield.cjs',
-  // Phase C slice 1 SessionStart (mmnto-ai/totem#1845).
-  '.claude/hooks/SessionStart.cjs',
-  // PR-C action-gate wrapper (mmnto-ai/totem#2048, eject parity).
-  '.claude/hooks/gate-wrapper.cjs',
-];
+export function totemScaffoldedFiles(totemDir: string): string[] {
+  return [
+    // Current (BeforeTool: mmnto-ai/totem#2481; SessionStart: mmnto-ai/totem#2488) +
+    // the pre-migration `.js` each one renamed — eject removes both shapes so an
+    // upgraded-then-ejected consumer leaves no fail-open artifact behind.
+    '.gemini/hooks/SessionStart.cjs',
+    '.gemini/hooks/SessionStart.js',
+    '.gemini/hooks/BeforeTool.cjs',
+    '.gemini/hooks/BeforeTool.js',
+    '.gemini/skills/totem.md',
+    `${totemDir}/hooks/shield-gate.cjs`,
+    // Phase B PreWriteShield (mmnto-ai/totem#1853, eject parity closing
+    // mmnto-ai/totem#1852).
+    '.claude/hooks/PreWriteShield.cjs',
+    // Phase C slice 1 SessionStart (mmnto-ai/totem#1845).
+    '.claude/hooks/SessionStart.cjs',
+    // PR-C action-gate wrapper (mmnto-ai/totem#2048, eject parity).
+    '.claude/hooks/gate-wrapper.cjs',
+    // The init-distributed prepare wrapper (mmnto-ai/totem#2410) — scaffolded at
+    // `.totem/prepare.cjs` REGARDLESS of `totemDir` (`PREPARE_SCRIPT_REL` in
+    // init-templates.ts, a sibling hardcode this slice leaves in place), so it is
+    // named literally: under a custom `totemDir` the directory sweep no longer
+    // reaches it (mmnto-ai/totem#2692 amendment A9).
+    '.totem/prepare.cjs',
+  ];
+}
 
 /** Deletion/scrub targets shared by the mutation steps AND the rule-2 sense
  *  roster — one source, read by both sides and by the parity test (Tenet 20;
  *  round 2, F5: a literal re-declared in the sense was a mirror that could
- *  drift when `deleteArtifacts` gained a member). */
-export const EJECT_ARTIFACT_DIRS = ['.lancedb', '.totem'];
+ *  drift when `deleteArtifacts` gained a member). `.lancedb` stays literal:
+ *  `lanceDir` is a separate override this slice does not thread. */
+export function ejectArtifactDirs(totemDir: string): string[] {
+  return ['.lancedb', totemDir];
+}
 export const EJECT_CONFIG_FILE = 'totem.config.ts';
 export const CLAUDE_SETTINGS_LOCAL_FILE = '.claude/settings.local.json';
 export const CLAUDE_SETTINGS_FILE = '.claude/settings.json';
@@ -251,8 +374,8 @@ export function scrubPostCheckoutHook(hooksDir: string, summary: EjectSummary): 
  * user-authored hook citing the managed version it replaced) — is not
  * totem-owned and must survive eject (mmnto-ai/totem#2488 review, rounds 1–2).
  */
-function removeScaffoldedFiles(cwd: string, summary: EjectSummary): void {
-  for (const rel of TOTEM_SCAFFOLDED_FILES) {
+function removeScaffoldedFiles(cwd: string, totemDir: string, summary: EjectSummary): void {
+  for (const rel of totemScaffoldedFiles(totemDir)) {
     const filePath = path.join(cwd, rel);
     if (!fs.existsSync(filePath)) continue;
 
@@ -346,9 +469,13 @@ function scrubClaudeSettings(cwd: string, summary: EjectSummary): void {
  *     left over from when Phase B added the install side).
  *   - `hooks.SessionStart` entries whose command references `SessionStart.cjs`
  *     (Phase C slice 1 install — mmnto-ai/totem#1845).
- *   - `hooks.PreToolUse` Write|Edit entries whose command references
- *     `gate-wrapper.cjs` (PR-C action-gate install — mmnto-ai/totem#2048;
- *     one per installed gate). Parity with `gate install` / `init --gates=`.
+ *   - `hooks.PreToolUse` entries whose command references `gate-wrapper.cjs`
+ *     under ANY matcher (PR-C action-gate install — mmnto-ai/totem#2048; one
+ *     per installed gate). Since mmnto-ai/totem#2799 each gate installs under
+ *     its OWN matcher (`Write|Edit` for freeze-check, `Bash|PowerShell` for
+ *     transport-shield), so the scrub keys on the wrapper needle — which only
+ *     Totem writes — and never on the matcher. Parity with `gate install` /
+ *     `init --gates=`.
  *
  * User-defined entries (other matchers, other commands) are preserved.
  * Empty arrays/objects/files are pruned bottom-up to leave a clean
@@ -398,23 +525,50 @@ function scrubCommittedClaudeSettings(cwd: string, summary: EjectSummary): void 
 
   let mutated = false;
 
-  // PreToolUse → drop the PreWriteShield entry AND every action-gate
-  // wrapper entry (matcher Write|Edit, command references gate-wrapper.cjs;
-  // one per installed gate — PR-C eject parity, mmnto-ai/totem#2048). Other
-  // matchers (Bash legacy, user-defined Write|Edit) preserved. Array guard
-  // so a malformed-but-valid JSON shape (e.g., `"PreToolUse": null`) is
-  // skipped instead of crashing the eject best-effort cleanup.
+  // PreToolUse → drop the PreWriteShield entry AND every action-gate wrapper
+  // entry (one per installed gate — PR-C eject parity, mmnto-ai/totem#2048).
+  //
+  // The two needles are scoped DIFFERENTLY on purpose:
+  //   - the installed gate command (the exact grammar `gateCommand()` bakes:
+  //     `node <…/>.claude/hooks/gate-wrapper.cjs --event …`) →
+  //     matcher-INDEPENDENT. Since mmnto-ai/totem#2799 a gate installs under
+  //     its own matcher (`Write|Edit` for freeze-check, `Bash|PowerShell` for
+  //     transport-shield), so binding the needle to a matcher would strand
+  //     every non-`Write|Edit` gate entry behind an eject. A user hook that
+  //     merely mentions the wrapper's basename, runs a same-named wrapper from
+  //     another directory, or passes `--event` to another program survives.
+  //   - `PreWriteShield` → still bound to `Write|Edit`, the only matcher that
+  //     install ever writes it under (unchanged, deliberately narrow).
+  // The scrub is per HOOK, not per entry: a user command that shares an entry
+  // with a Totem hook survives, and the entry goes only when nothing of it
+  // remains (the bot round on mmnto-ai/totem#2804). A user-authored `Bash` (or
+  // any other) entry carries neither needle and survives. Array guard so a
+  // malformed-but-valid JSON shape (e.g., `"PreToolUse": null`) is skipped
+  // instead of crashing the best-effort cleanup.
   const preToolUseRaw = hooks.PreToolUse;
   if (Array.isArray(preToolUseRaw)) {
     const preToolUse = preToolUseRaw as Array<{ matcher?: string; hooks?: Array<unknown> }>;
-    const filtered = preToolUse.filter(
-      (entry) =>
-        !(
-          entry.matcher === 'Write|Edit' &&
-          (commandIncludes(entry, 'PreWriteShield') || commandIncludes(entry, 'gate-wrapper.cjs'))
-        ),
-    );
-    if (filtered.length !== preToolUse.length) {
+    const commandOf = (h: unknown): string =>
+      typeof h === 'string' ? h : ((h as { command?: string } | null)?.command ?? '');
+    let changed = false;
+    const filtered: typeof preToolUse = [];
+    for (const entry of preToolUse) {
+      const own = Array.isArray(entry.hooks) ? entry.hooks : [];
+      const kept = own.filter((h) => {
+        const cmd = commandOf(h);
+        return !(
+          isInstalledGateCommand(cmd) ||
+          (entry.matcher === 'Write|Edit' && cmd.includes('PreWriteShield'))
+        );
+      });
+      if (kept.length === own.length) {
+        filtered.push(entry);
+        continue;
+      }
+      changed = true;
+      if (kept.length > 0) filtered.push({ ...entry, hooks: kept });
+    }
+    if (changed) {
       mutated = true;
       if (filtered.length === 0) {
         delete hooks.PreToolUse;
@@ -724,10 +878,25 @@ export async function scrubReflexFiles(cwd: string, summary: EjectSummary): Prom
 /**
  * Delete Totem directories and config file.
  */
-function deleteArtifacts(cwd: string, summary: EjectSummary): void {
-  for (const dir of EJECT_ARTIFACT_DIRS) {
+function deleteArtifacts(cwd: string, totemDir: string, summary: EjectSummary): void {
+  for (const dir of ejectArtifactDirs(totemDir)) {
     const dirPath = path.join(cwd, dir);
     if (fs.existsSync(dirPath)) {
+      // A CUSTOM Totem directory is swept only when it LOOKS like one: a
+      // `totemDir` pointing at `.git`, `src` or `docs` is a config mistake, not a
+      // licence to recursively delete it (Greptile on mmnto-ai/totem#2701). The
+      // default `.totem/` is Totem's by name and is swept as it always was, even
+      // when empty.
+      if (
+        dir === totemDir &&
+        dir !== DEFAULT_TOTEM_DIR &&
+        (dir === '.git' || !looksLikeTotemDir(dirPath))
+      ) {
+        summary.skipped.push(
+          `${dir}/ (not deleted: it is the configured totemDir but holds none of Totem's entries — remove it by hand if that is intended)`,
+        );
+        continue;
+      }
       try {
         fs.rmSync(dirPath, { recursive: true, force: true });
         summary.removed.push(`${dir}/`);
@@ -803,7 +972,10 @@ export interface DirtyTreeSense {
  *
  * Exported for the sense-contract tests.
  */
-export async function deriveDirtyTreeSense(cwd: string): Promise<DirtyTreeSense> {
+export async function deriveDirtyTreeSense(
+  cwd: string,
+  totemDir: string = DEFAULT_TOTEM_DIR,
+): Promise<DirtyTreeSense> {
   let porcelain: string;
   let ignoredVisible = true;
   try {
@@ -814,13 +986,13 @@ export async function deriveDirtyTreeSense(cwd: string): Promise<DirtyTreeSense>
     const { DISTRIBUTED_CLAUDE_SKILLS } = await import('./init-templates.js');
     const roster = [
       ...new Set([
-        ...TOTEM_SCAFFOLDED_FILES,
+        ...totemScaffoldedFiles(totemDir),
         CLAUDE_SETTINGS_LOCAL_FILE,
         CLAUDE_SETTINGS_FILE,
         ...DISTRIBUTED_CLAUDE_SKILLS.map((s) => `.claude/skills/${s.name}/SKILL.md`),
         ...AI_TOOLS.flatMap((t) => (t.reflexFile === null ? [] : [t.reflexFile])),
         ...LEGACY_REFLEX_FILES,
-        ...EJECT_ARTIFACT_DIRS,
+        ...ejectArtifactDirs(totemDir),
         EJECT_CONFIG_FILE,
       ]),
     ];
@@ -904,9 +1076,15 @@ export async function ejectCommand(options: EjectOptions): Promise<void> {
 
   const cwd = process.cwd();
 
+  // Resolve the repo's Totem directory ONCE, before anything is deleted — the
+  // sense roster and the removal steps must name the same tree
+  // (mmnto-ai/totem#2692 C5); the config file that declares it is itself a
+  // deletion target below.
+  const totemDir = await resolveEjectTotemDir(cwd);
+
   // Rule-2 sense line(s) ride ahead of the consent prompt — and under
   // --force too: the flag skips the prompt, never the sense (mmnto-ai/totem#2620).
-  const sense = await deriveDirtyTreeSense(cwd);
+  const sense = await deriveDirtyTreeSense(cwd, totemDir);
   for (const line of sense.lines) {
     log.warn(TAG, line);
   }
@@ -965,7 +1143,7 @@ export async function ejectCommand(options: EjectOptions): Promise<void> {
   }
 
   // 2. Remove scaffolded Gemini/Claude hook files
-  removeScaffoldedFiles(cwd, summary);
+  removeScaffoldedFiles(cwd, totemDir, summary);
 
   // 3. Scrub Claude settings.local.json (per-developer shield-gate)
   scrubClaudeSettings(cwd, summary);
@@ -997,7 +1175,7 @@ export async function ejectCommand(options: EjectOptions): Promise<void> {
   }
 
   // 7. Delete artifacts
-  deleteArtifacts(cwd, summary);
+  deleteArtifacts(cwd, totemDir, summary);
 
   // Print summary
   if (summary.removed.length > 0) {

@@ -6,10 +6,14 @@ import {
   DoctorConfigSchema,
   GarbageCollectionSchema,
   getConfigTier,
+  hasUnrenderableHeadingChar,
+  hasUnrenderableHookChar,
+  normalizeTotemDir,
   OrchestratorSchema,
   requireEmbedding,
   TotemConfigSchema,
 } from './config-schema.js';
+import { DEFAULT_LEGS_OWED_GLOBS } from './routing/legs-owed.js';
 
 const BASE_TARGETS = [
   { glob: '**/*.md', type: 'spec' as const, strategy: 'markdown-heading' as const },
@@ -1104,5 +1108,317 @@ describe('DoctorConfigSchema', () => {
     if (result.success) {
       expect(result.data.doctor?.staleRuleWindow).toBe(50);
     }
+  });
+});
+
+describe('totemDir — normalised, then refused where the managed hooks could not govern it (mmnto-ai/totem#2692 A7)', () => {
+  const TARGET = { glob: 'docs/*.md', type: 'lesson', strategy: 'markdown-heading' } as const;
+  // A literal backslash, built rather than escaped so no transport layer can
+  // collapse it (a `'\\'` literal arrived as a control character once already).
+  const BS = String.fromCharCode(0x5c);
+  const parseTotemDir = (totemDir: unknown) =>
+    TotemConfigSchema.safeParse(
+      totemDir === undefined ? { targets: [TARGET] } : { targets: [TARGET], totemDir },
+    );
+
+  it('defaults to .totem when unset (the default runs before the transform)', () => {
+    const result = parseTotemDir(undefined);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.totemDir).toBe('.totem');
+  });
+
+  it.each([
+    ['a trailing slash', 'knowledge/', 'knowledge'],
+    ['repeated trailing slashes', 'x//', 'x'],
+    ['a leading ./', './x', 'x'],
+    ['repeated leading ./', '././x', 'x'],
+    ['a backslash (Windows spelling)', `a${BS}b`, 'a/b'],
+    ['a dot-backslash prefix', `.${BS}totem`, 'totem'],
+    ['the config directory itself (the global profile spelling)', '.', '.'],
+  ])('normalises %s', (_label, input, expected) => {
+    expect(normalizeTotemDir(input)).toBe(expected);
+    const result = parseTotemDir(input);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data.totemDir).toBe(expected);
+  });
+
+  it.each([
+    ['an empty value', '', /must not be empty/],
+    ['a value that normalises to empty', './', /must not be empty/],
+    ['a bare slash', '/', /must not be empty/],
+    ['an absolute path', '/abs/x', /relative path/],
+    ['a drive-letter path', 'C:/x', /relative path/],
+    ['a single quote', "it's", /must not contain/],
+    ['a dollar sign', 'a$b', /must not contain/],
+    ['a backtick', 'a`b', /must not contain/],
+    [
+      'a non-ASCII character (git C-quotes it in the paths the hooks grep)',
+      'ünïcode',
+      /must not contain/,
+    ],
+    ['a control character', `a${String.fromCharCode(7)}b`, /must not contain/],
+  ])('refuses %s', (_label, input, message) => {
+    const result = parseTotemDir(input);
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.message).join('\n')).toMatch(message);
+    }
+  });
+
+  it('hasUnrenderableHookChar — the character set, pinned as a set', () => {
+    const refused = [
+      "'",
+      '"',
+      String.fromCharCode(0x5c), // backslash
+      '$',
+      '`',
+      String.fromCharCode(0x0a), // newline
+      String.fromCharCode(0x09), // tab
+      String.fromCharCode(0x7f),
+      'ü',
+      String.fromCharCode(0x2028),
+    ];
+    const accepted = [
+      '.',
+      '-',
+      '_',
+      ' ',
+      '/',
+      '~',
+      '!',
+      '*',
+      '?',
+      '[',
+      ']',
+      '{',
+      '}',
+      '(',
+      ')',
+      '#',
+      '%',
+      '&',
+      ';',
+      '|',
+      '<',
+      '>',
+    ];
+    for (const ch of refused)
+      expect(hasUnrenderableHookChar(`a${ch}b`), JSON.stringify(ch)).toBe(true);
+    for (const ch of accepted)
+      expect(hasUnrenderableHookChar(`a${ch}b`), JSON.stringify(ch)).toBe(false);
+  });
+
+  // The sibling predicate for required SPEC HEADINGS (mmnto-ai/totem#2737).
+  // Same five shell/JS-active characters and the same line-breaking bands, but
+  // printable non-ASCII is PERMITTED: a heading is rendered by JSON.stringify
+  // into the reader's JS source and compared in memory, where the path
+  // predicate's ban on everything above 0x7e exists for git's C-quoting of
+  // `diff --name-only` output that a heading never meets.
+  it('hasUnrenderableHeadingChar — the character set, pinned as a set', () => {
+    const refused = [
+      "'",
+      '"',
+      String.fromCharCode(0x5c), // backslash
+      '$',
+      '`',
+      String.fromCharCode(0x0a), // newline
+      String.fromCharCode(0x09), // tab
+      String.fromCharCode(0x00), // NUL
+      String.fromCharCode(0x1f), // the top of C0
+      String.fromCharCode(0x7f), // DEL
+      String.fromCharCode(0x85), // NEL — a line break to some terminals
+      String.fromCharCode(0x9f), // the top of C1
+      String.fromCharCode(0x2028), // LINE SEPARATOR
+      String.fromCharCode(0x2029), // PARAGRAPH SEPARATOR
+    ];
+    const accepted = [
+      '.',
+      '-',
+      '&',
+      '(',
+      ')',
+      ':',
+      ' ',
+      'é',
+      'ü',
+      String.fromCharCode(0x2014), // the em dash the Verification heading carries
+    ];
+    for (const ch of refused)
+      expect(hasUnrenderableHeadingChar(`a${ch}b`), JSON.stringify(ch)).toBe(true);
+    for (const ch of accepted)
+      expect(hasUnrenderableHeadingChar(`a${ch}b`), JSON.stringify(ch)).toBe(false);
+
+    // The whole heading, not just its bytes one at a time. Core cannot import
+    // SPEC_SYSTEM_PROMPT (it lives in @mmnto/cli, which depends on this
+    // package, not the other way round), so the em dash is BUILT rather than
+    // typed — the same guarantee against a look-alike byte. That this string is
+    // verbatim the prompt's line is locked on the CLI side, where
+    // SPEC_REQUIRED_SECTIONS is asserted to be a subset of SPEC_SYSTEM_PROMPT
+    // and every entry is run through this predicate.
+    const verification = `### Verification (MANDATORY ${String.fromCharCode(0x2014)} do not skip)`;
+    expect(hasUnrenderableHeadingChar(verification), verification).toBe(false);
+    expect(hasUnrenderableHookChar(verification), 'the PATH predicate still refuses it').toBe(true);
+  });
+});
+
+describe('hooks.legsOwed.globs — the judgment-dense path floor (mmnto-ai/totem#2698)', () => {
+  it('resolves to the default floor when `hooks` is absent entirely', () => {
+    const result = TotemConfigSchema.safeParse({ targets: BASE_TARGETS });
+    expect(result.success).toBe(true);
+    // `hooks` is optional, so an absent key stays absent — the consumer falls
+    // back to the exported constant, which is why it is exported at all.
+    if (result.success) {
+      expect(result.data.hooks).toBeUndefined();
+      expect([...DEFAULT_LEGS_OWED_GLOBS]).toEqual([
+        'doctrine/**',
+        'design-tenets.md',
+        'adr/**',
+        'proposals/**',
+        'README.md',
+        'docs/wiki/**',
+        '.changeset/**',
+      ]);
+    }
+  });
+
+  it('resolves to the default floor when `hooks: {}` is present', () => {
+    const result = TotemConfigSchema.safeParse({ targets: BASE_TARGETS, hooks: {} });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.hooks?.legsOwed.globs).toEqual([...DEFAULT_LEGS_OWED_GLOBS]);
+      // …and the sibling default is untouched.
+      expect(result.data.hooks?.tier).toBe('standard');
+    }
+  });
+
+  it('resolves to the default floor when `hooks` declares only a tier', () => {
+    const result = TotemConfigSchema.safeParse({
+      targets: BASE_TARGETS,
+      hooks: { tier: 'strict' },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.hooks?.legsOwed.globs).toEqual([...DEFAULT_LEGS_OWED_GLOBS]);
+    }
+  });
+
+  it('an explicitly EMPTY globs array is a hard parse error (the review.lanes precedent)', () => {
+    const result = TotemConfigSchema.safeParse({
+      targets: BASE_TARGETS,
+      hooks: { legsOwed: { globs: [] } },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.map((i) => i.message).join('\n')).toMatch(
+        /must contain at least one glob/,
+      );
+    }
+  });
+
+  it('a custom list REPLACES the default rather than extending it', () => {
+    const result = TotemConfigSchema.safeParse({
+      targets: BASE_TARGETS,
+      hooks: { legsOwed: { globs: ['packages/core/src/artifacts/**', '!**/*.test.ts'] } },
+    });
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.hooks?.legsOwed.globs).toEqual([
+        'packages/core/src/artifacts/**',
+        '!**/*.test.ts',
+      ]);
+    }
+  });
+
+  it('hooks.legsOwed.enforce accepts block | advisory, is ABSENT by default, and rejects any other spelling (mmnto-ai/totem#2771)', () => {
+    for (const enforce of ['block', 'advisory'] as const) {
+      const result = TotemConfigSchema.safeParse({
+        targets: BASE_TARGETS,
+        hooks: { legsOwed: { enforce } },
+      });
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.data.hooks?.legsOwed.enforce).toBe(enforce);
+        // Declaring the knob alone leaves the globs at the default floor — the
+        // two keys are independent.
+        expect(result.data.hooks?.legsOwed.globs).toEqual([...DEFAULT_LEGS_OWED_GLOBS]);
+      }
+    }
+    // Absent stays absent: no default is minted, so an upgraded consumer keeps
+    // its tier-derived behaviour.
+    const absent = TotemConfigSchema.safeParse({
+      targets: BASE_TARGETS,
+      hooks: { tier: 'strict' },
+    });
+    expect(absent.success).toBe(true);
+    if (absent.success) expect(absent.data.hooks?.legsOwed.enforce).toBeUndefined();
+    // A third spelling is a parse error, never a silent synonym for either.
+    expect(
+      TotemConfigSchema.safeParse({
+        targets: BASE_TARGETS,
+        hooks: { legsOwed: { enforce: 'sometimes' } },
+      }).success,
+    ).toBe(false);
+    expect(
+      TotemConfigSchema.safeParse({
+        targets: BASE_TARGETS,
+        hooks: { legsOwed: { enforce: true } },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('refuses an empty-string glob and a non-array', () => {
+    expect(
+      TotemConfigSchema.safeParse({
+        targets: BASE_TARGETS,
+        hooks: { legsOwed: { globs: [''] } },
+      }).success,
+    ).toBe(false);
+    expect(
+      TotemConfigSchema.safeParse({
+        targets: BASE_TARGETS,
+        hooks: { legsOwed: { globs: 'doctrine/**' } },
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('searchRelevanceFloor — optional, NO default (mmnto-ai/totem#2727)', () => {
+  // The whole point of the slice: an unconfigured repo must come out of the
+  // parse with NO floor, so the below-floor arms are unreachable rather than
+  // reachable-but-inert at a number no index ever crosses.
+  // `{ targets }` is the minimal PARSEABLE config — `targets` is required — so
+  // this is a config that simply does not mention the key.
+  it('a config that does not set the key leaves searchRelevanceFloor undefined — no default', () => {
+    const parsed = TotemConfigSchema.parse({ targets: BASE_TARGETS });
+    expect(parsed.searchRelevanceFloor).toBeUndefined();
+    expect('searchRelevanceFloor' in parsed).toBe(false);
+  });
+
+  it('a configured value round-trips unchanged', () => {
+    expect(
+      TotemConfigSchema.parse({ targets: BASE_TARGETS, searchRelevanceFloor: 0.57 })
+        .searchRelevanceFloor,
+    ).toBe(0.57);
+    // The bounds still hold — optional loosened the default, not the range.
+    expect(
+      TotemConfigSchema.parse({ targets: BASE_TARGETS, searchRelevanceFloor: 0 })
+        .searchRelevanceFloor,
+    ).toBe(0);
+    expect(
+      TotemConfigSchema.parse({ targets: BASE_TARGETS, searchRelevanceFloor: 1 })
+        .searchRelevanceFloor,
+    ).toBe(1);
+  });
+
+  it('rejects a value outside [0, 1] and a non-number', () => {
+    expect(
+      TotemConfigSchema.safeParse({ targets: BASE_TARGETS, searchRelevanceFloor: -0.1 }).success,
+    ).toBe(false);
+    expect(
+      TotemConfigSchema.safeParse({ targets: BASE_TARGETS, searchRelevanceFloor: 1.1 }).success,
+    ).toBe(false);
+    expect(
+      TotemConfigSchema.safeParse({ targets: BASE_TARGETS, searchRelevanceFloor: '0.5' }).success,
+    ).toBe(false);
   });
 });

@@ -1,5 +1,142 @@
 # @mmnto/mcp
 
+## 2.2.0
+
+### Patch Changes
+
+- Updated dependencies [cdfd4fd]
+- Updated dependencies [69f19c2]
+  - @mmnto/totem@2.2.0
+
+## 2.1.0
+
+### Minor Changes
+
+- b8fe7ed: `describeProject` counts the ACTIVE compiled-rule set — the set `totem lint` enforces and `totem status` reports — instead of the raw file total, and reports the inert split beside it (mmnto-ai/totem#2765; the describe half of the mmnto-ai/totem#2388 parity).
+
+  **What was wrong.** `totem describe` (and so the SessionStart banner every session opens on) and the MCP `describe_project` tool's `legacy` block printed `parsed.rules.length` — every entry in `compiled-rules.json`, archived and untested ones included — while `totem status` and `totem lint` count through the loader that applies the mmnto-ai/totem#1345 status filter. On this repository that read `Rules: 485 compiled` at session start against a lint that enforces 385: the 100-rule gap is exactly the archived-plus-untested set lint deliberately does not run, and no surface reconciled the two.
+
+  **What changed.** The status filter is now a named predicate, `isActiveCompiledRule` (exported from `@mmnto/totem`), and lint's loader filters through it. `describeProject` reads the file through the same schema-validating loader lint and status use and counts through that predicate, so on a present, schema-valid `compiled-rules.json` the three surfaces agree by construction (and a test now asserts describe's number against what `totem status` prints). `ProjectDescription.rules` is the active count; five new fields carry the rest — `rulesCompiled` (the raw total), `rulesArchived`, `rulesUntested`, `rulesPendingVerification`, with `rules + the three inert counts === rulesCompiled`, and `rulesSource` (`compiled-rules` | `absent` | `unreadable`). The new members are required on the interface: readers gain them for free, and a TypeScript consumer that CONSTRUCTS a `ProjectDescription` (a test double, an adapter) must supply them — the migration is to add the five fields, or to build the object through `describeProject`, which always fills them (no downstream constructor exists in the cohort; this is disclosed rather than shimmed, per the no-legacy ruling). The `totem describe` line reads `Rules: 385 active of 485 compiled (93 archived, 7 untested-against-codebase)` where the split is non-trivial, `Rules: 12 active` where nothing is inert, `Rules: 0 active (no compiled-rules.json)` for a missing file, and `Rules: 0 active — compiled-rules.json unreadable (…)` for one the loader refused — describe never prints a bare "N compiled" again, and never a 0 a reader could mistake for an honestly empty set. (`totem status` keeps its own `Rules: N compiled` wording, where N is the active set; its wording is out of scope here.)
+
+  **The MCP surface moves with it.** `describe_project`'s `legacy` block carries the new fields (its output schema mirrors `ProjectDescription` and gained the same members), and its rich state's `ruleCounts.active` now counts through the same predicate — before this it counted `status !== 'archived'`, so one call answered `legacy.rules` 385 beside `ruleCounts.active` 392 on this repository. `ruleCounts` gains `untested` and `pendingVerification` so its parts still sum to the file total.
+
+  **One consequence to know.** A `compiled-rules.json` the loader cannot use — valid JSON that fails the compiled-rules schema, or a file that is not JSON at all — now reports zeros from describe, labelled `unreadable` (it previously counted any `rules` array, or reported an unlabelled 0) — what lint refuses outright. `totem status` handles those files its own way: for a schema-invalid file it falls back to the compile manifest's `rule_count`, a raw total; for a non-JSON file it prints 0. Both are pre-existing and untouched here. A missing file still reports zeros, labelled `absent`; the sensor still never throws.
+
+  **Unchanged.** What "active" means (mmnto-ai/totem#1345), status's manifest fallback and wording, and the shape of everything else `describe_project` returns.
+
+- 1924baf: `search_knowledge` classifies a faulted relevance as FAULTED — neither signal nor exemption — on the same predicate the CLI gate and the grounding-bundle builder use (mmnto-ai/totem#2770).
+
+  **What was wrong.** The MCP reader selected relevances with a bare `typeof === 'number'`, so a `NaN` or an out-of-range value from the store read as signal: a `NaN` among the hits poisoned `Math.max`, `NaN < floor` was false, the floor never fired, and the tool answered `status="ok"` with the noise it should have withheld — a fault defeating the refusal, the class the mmnto-ai/totem#2761 bot round refuted in the CLI. With no floor (the default since mmnto-ai/totem#2758) a negative or above-1 value was rendered as a measurement in the per-hit field and the envelope (and, under a floor, in the selection manifest's exclusion reason). The mmnto-ai/totem#2738 changeset disclosed this reader as the surface not touched.
+
+  **Three classes of hit, one predicate.** Core's `isRelevanceInRange` (finite, in [0, 1]) decides: in range → SIGNAL; no relevance at all (keyword-only) → EXEMPT; a number failing it → FAULTED. `bestRelevance` is the max over signal only; the below-floor arm judges signal only; exempt hits carry a batch as before; a faulted hit never raises `bestRelevance`, is never withheld as a measurement, and cannot carry a batch.
+
+  **A new arm.** A retrieval whose EVERY hit is faulted answers `status="no_useful_hits"` — with or without a floor — with the CLI refusal's sentence (`Retrieval returned N hits, but every one carried a relevance that is not a finite number in [0, 1] (tallied out of range by the search layer) — nothing usable to return.`), content withheld and every candidate disclosed by path as `relevance faulted`. This is the one way that status now arises with `floor="none"`; the `min_relevance` description and the docs say so.
+
+  **What a reader sees.** The per-hit field prints `**Relevance:** faulted (not a finite number in [0, 1])` instead of a number. The `<retrieval-envelope>` gains a trailing `faulted="N"` attribute, always present so the line keeps one closed shape — a wrapper regex anchored on `hits="N" />` must admit it (no cohort code parses the envelope today; the only readers are prose and this package's own log line, which matches `bestRelevance` by name). Under a floor, the disclosure adds `N hit(s) carried a relevance … and did not count as signal or as exemption.` and a `Faulted candidates` list. The selection manifest records a faulted hit as `excluded` with reason `relevance-faulted (not a finite number in [0, 1])` on the withheld arms and as `selected` with `returned rank=N (relevance faulted)` on the ok arm; its context carries a `faulted` count, which is why `@mmnto/totem` moves too — `faulted` joins the CLOSED `SELECTION_CONTEXT_KEYS` set (a deliberate schema change by that set's own rule).
+
+  **Unchanged.** The floor semantics: a whole-run gate on the best in-range relevance, exempt hits unchanged, `min_relevance` overriding both ways. A batch with no faults renders byte-identically apart from `faulted="0"`.
+
+### Patch Changes
+
+- Updated dependencies [b8fe7ed]
+- Updated dependencies [8b8ee20]
+- Updated dependencies [1924baf]
+  - @mmnto/totem@2.1.0
+
+## 2.0.0
+
+### Major Changes
+
+- b17e348: `searchRelevanceFloor` has no default: the value is repo-local, unset means no floor, and the constant that named a default no index ever reached is removed (mmnto-ai/totem#2727).
+
+  **What the floor actually is.** A refusal threshold compared against the **best** vector-leg relevance of **one retrieval** — a whole-run gate, not a per-item filter. Nothing in Totem withholds an individual sub-floor hit while returning its siblings. `search_knowledge` answers `status="no_useful_hits"` and discloses the below-floor candidates when a response's best relevance falls under the floor; `totem spec` refuses an unanchored free-text run on the same comparison, and one floor-exempt (keyword-only) hit from a grounding partition — specs, sessions, code — saves the run (a keyword-only lesson does not: lessons never ground a run). Saying so plainly is part of this change: the config comment it replaces read as a per-hit filter, and the calibration people would have derived from that reading is the wrong calibration.
+
+  **The measurement.** R4, over 55 recorded `totem spec` queries at pin `14daff4d` on the gemini-embedding-2-preview 768-d profile (the record is `.totem/fixtures/floor-arm-2026-09-03/`). Relevance is `1 / (1 + squared L2)` on unit-norm vectors, so it ranges over `[0.2, 1]` and real retrievals sit high in it: the **lowest best-relevance of any run was 0.559** — 0.5687 over the runs the spec refusal was even eligible to judge. The shipped default of 0.25 therefore could not fire on a single one of them. It was a mechanism claim with no mechanism, and any value below a corpus's own measured floor is equally inert.
+
+  **The ruling.** The default is removed rather than raised. A reachable floor is a property of a corpus, its embedder and its labels — repo-local by construction — so it is not ours to guess. `searchRelevanceFloor` becomes optional with no default; unset means no floor.
+
+  **What changed.**
+  - `searchRelevanceFloor: z.number().min(0).max(1).optional()` — no `.default()`. Bounds unchanged.
+  - With no floor configured and no per-call `min_relevance`, the below-floor arms cannot fire: `search_knowledge` never answers `no_useful_hits`, and `totem spec`'s below-floor refusal is unreachable. `totem spec`'s **zero-hit** refusal is a separate arm and still fires.
+  - The retrieval envelope's `floor` attribute reads `floor="none"` when no floor applies (it stays a closed token, so the wrapper-agent single-regex contract holds). The selection manifest records `floor: null` for the same case.
+  - `totem spec`'s refusal grew a second floor line: `floor none — searchRelevanceFloor unset in totem.config.ts (no default; calibrate per repo — see config-reference)` when unset, and `floor 0.570 — searchRelevanceFloor in totem.config.ts` when set (the old "(schema default 0.25 when unset)" suffix is gone — it named a default that no longer exists).
+  - A run artifact records `grounding.floor` only when a floor was configured; the key is absent otherwise, rather than carrying a number no floor judged.
+  - The refusal's lessons clause is now `… but lessons do not ground a run (ruled mmnto-ai/totem#2727).` — that question was open when the clause was written and is now closed. **Lessons never ground a run: final.**
+  - `min_relevance` keeps its meaning and still overrides, in both directions.
+
+  **REMOVED — `DEFAULT_SEARCH_RELEVANCE_FLOOR` is gone from `@mmnto/totem`, and this release is a MAJOR.** No shim, no compat constant, no deprecated re-export — the mmnto-ai/totem#2691 ruling carries no legacy while every consumer is a repo we operate; one truth and a loud line instead. It existed to keep the schema default and the MCP guard on one number; with no default there is no number for it to name. Measured before removing it: no repo in the cohort imports it. `totem-strategy`, `totem-status`, `liquid-city`, `totem-substrate` and `totem-playground` were searched over tracked files; the only tracked mention anywhere outside this monorepo is prose in one `totem-strategy` research document, and the only code consumers were the two sites inside this repo (the schema default and the MCP guard). The bump is **major** regardless of that measurement, for two reasons that do not depend on who imports the constant: the root barrel's own header promises zero removals and defers subtraction to a future major (`packages/core/src/index.ts`, mmnto-ai/totem#2336 / ADR-084 / Proposal 294), and a deleted public export is a breaking change by the semver definition — the same ruling's "honest semver" clause. This is that major. The changeset config pins the six `@mmnto/*` packages as one **fixed** group, so `@mmnto/cli`, `@mmnto/mcp` and the three packs take the same 2.0.0 with it — their declared engine ranges do not move with them, which is its own paragraph below. (Ruled major at the bot round on 2026-09-04; the build had called it minor on the import measurement alone, and said so.)
+
+  **Packs and the major.** `engines['@mmnto/totem']` is where a pack declares the engine range it runs on, and ADR-097 § 11 made that field deliberately immune to the changesets fixed-group bump — so the cut moves the engine to 2.0.0 and leaves every pack's range where it was. The three in-repo packs declared `^1.26.0`; `loadInstalledPacks` cross-checks every installed pack's range against the running engine at boot and throws on a mismatch, so a 2.0.0 engine would have refused to start for any consumer with a pack installed (`liquid-city` installs `@mmnto/pack-rust-architecture`). The only test over the field asserted a non-empty string and would have stayed green. This PR widens the three ranges to `>=1.26.0 <3.0.0` — true on both sides of the cut: the engine feature the packs need (the `engines` reader) shipped in 1.26.0, and nothing removed here is read by a pack — and each pack's structure test now runs the boot predicate itself against the version the workspace resolves, so a Version Packages PR goes red if a cut ever walks out of a range again — with one disclosure: `>=1.26.0 <3.0.0` admits the whole 2.x line, so that control is dormant until a 3.0.0 cut; the field no longer distinguishes major lines, which is the least-bad shape while ADR-097 § 11 keeps it out of the bump. **An external pack that declares `^1.x` will refuse a 2.x engine at boot** with `Pack '<name>' requires @mmnto/totem '^1.x' but the running engine is 2.0.0` — widen its range and republish, or hold the engine at 1.x until it does. Update the engine and the packs together (the cohort bump does), **then re-run `totem sync`**: the boot cross-check reads each pack's range from `.totem/installed-packs.json` as recorded at the last sync (`pack-discovery.ts` copies the manifest's `declaredEngineRange`; the installed pack's `package.json` is read only by the sync-time manifest writer), so a manifest written under 1.x keeps saying `^1.26.0` until the sync rewrites it. Under pnpm the manifest's version-hashed `resolvedPath` goes stale first and the boot error already says to re-run `totem sync`; under npm or yarn the range check fires instead, with a message that points at upgrading the pack — the cure is the same sync, and `totem sync` does not boot the engine, so it is always reachable.
+
+  **MIGRATION.** On the **measured profile** — gemini-embedding-2-preview, 768-d, unit-norm, over this repo's corpus — a repo that relied on the schema default sees **no change in delivered results**: the lowest best-relevance of any of the 55 recorded runs was 0.559, so the default withheld nothing there; those results were already unfloored in fact. That is a claim about the measured profile, not about unit-norm embedders in general. Relevance on unit-norm vectors is bounded below by 0.2 (LanceDB's default `l2` is squared L2 — measured in R1, `.totem/fixtures/spec-runs-2026-09-02/r1-summary.md`, 3 of 3 trials; mmnto-ai/totem#2738 pins the metric per query), so values under 0.25 stay reachable in principle on any unit-norm profile (a query more than 120° from everything indexed — cosine below −0.5, squared L2 above 3), and a corpus that produced them was being refused by the old default and will not be after this change. Measure your own profile (recipe below) before assuming the no-change case. Two things look different everywhere: `search_knowledge`'s envelope prints `floor="none"` instead of `floor="0.250"`, and a `totem spec` refusal names the floor as `none` instead of `0.250`.
+
+  A repo whose embedder returns **unnormalized** vectors (some custom providers, some Ollama models) is not bounded that way and can produce relevances below 0.25 — so the old default could fire there, and such a repo may see **fewer** refusals and fewer `no_useful_hits` after this change. Set `searchRelevanceFloor` to restore them; the recipe below applies unchanged.
+
+  A repo that set `searchRelevanceFloor` explicitly is unaffected. Anything importing `DEFAULT_SEARCH_RELEVANCE_FLOOR` gets a TypeScript error at the import — read `config.searchRelevanceFloor` and handle `undefined`.
+
+  To make the below-floor arms reachable, calibrate and set a value: record real `totem spec` runs, mark the ones whose retrieval you would want kept, note each kept run's best relevance, and set `searchRelevanceFloor` below the weakest of those. The recipe and the worked measurement are in `docs/wiki/config-reference.md` ("The Relevance Floor"). Recalibrate when the embedder or the corpus changes materially — a floor calibrated on one embedding profile says nothing about another.
+
+  **Not in this slice.** The relevance formula (`lance-search.ts`) and whether it must be metric-aware (mmnto-ai/totem#2738); a pre-fusion per-item floor (`distanceRange` — R4's A-pre arm was undetermined, and R5 is pre-registered for it); the dedup similarity threshold (mmnto-ai/totem#2751); any change to which partitions ground a run; any lesson-pool floor, which needs its own measurement against lesson relevances before it can be designed.
+
+### Patch Changes
+
+- Updated dependencies [b17e348]
+- Updated dependencies [ba22ea1]
+- Updated dependencies [9c7f9cb]
+  - @mmnto/totem@2.0.0
+
+## 1.124.0
+
+### Patch Changes
+
+- Updated dependencies [12250e8]
+  - @mmnto/totem@1.124.0
+
+## 1.123.0
+
+### Patch Changes
+
+- Updated dependencies [01a9c74]
+  - @mmnto/totem@1.123.0
+
+## 1.122.0
+
+### Patch Changes
+
+- Updated dependencies [8d5e269]
+  - @mmnto/totem@1.122.0
+
+## 1.121.0
+
+### Patch Changes
+
+- Updated dependencies [2e389e3]
+- Updated dependencies [519010f]
+  - @mmnto/totem@1.121.0
+
+## 1.120.0
+
+### Patch Changes
+
+- Updated dependencies [aba7c78]
+  - @mmnto/totem@1.120.0
+
+## 1.119.0
+
+### Patch Changes
+
+- Updated dependencies [180e0d5]
+- Updated dependencies [ee72a24]
+- Updated dependencies [e22cabf]
+  - @mmnto/totem@1.119.0
+
+## 1.118.1
+
+### Patch Changes
+
+- Updated dependencies [2760c96]
+  - @mmnto/totem@1.118.1
+
 ## 1.118.0
 
 ### Patch Changes

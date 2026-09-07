@@ -61,6 +61,32 @@ const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 const LESSON_REF_RE = /^[0-9a-f]{16}$/;
 
 /**
+ * A full sha256 digest in lowercase hex — the codomain of every content hash on
+ * this seam (Prop 310 § Design 10's CR-blind example-pair hash, the record file's
+ * own content hash). Canonical form only, for the same reason `COMMIT_SHA_RE`
+ * refuses uppercase: admitting a non-canonical digest is a silent data-quality
+ * hole, and normalising it on parse would move the hash basis.
+ */
+export const SHA256_HEX_RE = /^[0-9a-f]{64}$/;
+
+// The persisted minted-rule-id shape (ADR-112 §8): a 16-char lowercase-hex base from
+// `mintAuthoredRuleId`, with an optional collision suffix. The suffix is EXACTLY what the
+// mint emits — `-<n>` for n≥1, never `-0` and never zero-padded — so schema-valid ≡
+// mint-producible (#2259 CR: a looser `-\d+` admitted ids like `…-0`/`…-01` the mint can't
+// make). Pinned as a shared constant binding the SCHEMA boundary to the mint's codomain.
+//
+// HOMED HERE, not beside the mint (Prop 310 slice 3): `PreimageSourceSchema`'s
+// `kind: 'record'` branch needs it, and this module is a leaf that
+// `spine/authored-rule.ts` already imports — the reverse edge would be an import
+// cycle whose top-level Zod construction would hit a TDZ error. `authored-rule.ts`
+// re-exports it, so the constant still has exactly one definition (Tenet 20) and
+// every existing import path is unchanged.
+export const AUTHORED_RULE_ID_HEX_LEN = 16;
+export const AUTHORED_RULE_ID_RE = new RegExp(
+  `^[0-9a-f]{${AUTHORED_RULE_ID_HEX_LEN}}(?:-[1-9]\\d*)?$`,
+);
+
+/**
  * ISO-8601 shape for an authoring date — a calendar date (`YYYY-MM-DD`) or a full
  * timestamp with optional fractional seconds + `Z`/offset. Shape only; the calendar
  * validity is enforced by `isIso8601CalendarDate` (#2259 — GCA-high + CR).
@@ -142,6 +168,15 @@ export type MinedProvenanceRecord = z.infer<typeof MinedProvenanceWireSchema>;
  *     never a path/mutable alias (§8 identity discipline).
  *   - `commit` (FALLBACK, land-then-fix repos): the pre-fix parent
  *     (`preimageCommitSha` — fire) / post-fix merge (`mergeCommitSha` — silent).
+ *   - `record` (Prop 310 § Design 10 + Amendment 1): DERIVED at intake from a
+ *     `.totem/rules/<slug>.rule.yaml` record's `examples[ordinal]` pair, joined by
+ *     the `(ruleId, ordinal)` key with the CR-blind `pairHash` as drift sensor.
+ *     The bad/good text is carried inline exactly as the `lesson` branch carries
+ *     it, so the differential evaluates identically; the key is what differs.
+ *     Amendment 1 makes the record's `examples` block the EDITABLE home — this
+ *     branch is the derived side and is never hand-authored (an inline
+ *     `preimageSource` in the authored envelope is a migration error, rejected by
+ *     name at intake).
  *
  * `z.discriminatedUnion` (not `z.union`): both branches carry a REQUIRED literal
  * `kind`, so Zod routes a parse error to the matched branch instead of emitting
@@ -187,6 +222,42 @@ export const PreimageSourceSchema = z.discriminatedUnion('kind', [
       /** The PR's merge/squash commit — the post-fix (defect-absent) anchor; the matcher must stay SILENT on this. */
       mergeCommitSha: z.string().regex(COMMIT_SHA_RE, {
         message: 'mergeCommitSha must be a 40-character lowercase hex commit SHA',
+      }),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal('record'),
+      /**
+       * Prop 310 § Design 10 — half of the join key. The ADR-112 §8 producer-minted
+       * rule id the record was ingested under; pinned to the mint's codomain so a
+       * derivation that lost the id fails LOUD instead of anchoring the pair to a
+       * free-text label.
+       */
+      ruleId: z.string().regex(AUTHORED_RULE_ID_RE, {
+        message:
+          'ruleId must be a minted authored rule id — 16 hex chars + optional -<n> suffix (ADR-112 §3/§8)',
+      }),
+      /** The `examples[i]` ordinal within the record — the other half of the join key (§ Design 10). */
+      ordinal: z.number().int().nonnegative({
+        message: 'ordinal must be a non-negative `examples[i]` index (Prop 310 § Design 10)',
+      }),
+      /**
+       * Amendment 1 item 3 — the CR-blind per-pair content hash (`ruleExamplePairHash`),
+       * computed over the LF-image of the pair's material. The § Design 10 DRIFT SENSOR:
+       * an `examples` edit flips it, which flips the ledger `contentHash`, which reads
+       * `revised`. There is no second mechanism.
+       */
+      pairHash: z.string().regex(SHA256_HEX_RE, {
+        message: 'pairHash must be the CR-blind example-pair sha256 hex (Prop 310 Amendment 1)',
+      }),
+      /** The record's `examples[ordinal].bad` — the defect preimage the matcher must FIRE on (§4). */
+      badExample: z.string().refine((s) => s.trim().length > 0, {
+        message: 'badExample (the defect preimage the matcher must fire on) must be non-empty',
+      }),
+      /** The record's `examples[ordinal].good` — the fixed postimage the matcher must stay SILENT on (§4). */
+      goodExample: z.string().refine((s) => s.trim().length > 0, {
+        message: 'goodExample (the fixed form the matcher must stay silent on) must be non-empty',
       }),
     })
     .strict(),
@@ -236,7 +307,17 @@ export const AuthoredFixtureSchema = z
   // ZodEffects and break discriminator extraction).
   .superRefine((fixture, ctx) => {
     const src = fixture.preimageSource;
-    if (src.kind === 'lesson' && src.badExample.trim() === src.goodExample.trim()) {
+    // The two INLINE-EXEMPLAR kinds take one anti-vacuity floor: `lesson` carries
+    // its pair from the lesson corpus, `record` from the § Design 10 derivation off
+    // `examples[i].bad`/`.good`, and an identical pair is unconditionally vacuous
+    // whichever home authored it. (The record grammar requires both sides non-empty
+    // but does not require them to DIFFER, so this is the only gate that catches
+    // it.) One predicate rather than two identical branches — a second copy is how
+    // one of them silently stops matching the other's message.
+    if (
+      (src.kind === 'lesson' || src.kind === 'record') &&
+      src.badExample.trim() === src.goodExample.trim()
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         message:
@@ -611,6 +692,139 @@ const CompiledRuleBaseSchema = z.object({
    * reader falls back to the legacy engine-type proxy.
    */
   ruleClass: z.enum(['hard', 'advisory']).optional(),
+
+  // ─── Prop 310 V1 record-grammar compiled homes (§ Design 12) ───────────────
+  //
+  // The four homes the Existing-Surface Coupling table's lint-runtime row names
+  // as V1-BLOCKING build items (`excludeGlobs`, `requires`, `examples`,
+  // `language`), plus the verbatim `verificationShadow` carry (§ Design 9 /
+  // Amendment R4) and the two §§ Design 4 constructs total lowering forces a home
+  // for (`recoveryHint`, `curation` — see `record-lower.ts`'s contract comment).
+  //
+  // EVERY addition is OPTIONAL, and that is load-bearing, not stylistic: the 485
+  // mined/legacy rules in `.totem/compiled-rules.json` carry none of them, the
+  // rule-compilation freeze means nothing regenerates that file, and a required
+  // addition would fail the whole frozen corpus at `loadCompiledRules`. The
+  // mined-path byte-identity guard (`record-lower.test.ts`) is the proof: the
+  // shipped manifest re-validates unchanged under the extended schema, and zero
+  // of its rules carry any field added here.
+  //
+  // Absence is also the RECORD-PATH DISCRIMINATOR the runtime reads (see
+  // `isRecordPathRule` in `spine/record-runtime.ts`): a rule carrying any of
+  // these came from the Prop 310 path and gets the § Design 7 glob dialect;
+  // everything else keeps the shipped matcher byte-for-byte.
+  /**
+   * Prop 310 § Design 7 / mmnto-ai/totem#1574 — first-class structural
+   * exclusions. Entries are POSITIVE-form globs applied as exclusions: a file is
+   * in scope iff it matches some `fileGlobs` entry AND no `excludeGlobs` entry
+   * (`positiveMatch && !excludeMatch`). `!`-negation is a parse error in the
+   * record grammar, so an entry here never carries one.
+   */
+  excludeGlobs: z.array(z.string()).optional(),
+  /**
+   * Prop 310 § Design 8 — the absence / must-contain block. The rule fires on a
+   * target match at locus L iff `pattern` does NOT match within the declared
+   * scope containing L. `pattern` is a safe-regex2-gated regex evaluated
+   * TEXTUALLY, independent of `engine`; V1 carries exactly one block.
+   *
+   * The scope enum MIRRORS `RequiresScopeSchema` (`spine/rule-record.ts`) rather
+   * than importing it — `compiler-schema.ts` is an import-graph LEAF (zod only)
+   * and `spine/rule-record.ts` transitively imports it, so an import here would
+   * close a cycle. The two are COUPLED by an equality test in
+   * `record-lower.test.ts`, never left to drift on inspection. `block` is
+   * reserved-unimplemented at the grammar (§ Design 8) and therefore can never
+   * reach a compiled rule.
+   */
+  requires: z
+    .object({
+      pattern: z.string(),
+      scope: z.enum(['line', 'file']),
+    })
+    .optional(),
+  /**
+   * Prop 310 § Design 5 / § Design 10 — certification's PRIMARY PREIMAGE SOURCE
+   * (ADR-112 §4), and per Amendment 1 the record's block is the hand-editable
+   * home (the fixture envelope derives). Carried verbatim, in ordinal order: the
+   * `(ruleId, ordinal)` join key is positional, so a reorder is a re-pair.
+   *
+   * Deliberately NOT projected onto the legacy `badExample`/`goodExample` pair —
+   * that would be Tenet 20's prohibited mirror (two hand-editable homes for one
+   * object). Consumers that need a single exemplar read `examples[0]`.
+   */
+  examples: z
+    .array(
+      z.object({
+        bad: z.string(),
+        good: z.string(),
+      }),
+    )
+    // MIN-1 of the § Design 5 mandatory set, enforced HERE as well as at parse:
+    // `examples` is also the discriminator `isRecordPathRule` keys on, so an EMPTY
+    // array would make a rule read as record-path — taking the § Design 7 dialect
+    // and the two-array scope rule — while carrying zero exemplars for Stage 4,
+    // doctor, and `totem rule test` to read. No compiled record can be in that
+    // state (the grammar rejects it first); this closes the hand-edited-manifest
+    // hole so the predicate can never be true with nothing behind it. OPTIONAL is
+    // untouched: absence still means "legacy rule", which is every mined rule.
+    .min(1, {
+      message:
+        'examples must carry ≥1 bad/good pair when present — it is certification’s primary preimage source and the record-path discriminator (Prop 310 § Design 5)',
+    })
+    .optional(),
+  /**
+   * Prop 310 § Design 6 — the rule's grammar binding: the single declared
+   * language the ast-grep payload was validated under, resolved against the
+   * Map-backed `extensionToLanguage` registry at compile (built-ins + pack
+   * contributions), never a spec-frozen enum. Present only for record-path
+   * ast-grep rules; the record grammar FORBIDS `language` for regex.
+   */
+  language: z.string().optional(),
+  /**
+   * Prop 310 § Design 9 (Amendment R4) — the classification block, carried
+   * VERBATIM and **NEVER EVALUATED at V1**. Evaluation is gated by the ADR-103
+   * Amendment's proof-required-for-enforcement ruling (and any OPA wiring by
+   * Amendment R1's Q2 perf probe); when SMT lands, the verification result binds
+   * to the emitted artifact via the Amendment's R2 certificate chain. Any reader
+   * that starts EXECUTING this field has crossed the R4 gate — a doctrine change,
+   * not a code change.
+   *
+   * The record key keeps its shipped snake_case name (`verification_shadow`, a
+   * named § Design 4 exception); the COMPILED home is camelCase like every other
+   * field here — the rename happens exactly once, at lowering.
+   */
+  verificationShadow: z
+    .object({
+      type: z.string(),
+      source: z.string(),
+    })
+    .optional(),
+  /**
+   * Prop 310 § Design 4 — the optional author-supplied recovery hint. Compiled
+   * home added under § Design 12's total-lowering obligation: the parser admits
+   * the construct, so it either lands here or fails compile loud, and failing
+   * loud on a legal § Design 4 field is not an option. See `record-lower.ts`
+   * § "Total lowering, mechanically".
+   */
+  recoveryHint: z.string().optional(),
+  /**
+   * Prop 310 § Design 4 (R8) — Prop 270 §8's curation-provenance block, carried
+   * under the § Design 4 collision rename (`curation`, not `provenance` — that
+   * name is the ADR-112 producer's own output field). Compiled home added under
+   * § Design 12's total-lowering obligation, same grounds as `recoveryHint`.
+   *
+   * Shape mirrors `RuleCurationSchema` (`spine/rule-record.ts`) for the same
+   * import-graph-leaf reason as `requires.scope` above, and is coupled by test.
+   * The grammar's all-or-none process-trio refinement is a PARSE-stage rule; a
+   * compiled rule only ever carries a record that already satisfied it.
+   */
+  curation: z
+    .object({
+      sourceLesson: z.string(),
+      curatedBy: z.string().optional(),
+      curatedAt: z.string().optional(),
+      baseline5Phase: z.number().int().optional(),
+    })
+    .optional(),
 });
 
 /**

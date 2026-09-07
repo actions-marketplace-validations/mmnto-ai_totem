@@ -4,7 +4,16 @@ import * as path from 'node:path';
 import { stdin as input, stdout as output } from 'node:process';
 import * as readline from 'node:readline/promises';
 
+// totem-context: mmnto-ai/totem#2753 — the rule's startup-cost premise does not apply to THIS module, because `install-hooks.js` is reached only through `await import` (index.ts, index-lite.ts, doctor.ts, doctor-parity.ts, eject.ts, init.ts, shield.ts), so it is never on the `--help` graph, and the core barrel is already in its static graph via `../git.js` (`import { safeExec } from '@mmnto/totem'`) and `../artifact-vocabulary.js`. The dynamic form is also unavailable: `isAttestedTrailer` is a SYNCHRONOUS exported predicate by contract and `installGitHook` is synchronous, so the only alternative would be duplicating core's `parseForkMarker` regex in the CLI — the divergence the shared parser exists to prevent.
+import { parseForkMarker, writeFileAtomicSync } from '@mmnto/totem';
+
+import {
+  GROUNDING_ANCHOR_ISSUE,
+  GROUNDING_ANCHOR_RECORD,
+  PROMPT_SOURCE_OVERRIDE,
+} from '../artifact-vocabulary.js';
 import { resolveGitRoot } from '../git.js';
+import { SPEC_REQUIRED_SECTIONS } from './spec-templates.js';
 
 export const TOTEM_HOOK_MARKER = '[totem] post-merge hook';
 export const TOTEM_HOOK_END = '[totem] end post-merge';
@@ -14,6 +23,13 @@ export const TOTEM_PRECOMMIT_MARKER = '[totem] pre-commit hook';
 export const TOTEM_PRECOMMIT_END = '[totem] end pre-commit';
 export const TOTEM_PREPUSH_MARKER = '[totem] pre-push hook';
 export const TOTEM_PREPUSH_END = '[totem] end pre-push';
+
+/**
+ * Hex characters of each sha256 the strict reader's record SENSOR shows when
+ * a bound record has been revised (mmnto-ai/totem#2700). Identity at a glance,
+ * not a full digest — the comparison itself is over the whole hash.
+ */
+const RECORD_HASH_DISPLAY_PREFIX = 8;
 
 type HookManager = 'husky' | 'lefthook' | 'simple-git-hooks';
 
@@ -132,6 +148,312 @@ export function detectTotemPrefix(cwd: string): string {
   return 'npx totem';
 }
 
+// ─── Hook render options (mmnto-ai/totem#2692) ────────────────
+
+/** The `totemDir` every hook renders when the repo configures none. */
+export const DEFAULT_TOTEM_DIR = '.totem';
+
+/**
+ * Everything the four hook templates render FROM.
+ *
+ * Every field is REQUIRED on purpose. A defaulted parameter is exactly how a
+ * writer keeps rendering `.totem` under a repo that configured something else —
+ * the mmnto-ai/totem#2692 class, where the strict pre-commit reader and `totem
+ * spec`'s writer named different trees and the gate failed closed forever. With
+ * no default, the compiler forces every call site to thread the resolved value.
+ */
+export interface HookRenderOptions {
+  /** Enforcement tier the hook is generated at. */
+  tier: 'strict' | 'standard';
+  /** Repo-relative Totem directory the hook must name (config `totemDir`). */
+  totemDir: string;
+  /** Package-manager fallback invocation for the runtime resolve block. */
+  fallbackCmd: string;
+}
+
+/** {@link HookRenderOptions} plus the config file they were derived from. */
+export interface ResolvedHookRenderOptions extends HookRenderOptions {
+  /** Set when `tier` was PINNED by an explicit flag or by `hooks.tier` in config,
+   *  rather than falling through to the `'standard'` default. Callers that rewrite
+   *  an EXISTING hook use this to tell "the repo asked for standard" apart from
+   *  "nobody said" — only in the second case may the installed hook's own declared
+   *  tier decide, which is what stops a bare install from silently downgrading a
+   *  `--strict` hook (mmnto-ai/totem#2753 fold F4). */
+  tierPinned?: true;
+  /** The config that supplied the values; undefined when none resolved. */
+  configPath?: string;
+  /** Set when a config RESOLVED but would not load: the values are the defaults
+   *  and the failure was printed (mmnto-ai/totem#2692 amendment A8). */
+  configError?: string;
+}
+
+/**
+ * Whether `value` carries a character that cannot be rendered SAFELY into the
+ * managed hooks: a single quote (breaks the `sh` single-quoted word AND the
+ * single-quoted `node -e '…'` reader), a double quote or a backslash (breaks the
+ * JS string literal inside that reader), a dollar sign or a backtick (the only
+ * characters that stay ACTIVE inside the double-quoted `sh` words every guard
+ * uses — refusing them is what lets those sites keep the one plain
+ * double-quoted form `tools/*` ships; mmnto-ai/totem#2692 amendment A2), or a
+ * control character / newline (breaks both, and can forge lines in the hook
+ * body).
+ *
+ * Written as a code-point walk rather than a regex with escape literals so the
+ * predicate carries no escape sequence of its own to mis-author.
+ */
+export function hasUnrenderableTotemDirChar(value: string): boolean {
+  for (const ch of value) {
+    if (ch === "'" || ch === '"' || ch === '\\' || ch === '$' || ch === '`') return true;
+    const code = ch.codePointAt(0) ?? 0;
+    // Control characters, DEL, and everything non-ASCII: git C-quotes any path
+    // byte above 0x7e in the `diff --name-only` output the two `grep -q` diff
+    // filters read (`core.quotePath`, on by default), so a directory name
+    // carrying one could never match — the silent-skip class this closes.
+    if (code < 0x20 || code > 0x7e) return true;
+  }
+  return false;
+}
+
+/**
+ * Why `totemDir` cannot be rendered into the managed hooks, or `null` when it
+ * can (mmnto-ai/totem#2692 C4 + amendment A7). Two classes:
+ *
+ *  - CHARACTERS the quoting regimes cannot carry (see
+ *    {@link hasUnrenderableTotemDirChar}) — the `@mmnto/totem` schema refuses
+ *    the same set, so a validated config never reaches this arm.
+ *  - SHAPES the hooks could never govern, which the schema deliberately still
+ *    accepts because other verbs can use them (`.` is the global profile's own
+ *    spelling): empty, a trailing slash, `.`, a `.` or empty segment, a `..`
+ *    segment, a leading `-`. Each of these renders a hook whose post-merge /
+ *    post-checkout diff filter (`grep -q '<dir>/…'` over the repo-relative
+ *    paths git prints) can never match, or — for the empty value — an ABSOLUTE
+ *    run-store path in the strict pre-commit reader. The schema normalises a
+ *    trailing slash away; a raw value reaching a builder directly is refused,
+ *    never normalised here (a builder is a pure function of its options).
+ */
+export function hookTotemDirProblem(totemDir: string): string | null {
+  if (hasUnrenderableTotemDirChar(totemDir)) {
+    return 'a single quote, double quote, backslash, dollar sign, backtick, non-ASCII character, newline or control character cannot be safely rendered into the managed hooks (git C-quotes non-ASCII paths, so a diff filter naming one could never match)';
+  }
+  if (totemDir.length === 0) {
+    return "an empty totemDir renders an ABSOLUTE run-store path ('/artifacts/runs') into the strict pre-commit reader and a diff filter that matches every path";
+  }
+  if (totemDir.endsWith('/')) {
+    return "a trailing slash renders 'dir//…' into the post-merge / post-checkout diff filters, which then never match — spell it without the slash";
+  }
+  if (totemDir === '.') {
+    return "'.' names the config directory itself; the hooks' diff filters ('grep -q <dir>/…') could never match the repo-relative paths git prints";
+  }
+  const segments = totemDir.split('/');
+  if (segments.includes('.') || segments.includes('')) {
+    return "a '.' segment (or '//') never appears in the repo-relative paths git prints, so the diff filters would never match";
+  }
+  if (segments.includes('..')) {
+    return "a '..' segment points outside the worktree the hooks run in; git prints repo-relative paths, so the diff filters could never match";
+  }
+  if (totemDir.startsWith('-')) {
+    return "a leading '-' is read as an option by grep in the diff filters";
+  }
+  return null;
+}
+
+/**
+ * Refuse — loudly, naming the value and the reason — a `totemDir` the hook
+ * templates cannot render (mmnto-ai/totem#2692 C4/A7). Called by the resolver
+ * on the configured value and by every builder as the render-path backstop for
+ * direct-API and hand-threaded call sites.
+ *
+ * Throws rather than degrades: a hook rendered from a value we could not quote
+ * is a shell-injection surface, and silently falling back to `.totem` would
+ * re-create the very writer/reader split this slice closes (Tenet 4).
+ */
+export function assertRenderableTotemDir(totemDir: string): void {
+  const problem = hookTotemDirProblem(totemDir);
+  if (problem === null) return;
+  // A plain Error, unprefixed: this backstop sits on the SYNC render path (the
+  // builders), where `@mmnto/totem`'s TotemError cannot be lazy-imported; the
+  // resolver — the CLI's actual entry — raises the TotemError form of the same
+  // refusal. `handleError` adds the `[Totem Error]` tag, so the message carries
+  // none of its own (Gemini on mmnto-ai/totem#2701).
+  throw new Error(
+    `Refusing to render git hooks for totemDir ${JSON.stringify(totemDir)}: ${problem}. ` +
+      'Set `totemDir` to a plain relative directory inside the repo and re-run `totem hook install --force`.',
+  );
+}
+
+/**
+ * Escape a validated `totemDir` for a POSIX Basic Regular Expression — the two
+ * `grep -q '…'` diff filters. BRE specials are `\ ^ $ . * [ ]`; `^` and `$` are
+ * only special positionally, but escaping them unconditionally is still a
+ * literal match and keeps the rule one line.
+ */
+function escapeBre(value: string): string {
+  return value.replace(/[\\^$.*[\]]/g, '\\$&');
+}
+
+/**
+ * THE resolver: config → the options every hook writer renders from
+ * (mmnto-ai/totem#2692 C1).
+ *
+ * `tier` = explicit flag > `hooks.tier` from config > `'standard'` (the
+ * precedence `hooksCommand` already implemented, moved here so `totem init`,
+ * `installHooksNonInteractive` and the silent pre-push upgrade honor it too) —
+ * from whichever config resolves, global profile included, exactly as before.
+ *
+ * `totemDir` = the REPO-LOCAL config's `totemDir` > `.totem`. Repo-local only,
+ * and deliberately asymmetric with `tier`: the value is a path rendered into a
+ * hook that runs at the worktree top, so only this project's config can name it.
+ * The global `~/.totem/` profile `totem init --global` writes declares
+ * `totemDir: '.'` — describing that profile directory itself — and honoring it
+ * here would silently re-render every config-less repo's hooks against the
+ * checkout root on any machine that has a profile (the mmnto-ai/totem#2692 C3
+ * "no consumer's hooks drift on upgrade" invariant, and the same
+ * machine-dependence `doctor --parity` guards with `isGlobalConfigPath`).
+ *
+ * `fallbackCmd` = the lockfile probe anchored at `cwd` — pass the GIT ROOT, the
+ * anchor the installer has always used, so a hook installed from a subdirectory
+ * still names the repo's package manager.
+ *
+ * No config at all → the defaults, silently: a config-less repo installing hooks
+ * is a supported path, not an error. A config that RESOLVES but will not LOAD
+ * (a syntax error, a `totemDir` the schema refines out) → the defaults, LOUDLY:
+ * one line names the file and the failure, so a repo whose config says
+ * `knowledge/` never gets `.totem/` hooks without a word (mmnto-ai/totem#2692
+ * amendment A8 — the silent→loud shape of mmnto-ai/totem#2685). A config that
+ * loads but names a `totemDir` the hooks cannot govern (`.`, a `..` segment, a
+ * leading `-`) REFUSES — {@link assertRenderableTotemDir}.
+ */
+export async function resolveHookRenderOptions(
+  cwd: string,
+  flags?: { tier?: 'strict' | 'standard' },
+): Promise<ResolvedHookRenderOptions> {
+  const fallbackCmd = getFallbackCommand(cwd);
+  // `tierPinned` belongs on the DEFAULTS, not only on the fully-resolved return:
+  // both early exits below (no config anywhere, config present but unloadable)
+  // hand `defaults` straight back, and a flag is pinned in those states exactly as
+  // it is in the resolved one. Without it `tierForHook` would let an installed
+  // hook's own declaration override an explicit `--strict` / `--standard` in every
+  // config-less repo — `totem hook install --strict` a no-op, and `--force` writing
+  // the tier the user just asked to change (mmnto-ai/totem#2753 fold 3 F1).
+  const defaults: ResolvedHookRenderOptions = {
+    tier: flags?.tier ?? 'standard',
+    ...(flags?.tier === undefined ? {} : { tierPinned: true as const }),
+    totemDir: DEFAULT_TOTEM_DIR,
+    fallbackCmd,
+  };
+  const { loadConfig, loadEnv, resolveConfigPath, isGlobalConfigPath } =
+    await import('../utils.js');
+  loadEnv(cwd);
+
+  let configPath: string;
+  try {
+    configPath = resolveConfigPath(cwd);
+    // totem-context: no config anywhere (resolveConfigPath throws CONFIG_MISSING) is the honest-default path — hooks install in config-less repos by design.
+  } catch {
+    return defaults;
+  }
+
+  let config: Awaited<ReturnType<typeof loadConfig>>;
+  try {
+    config = await loadConfig(configPath);
+    // totem-context: LOUD default, not a swallow — the failure is printed on the line below and surfaced as `configError`; a repo whose config will not load still gets default hooks rather than an aborted install (mmnto-ai/totem#2692 A8, the silent→loud shape of mmnto-ai/totem#2685).
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error(
+      `[Totem] Could not load ${configPath} (${reason.split('\n')[0]}) — the git hooks are rendered at the defaults (totemDir '${DEFAULT_TOTEM_DIR}'); the tier follows an explicit flag, else the tier each installed hook declares, else 'standard'; fix the config and re-run \`totem hook install --force\`.`,
+    );
+    return { ...defaults, configError: reason };
+  }
+
+  const totemDir = isGlobalConfigPath(configPath)
+    ? DEFAULT_TOTEM_DIR
+    : (config.totemDir ?? DEFAULT_TOTEM_DIR);
+  // The CLI-layer form of the refusal: a TotemError with a recovery hint (the
+  // sync builders keep the plain-Error backstop, `assertRenderableTotemDir`).
+  const problem = hookTotemDirProblem(totemDir);
+  if (problem !== null) {
+    const { TotemError } = await import('@mmnto/totem');
+    throw new TotemError(
+      'CONFIG_INVALID',
+      `Refusing to render git hooks for totemDir ${JSON.stringify(totemDir)}: ${problem}`,
+      'Set `totemDir` to a plain relative directory inside the repo and re-run `totem hook install --force`.',
+    );
+  }
+  const pinned = flags?.tier ?? config.hooks?.tier;
+  return {
+    tier: pinned ?? 'standard',
+    ...(pinned === undefined ? {} : { tierPinned: true as const }),
+    totemDir,
+    fallbackCmd,
+    configPath,
+  };
+}
+
+/**
+ * The enforcement tier an INSTALLED hook declares (`TOTEM_HOOK_TIER="…"`), read from
+ * the TOTEM-OWNED BLOCK only — never from the whole file, so a user's own line
+ * carrying that assignment above an appended block cannot steer the render (the
+ * mmnto-ai/totem#2692 pass-2 F3 lesson, applied on the install side).
+ *
+ * `undefined` when the hook is absent, carries no marker, or predates the tier line.
+ *
+ * Only an ASSIGNMENT at the start of a line counts — the templates emit
+ * `TOTEM_HOOK_TIER="…"` unindented — so a comment inside the block that quotes the
+ * assignment (`# TOTEM_HOOK_TIER="strict" …`) cannot steer the render (Gemini,
+ * mmnto-ai/totem#2760 round 1).
+ *
+ * A hook with a start marker but NO end marker is read from the marker to EOF. That
+ * is a POLICY, not an observation about such files: everything below an unbounded
+ * start marker is TREATED as ours, because that file's one cure is `--force`, which
+ * discards the tail anyway. So a user line below it can only steer the render toward
+ * the tier it names — fail-closed toward strict, never a silent downgrade.
+ */
+export function declaredHookTier(
+  content: string,
+  marker: string,
+  endMarker: string,
+): 'strict' | 'standard' | undefined {
+  const start = content.indexOf(marker);
+  if (start === -1) return undefined;
+  const end = content.indexOf(endMarker, start + marker.length);
+  const block = end === -1 ? content.slice(start) : content.slice(start, end + endMarker.length);
+  return /^TOTEM_HOOK_TIER="(strict|standard)"/m.exec(block)?.[1] as
+    | 'strict'
+    | 'standard'
+    | undefined;
+}
+
+/**
+ * The tier to RENDER one hook at: an explicit flag or a configured `hooks.tier`
+ * (both carried as `render.tierPinned`) wins; otherwise the tier the hook already
+ * on disk declares; otherwise `render.tier` (the `'standard'` default).
+ *
+ * Without this last-but-one rung a bare `totem hook install` or `totem init` on a
+ * repo that pins no tier re-renders a `--strict` hook at standard — a SILENT
+ * enforcement downgrade performed by a command the user ran to stay current
+ * (mmnto-ai/totem#2753 fold F4). doctor already refuses to call a tier difference
+ * drift for exactly this reason (mmnto-ai/totem#2692 amendment A10); this is the
+ * writer-side half of that ruling.
+ */
+function tierForHook(
+  hooksDir: string,
+  hookName: string,
+  marker: string,
+  endMarker: string,
+  render: ResolvedHookRenderOptions,
+): 'strict' | 'standard' {
+  if (render.tierPinned === true) return render.tier;
+  const hookPath = path.join(hooksDir, hookName);
+  let existing: string;
+  try {
+    existing = fs.readFileSync(hookPath, 'utf-8');
+    // totem-context: an unreadable/absent hook simply has no declared tier to honor — the caller falls back to the resolved default, which is the pre-#2753 behavior, never a crash of the install.
+  } catch {
+    return render.tier;
+  }
+  return declaredHookTier(existing, marker, endMarker) ?? render.tier;
+}
+
 /**
  * Build a POSIX shell block that resolves the totem command at runtime.
  *
@@ -163,7 +485,9 @@ else
 fi`;
 }
 
-export function buildHookContent(fallbackCmd: string): string {
+export function buildHookContent(options: { fallbackCmd: string; totemDir: string }): string {
+  const { fallbackCmd, totemDir } = options;
+  assertRenderableTotemDir(totemDir);
   return `#!/bin/sh
 # ${TOTEM_HOOK_MARKER} — background re-index after pull/merge.
 
@@ -174,6 +498,17 @@ ${buildResolveBlock(fallbackCmd)}
 # exit-0-or-nothing contract (single-flight, atomic rename, no-clobber when gh is
 # missing) makes blind firing safe, and the merge must never wait on it. An absent
 # binary means the sidecar is not adopted here (non-cohort consumer) — skip silently.
+# A SECOND verb rides the same gate: \`totem-status refresh-obligation-store\`
+# (mmnto-ai/totem-status#127 slice-two residual, sibling of mmnto-ai/totem#2556)
+# writes the durable obligation store beside the GH snapshot, so it gets the same
+# post-merge moment. Same presence + primary-checkout gate, same backgrounded
+# subshell, same log — and each firing stamps its own verb= field, so the log
+# records WHICH verbs fired and in what order. That does NOT restore the #2570
+# per-child reap discriminator: child output carries no verb tag and the two
+# backgrounded children interleave nondeterministically, so a silent tail
+# attributes only to the LAST verb stamped. Reopen when the sidecar tags its own
+# output. Blind firing stays safe there too: the verb is in-process single-flight
+# only, so it races the daemon exactly the way its manual invocation already does.
 # PRIMARY checkout only ([ -d .git ]): in a linked worktree .git is a FILE, and a
 # detached child inheriting the worktree cwd holds a Windows directory lock that
 # breaks worktree removal; the primary's hooks + the daemon cover the workspace-level
@@ -181,9 +516,12 @@ ${buildResolveBlock(fallbackCmd)}
 if [ -d .git ] && command -v totem-status >/dev/null 2>&1; then
   # Observability leg (mmnto-ai/totem#2570): stamp each firing (time, cwd, and
   # WHICH binary resolved — the shell search order includes cwd on Windows, so
-  # a stale checkout-local exe can shadow the installed one) and hand the child
-  # the same log, so the verb's own success line lands after the stamp; a stamp
-  # with nothing after it means the child never finished. Repo-local inside
+  # a stale checkout-local exe can shadow the installed one) and hand the children
+  # the same log, so their output lands after the stamps. Measured caveat now that
+  # TWO verbs share one log: child output is unlabelled and the two children
+  # interleave nondeterministically, so a silent tail no longer discriminates per
+  # child — it attributes only to the LAST verb stamped. The stamps still record
+  # which verbs fired, and in what order. Repo-local inside
   # .git (never tracked, per-repo, writable wherever git itself writes); 1 MiB
   # self-cap. If the log is not writable, fall back to the previous blind
   # firing — the 2>/dev/null PRECEDES the append so the open failure itself
@@ -194,17 +532,25 @@ if [ -d .git ] && command -v totem-status >/dev/null 2>&1; then
   # fields pass through tr -d '[:cntrl:]' so a crafted checkout path cannot
   # forge stamp lines or inject terminal controls into the log.
   if [ -f "$TS_REFRESH_LOG" ] && [ "$(( $(wc -c < "$TS_REFRESH_LOG" 2>/dev/null || echo 0) ))" -gt 1048576 ]; then : > "$TS_REFRESH_LOG"; fi
-  if printf '[%s] post-merge spawn cwd=%s bin=%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(pwd | tr -d '[:cntrl:]')" "$(command -v totem-status | tr -d '[:cntrl:]')" 2>/dev/null >> "$TS_REFRESH_LOG"; then
+  if printf '[%s] post-merge spawn cwd=%s bin=%s verb=%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(pwd | tr -d '[:cntrl:]')" "$(command -v totem-status | tr -d '[:cntrl:]')" refresh-gh 2>/dev/null >> "$TS_REFRESH_LOG"; then
     (totem-status refresh-gh >> "$TS_REFRESH_LOG" 2>&1 &)
   else
     (totem-status refresh-gh >/dev/null 2>&1 &)
+  fi
+  # Second verb, same gate and same log. Written out rather than looped so the
+  # stamp and the backgrounded invocation each carry a literal verb — a reader of
+  # the hook (or of the log) never has to resolve a variable to know which fired.
+  if printf '[%s] post-merge spawn cwd=%s bin=%s verb=%s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(pwd | tr -d '[:cntrl:]')" "$(command -v totem-status | tr -d '[:cntrl:]')" refresh-obligation-store 2>/dev/null >> "$TS_REFRESH_LOG"; then
+    (totem-status refresh-obligation-store >> "$TS_REFRESH_LOG" 2>&1 &)
+  else
+    (totem-status refresh-obligation-store >/dev/null 2>&1 &)
   fi
 fi
 
 # Only sync when lessons changed (suppress errors if ORIG_HEAD is missing).
 # The trailing -- terminates the revision list so a ref/path ambiguity can never
 # reinterpret ORIG_HEAD/HEAD as pathspecs.
-if [ -n "$TOTEM_CMD" ] && git diff-tree -r --name-only ORIG_HEAD HEAD -- 2>/dev/null | grep -q '\\.totem/lessons/'; then
+if [ -n "$TOTEM_CMD" ] && git diff-tree -r --name-only ORIG_HEAD HEAD -- 2>/dev/null | grep -q '${escapeBre(totemDir)}/lessons/'; then
   # Resolve the real git dir so the sync-log redirect works in a linked worktree,
   # where .git is a FILE (gitdir: pointer), not a directory (mmnto-ai/totem#2376).
   GIT_DIR_RESOLVED=$(git rev-parse --git-dir 2>/dev/null || echo .git)
@@ -214,7 +560,12 @@ fi
 `;
 }
 
-export function buildPostCheckoutHookContent(fallbackCmd: string): string {
+export function buildPostCheckoutHookContent(options: {
+  fallbackCmd: string;
+  totemDir: string;
+}): string {
+  const { fallbackCmd, totemDir } = options;
+  assertRenderableTotemDir(totemDir);
   return `#!/bin/sh
 # ${TOTEM_CHECKOUT_MARKER} — background re-index on branch switch.
 
@@ -230,17 +581,17 @@ ${buildResolveBlock(fallbackCmd)}
 # where .git is a FILE (gitdir: pointer), not a directory (mmnto-ai/totem#2376).
 GIT_DIR_RESOLVED=$(git rev-parse --git-dir 2>/dev/null || echo .git)
 
-# Handle initial checkout (null SHA) — sync if .totem/ exists
+# Handle initial checkout (null SHA) — sync if ${totemDir}/ exists
 if [ "$1" = "0000000000000000000000000000000000000000" ]; then
-  if [ -n "$TOTEM_CMD" ] && [ -d ".totem" ]; then
+  if [ -n "$TOTEM_CMD" ] && [ -d "${totemDir}" ]; then
     ($TOTEM_CMD sync --incremental --quiet > "$GIT_DIR_RESOLVED/totem-sync.log" 2>&1) &
   fi
   exit 0
 fi
 
-# Only sync when .totem/ files differ between branches. The trailing -- terminates
+# Only sync when ${totemDir}/ files differ between branches. The trailing -- terminates
 # the revision list so the "$1"/"$2" SHAs can never be reinterpreted as pathspecs.
-if [ -n "$TOTEM_CMD" ] && git diff --name-only "$1" "$2" -- 2>/dev/null | grep -q '\\.totem/'; then
+if [ -n "$TOTEM_CMD" ] && git diff --name-only "$1" "$2" -- 2>/dev/null | grep -q '${escapeBre(totemDir)}/'; then
   ($TOTEM_CMD sync --incremental --quiet > "$GIT_DIR_RESOLVED/totem-sync.log" 2>&1) &
 fi
 # ${TOTEM_CHECKOUT_END}
@@ -248,27 +599,50 @@ fi
 }
 
 /**
- * Generate helper shell scripts under `.totem/hooks/` for hook manager integration.
- * These scripts contain the full guard logic (diff checks, null-SHA guards) that
- * bare inline commands would skip.
+ * Generate helper shell scripts under `<totemDir>/hooks/` for hook manager
+ * integration. These scripts contain the full guard logic (diff checks, null-SHA
+ * guards) that bare inline commands would skip.
+ *
+ * Takes the RESOLVED {@link ResolvedHookRenderOptions} rather than resolving config
+ * itself: both callers already hold the one resolution for this invocation, and
+ * a required parameter is the same compiler-enforced thread the builders use
+ * (mmnto-ai/totem#2692 C1/C2). `tierPinned` rides along so this path applies the
+ * SAME tier rule the git-hook writers do — a hook-manager repo is not a repo whose
+ * enforcement tier may be silently reset (mmnto-ai/totem#2753 fold 3 F2).
  */
-export function generateHookHelpers(
-  gitRoot: string,
-  fallbackCmd: string,
-  options?: { tier?: 'strict' | 'standard' },
-): void {
-  const hooksDir = path.join(gitRoot, '.totem', 'hooks');
+export function generateHookHelpers(gitRoot: string, render: ResolvedHookRenderOptions): void {
+  // Refuse BEFORE the mkdir: the helper dir is joined from the value, and a
+  // `..` segment would create a directory outside the checkout before any
+  // builder got the chance to refuse it (mmnto-ai/totem#2692 amendment A7).
+  assertRenderableTotemDir(render.totemDir);
+  const hooksDir = path.join(gitRoot, render.totemDir, 'hooks');
   fs.mkdirSync(hooksDir, { recursive: true });
 
-  const postMerge = buildHookContent(fallbackCmd);
-  const postCheckout = buildPostCheckoutHookContent(fallbackCmd);
-  const preCommit = buildPreCommitHook(options?.tier);
-  const prePush = buildPrePushHook(fallbackCmd, options?.tier);
+  const postMerge = buildHookContent(render);
+  const postCheckout = buildPostCheckoutHookContent(render);
+  // Only these two carry `TOTEM_HOOK_TIER`, so only these two can be downgraded.
+  // The declaration is read from the helper ALREADY on disk, exactly as the git-hook
+  // path reads it from the installed hook.
+  const preCommit = buildPreCommitHook({
+    ...render,
+    tier: tierForHook(
+      hooksDir,
+      'pre-commit.sh',
+      TOTEM_PRECOMMIT_MARKER,
+      TOTEM_PRECOMMIT_END,
+      render,
+    ),
+  });
+  const prePush = buildPrePushHook({
+    ...render,
+    tier: tierForHook(hooksDir, 'pre-push.sh', TOTEM_PREPUSH_MARKER, TOTEM_PREPUSH_END, render),
+  });
 
-  fs.writeFileSync(path.join(hooksDir, 'post-merge.sh'), postMerge, { mode: 0o755 });
-  fs.writeFileSync(path.join(hooksDir, 'post-checkout.sh'), postCheckout, { mode: 0o755 });
-  fs.writeFileSync(path.join(hooksDir, 'pre-commit.sh'), preCommit, { mode: 0o755 });
-  fs.writeFileSync(path.join(hooksDir, 'pre-push.sh'), prePush, { mode: 0o755 });
+  // Atomic like every other git-hook write (mmnto-ai/totem#2760 round 1, leg F2).
+  writeExecutableHook(path.join(hooksDir, 'post-merge.sh'), postMerge);
+  writeExecutableHook(path.join(hooksDir, 'post-checkout.sh'), postCheckout);
+  writeExecutableHook(path.join(hooksDir, 'pre-commit.sh'), preCommit);
+  writeExecutableHook(path.join(hooksDir, 'pre-push.sh'), prePush);
 }
 
 function detectHookManager(cwd: string): HookManager | null {
@@ -297,49 +671,63 @@ function detectHookManager(cwd: string): HookManager | null {
   return null;
 }
 
-function printHookManagerGuidance(manager: HookManager): void {
+/**
+ * Print the manual wiring a detected hook manager needs. `totemDir` is the
+ * RESOLVED value the helper scripts were just written under — guidance that
+ * names `.totem/` in a repo that configured something else points the consumer
+ * at files that do not exist (mmnto-ai/totem#2692 C5).
+ */
+function printHookManagerGuidance(manager: HookManager, totemDir: string): void {
+  // The validator accepts whitespace in a totemDir; an unquoted word would split
+  // into two arguments in every consumer's shell (CodeRabbit on
+  // mmnto-ai/totem#2701). Quote only when needed so the default guidance stays
+  // the familiar `sh .totem/hooks/…`. `$` and a backtick are refused upstream, so
+  // double quotes are inert; the JSON form escapes them for package.json.
+  const needsQuotes = /\s/.test(totemDir);
+  const sh = needsQuotes ? `"${totemDir}"` : totemDir;
+  const json = needsQuotes ? `\\"${totemDir}\\"` : totemDir;
   switch (manager) {
     case 'husky':
       console.error('[Totem] Detected husky. Add the following to your hook files:');
       console.error('');
       console.error('  # .husky/pre-commit');
-      console.error('  sh .totem/hooks/pre-commit.sh');
+      console.error(`  sh ${sh}/hooks/pre-commit.sh`);
       console.error('');
       console.error('  # .husky/pre-push');
-      console.error('  sh .totem/hooks/pre-push.sh');
+      console.error(`  sh ${sh}/hooks/pre-push.sh`);
       console.error('');
       console.error('  # .husky/post-merge');
-      console.error('  sh .totem/hooks/post-merge.sh');
+      console.error(`  sh ${sh}/hooks/post-merge.sh`);
       console.error('');
       console.error('  # .husky/post-checkout');
-      console.error('  sh .totem/hooks/post-checkout.sh');
+      console.error(`  sh ${sh}/hooks/post-checkout.sh`);
       break;
     case 'lefthook':
       console.error('[Totem] Detected lefthook. Add to your lefthook.yml:');
       console.error('  pre-commit:');
       console.error('    commands:');
       console.error('      totem-block-main:');
-      console.error('        run: sh .totem/hooks/pre-commit.sh');
+      console.error(`        run: sh ${sh}/hooks/pre-commit.sh`);
       console.error('  pre-push:');
       console.error('    commands:');
       console.error('      totem-review:');
-      console.error('        run: sh .totem/hooks/pre-push.sh');
+      console.error(`        run: sh ${sh}/hooks/pre-push.sh`);
       console.error('  post-merge:');
       console.error('    commands:');
       console.error('      totem-sync:');
-      console.error('        run: sh .totem/hooks/post-merge.sh');
+      console.error(`        run: sh ${sh}/hooks/post-merge.sh`);
       console.error('  post-checkout:');
       console.error('    commands:');
       console.error('      totem-sync-checkout:');
-      console.error('        run: sh .totem/hooks/post-checkout.sh');
+      console.error(`        run: sh ${sh}/hooks/post-checkout.sh`);
       break;
     case 'simple-git-hooks':
       console.error('[Totem] Detected simple-git-hooks. Add to your package.json:');
       console.error('  "simple-git-hooks": {');
-      console.error('    "pre-commit": "sh .totem/hooks/pre-commit.sh",');
-      console.error('    "pre-push": "sh .totem/hooks/pre-push.sh",');
-      console.error('    "post-merge": "sh .totem/hooks/post-merge.sh",');
-      console.error('    "post-checkout": "sh .totem/hooks/post-checkout.sh"');
+      console.error(`    "pre-commit": "sh ${json}/hooks/pre-commit.sh",`);
+      console.error(`    "pre-push": "sh ${json}/hooks/pre-push.sh",`);
+      console.error(`    "post-merge": "sh ${json}/hooks/post-merge.sh",`);
+      console.error(`    "post-checkout": "sh ${json}/hooks/post-checkout.sh"`);
       console.error('  }');
       break;
   }
@@ -370,12 +758,14 @@ export async function installPostMergeHook(
     return;
   }
 
-  const fallbackCmd = getFallbackCommand(gitRoot);
+  // One config read per invocation, anchored at the git root — the same anchor
+  // getFallbackCommand has always used (mmnto-ai/totem#2692 C1).
+  const render = await resolveHookRenderOptions(gitRoot, { tier: options?.tier });
   const manager = detectHookManager(gitRoot);
 
   if (manager) {
-    generateHookHelpers(gitRoot, fallbackCmd, options);
-    printHookManagerGuidance(manager);
+    generateHookHelpers(gitRoot, render);
+    printHookManagerGuidance(manager, render.totemDir);
     return;
   }
 
@@ -407,32 +797,35 @@ export async function installPostMergeHook(
 
   // Idempotency: check if already installed
   if (fs.existsSync(hookPath)) {
-    const existing = fs.readFileSync(hookPath, 'utf-8');
+    // Raw bytes are the user's file; the decoded text serves the probes only.
+    const raw = fs.readFileSync(hookPath);
+    const existing = raw.toString('utf-8');
     if (existing.includes(TOTEM_HOOK_MARKER)) {
       console.log('[Totem] Post-merge hook already installed.');
       return;
     }
 
-    // Append to existing hook — reuse buildHookContent, strip shebang
+    // Append to existing hook — reuse buildHookContent, strip shebang. Written as
+    // one atomic replacement of the whole file (the user's RAW bytes + ours) rather
+    // than an append: an interrupted append leaves a hook truncated mid-block,
+    // which git still runs (mmnto-ai/totem#2760 round 1, leg F2). The helper
+    // keeps the user's file mode.
     const separator = existing.endsWith('\n') ? '' : '\n';
-    const appendBlock = buildHookContent(fallbackCmd)
+    const appendBlock = buildHookContent(render)
       .replace(/^#!\/bin\/sh\n/, '')
       .trimStart();
-    fs.appendFileSync(hookPath, separator + '\n' + appendBlock);
+    writeFileAtomicSync(
+      hookPath,
+      Buffer.concat([raw, Buffer.from(separator + '\n' + appendBlock, 'utf-8')]),
+    );
     console.log('[Totem] Appended post-merge hook to existing hook file.');
     return;
   }
 
-  // Create new hook
+  // Create new hook — atomic, executable on POSIX, mode skipped on Windows by the
+  // helper's own boundary (git bash owns the bit there).
   fs.mkdirSync(hooksDir, { recursive: true });
-  fs.writeFileSync(hookPath, buildHookContent(fallbackCmd));
-
-  // Make executable (no-op on Windows, git bash handles it)
-  try {
-    fs.chmodSync(hookPath, 0o755);
-  } catch {
-    // chmod may fail on Windows — hooks still work via git bash
-  }
+  writeExecutableHook(hookPath, buildHookContent(render));
 
   console.log('[Totem] Installed post-merge hook.');
 }
@@ -449,13 +842,399 @@ fi`;
 
 // ─── Enforcement hooks (pre-commit + pre-push) ──────────
 
-export function buildPreCommitHook(tier?: 'strict' | 'standard'): string {
-  const effectiveTier = tier ?? 'standard';
+export function buildPreCommitHook(options: {
+  tier: 'strict' | 'standard';
+  totemDir: string;
+}): string {
+  const effectiveTier = options.tier;
+  const totemDir = options.totemDir;
+  assertRenderableTotemDir(totemDir);
+  // The run store the strict arm reads, rendered from the CONFIGURED totemDir so
+  // the reader names the tree `totem spec` actually writes (mmnto-ai/totem#2692).
+  const runsDir = `${totemDir}/artifacts/runs`;
+  // Strict-tier evidence (mmnto-ai/totem#2690, tightened by
+  // mmnto-ai/totem#2700): the gate names `totem spec`, so it must pass on what
+  // `totem spec` actually writes — the grounded run artifact under
+  // <totemDir>/artifacts/runs/ (mmnto-ai/totem#2100; written on every
+  // successful run, --fresh included) whose TOP-LEVEL
+  // admission.runMetadata.caller is "spec". The read is JSON-aware on purpose:
+  // the run store is written by every orchestrator caller, and a `review`
+  // artifact's inputBundle embeds the reviewed diff — a substring grep would
+  // pass the gate on a review of any text that merely QUOTES the key (this
+  // very test fixture). node is already assumed by the pre-push template's
+  // format-check block; ~50 ms, no CLI boot, nothing written (Tenet 13). The
+  // former <totemDir>/cache/.spec-completed marker is NOT honored: no CLI path
+  // ever wrote it, so "compatibility" with it would be compatibility with a
+  // hand hack (operator ruling 2026-08-29 — no legacy shims while there is no
+  // hard consumer, Tenet 19).
+  //
+  // #2700 adds the second half of the rule: an artifact is EVIDENCE only when
+  // it is ANCHORED (`grounding.anchor.kind` of "issue" or "record" — a
+  // "free-text" or "mixed" run is the confabulation surface the rule exists
+  // for) and its SUBJECT carries a real shape. The SUBJECT depends on the
+  // anchor: for an `issue` run it is the draft (`output.content`); for a
+  // `record` run it is the RECORD'S OWN BYTES, re-read from disk at commit
+  // time — the draft is discarded on that path, so checking it would check
+  // nothing. The record's sha256 is compared and REPORTED (matches / revised
+  // since binding) but never blocks: blocking on revision would price every
+  // fold of a design record at one LLM call, the friction this slice retires.
+  //
+  // #2737 fixes what that shape check MEASURED, on both halves. A body now ends
+  // only at a heading of the SAME OR SHALLOWER level: a deeper heading neither
+  // ends the body nor counts as one, so a section that opens with a `####`
+  // sub-heading is no longer read as empty (it was, in 3 of the 7 recorded R3
+  // drafts, on the longest section each of them wrote). And a promised heading
+  // is matched EXACTLY first, then — only if nothing matched — tolerantly, with
+  // ONE trailing parenthetical group stripped from BOTH sides: symmetric, so a
+  // dropped `(structural constraint)` and a differing `(required)` both match,
+  // and LEVEL-EXACT, because the `###` marker is part of the compared string
+  // (`## Problem Statement` never satisfies `### Problem Statement`). A
+  // tolerant match is never silent: the pass line carries `· tolerated
+  // <promised> ~ <found>` for each one, so the drift is disclosed on the commit
+  // that relied on it rather than absorbed. Trailing whitespace is not drift —
+  // `trimEnd()` settles it on the exact pass, and nothing is named.
+  //
+  // Exit vocabulary: 0 evidence · 2 no spec artifact · 3 the newest spec
+  // artifact is NOT evidence (reason on stdout) · anything else = the reader
+  // itself could not run. The evidence line makes a stale pass VISIBLE (age
+  // from the artifact's own createdAt); a freshness rule is a separate policy,
+  // deliberately not here. This is the ONLY reader of the rule — the repo's
+  // pre-managed-era `.gemini/hooks/BeforeTool.js` (unregistered, inert) was
+  // deleted with the marker rather than kept in step.
+  //
+  // Every value the reader compares against is RENDERED from the one canonical
+  // constant via JSON.stringify (the runsDir precedent): the required section
+  // headings from `SPEC_REQUIRED_SECTIONS`, the anchor kinds and the
+  // prompt-source spelling from the core schema's exported constants. The hook
+  // text can never drift from the writer's vocabulary by re-spelling it.
+  //
+  // The artifact is a plain JSON file a seat can hand-edit, and its NAME comes
+  // off the filesystem, so nothing echoed is trusted as text: EVERY value that
+  // reaches stdout — the artifact's path, its `createdAt`, `anchor.kind`,
+  // `anchor.ref`, `anchor.sha256`, the resolved realpath of a bound record,
+  // each required heading, and, on a tolerant match, the draft line it matched
+  // — passes through `safe()` first, except the two sha256 prefixes in
+  // `recordStatus`, which the preceding `/^[0-9a-f]{64}$/` block proves hex. A
+  // newline in any of them would otherwise forge a second `[Totem]` line in the
+  // hook's own output; `safe()` collapses C0 (0x00–0x1f), the DEL/C1 band
+  // (0x7f–0x9f), and U+2028/U+2029, because U+0085 (NEL) breaks a line on some
+  // terminals and U+2028/U+2029 are line separators for the same purpose.
+  //
+  // `safe()` is necessary but NOT sufficient, because it cannot see the attack
+  // that lives in PRINTABLE bytes (mmnto-ai/totem#2737 fold 3). A literal
+  // backslash followed by `n` is two printable characters, so it passes
+  // `safe()` untouched — and the hole was open wherever `/bin/sh` EXPANDS
+  // backslash escapes in `echo`: `dash`, which is `/bin/sh` on Debian and
+  // Ubuntu, and macOS's own `/bin/sh`, a bash built with `xpg_echo` on. On
+  // those the pair becomes a real newline at the shell and forges the second
+  // `[Totem]` line (`\\c` truncates the line instead, swallowing the cure text
+  // that follows). Only Git Bash and a plain bash leave it inert, so the hole
+  // was invisible in exactly the shells a seat develops in. The two
+  // sinks that echo an untrusted value — the evidence line and the BLOCKED
+  // reason, both carrying `$spec_evidence` — therefore print through
+  // `printf '%s\\n'`, which is defined to treat its ARGUMENT as literal text on
+  // every POSIX shell. The remaining echoes in this block carry only
+  // `$reader_status` (an integer from `$?`) and the render-time `runsDir`
+  // (validated by `assertRenderableTotemDir`, which refuses a backslash), so
+  // neither can carry the payload.
+  // Containment is decided by RESOLUTION, not by inspecting one segment, and
+  // it is decided TWICE. Lexically first: a `record` ref that is absolute
+  // (either path flavor) or whose `path.resolve` against `process.cwd()` — the
+  // worktree top git runs hooks from — lands outside it is refused, so
+  // `sub/../../x.md` and `./../x.md` are caught where a first-segment test let
+  // them through, while a mid-path `..` that stays inside stays legal. Then by
+  // REALPATH, once the ref is known to exist and before its bytes are read: an
+  // in-repo SYMLINK whose target lives outside the tree is lexically contained
+  // and would otherwise be read and judged, so the resolved pair is compared
+  // too and the block names both spellings. A `record` anchor whose `sha256` is
+  // missing and one whose `sha256` is not a 64-hex digest are refused with
+  // their OWN reasons — "no sha256" and "not a 64-hex digest" are different
+  // repairs — rather than as one malformed sensor line. Every reason and the
+  // pass line go out through `fs.writeSync(1, …)`: `process.stdout.write` is
+  // asynchronous on a pipe (macOS), so `process.exit` could truncate the text
+  // the `sh` arm is about to echo.
   const strictBlock = `
-# Strict mode: require spec before commit
+# Strict mode: require spec EVIDENCE before commit (mmnto-ai/totem#2690, mmnto-ai/totem#2700).
+# Evidence = a totem spec run artifact (${runsDir}/*.json with a
+# top-level admission.runMetadata.caller of "spec"), read JSON-aware — a
+# substring match would accept a review artifact that merely quotes the key —
+# that is ANCHORED on an issue or a bound design record, and whose subject
+# carries a real shape: every promised heading (level-exact; a trailing
+# parenthetical may differ or be dropped, and the evidence line names it) each
+# with a non-blank body before the next heading of the same or shallower level
+# (an issue run drafted by the built-in prompt), or at least one heading with a body (a
+# record run, or an issue run drafted under a custom prompt). A record run is
+# judged on the bytes of the record at grounding.anchor.ref, re-read here from
+# the worktree top; its sha256 is REPORTED, never enforced.
+# The former ${totemDir}/cache/.spec-completed marker is not honored (no CLI wrote it).
 if [ "$is_agent" = "1" ] || [ "$TOTEM_HOOK_TIER" = "strict" ]; then
-  if [ ! -f ".totem/cache/.spec-completed" ]; then
-    echo "[Totem] BLOCKED: Run 'totem spec <issue>' before committing (strict mode)"
+  spec_evidence=$(node -e '
+const fs = require("fs");
+const crypto = require("crypto");
+const nodePath = require("path");
+const dir = ${JSON.stringify(runsDir)};
+const REQUIRED = ${JSON.stringify(SPEC_REQUIRED_SECTIONS)};
+const KIND_ISSUE = ${JSON.stringify(GROUNDING_ANCHOR_ISSUE)};
+const KIND_RECORD = ${JSON.stringify(GROUNDING_ANCHOR_RECORD)};
+const PROMPT_OVERRIDE = ${JSON.stringify(PROMPT_SOURCE_OVERRIDE)};
+let names = [];
+try { names = fs.readdirSync(dir); } catch (err) { names = []; }
+let best = null;
+for (const name of names) {
+  if (!name.endsWith(".json")) continue;
+  let a = null;
+  try { a = JSON.parse(fs.readFileSync(dir + "/" + name, "utf8")); } catch (err) { continue; }
+  const caller = a && a.admission && a.admission.runMetadata && a.admission.runMetadata.caller;
+  if (["spec"].indexOf(caller) < 0) continue;
+  const at = ["string"].indexOf(typeof a.createdAt) < 0 ? "" : a.createdAt;
+  if (!best || at > best.at) best = { name: name, at: at, art: a };
+}
+if (!best) process.exit(2);
+const file = dir + "/" + best.name;
+// fs.writeSync, not process.stdout.write: stdout is a PIPE here (the sh arm
+// captures it) and a piped write is asynchronous on macOS, so process.exit
+// below could truncate the very text the sh arm is about to echo.
+function emit(text) { fs.writeSync(1, text); }
+function block(reason) { emit(reason); process.exit(3); }
+function safe(text) {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const control = code < 32 || (code >= 127 && code <= 159) || [8232, 8233].indexOf(code) > -1;
+    out = out + (control ? "?" : text.charAt(i));
+  }
+  return out;
+}
+const shownFile = safe(file);
+const shownAt = safe(best.at);
+function headingLevel(line) {
+  let n = 0;
+  while (n < line.length && ["#"].indexOf(line.charAt(n)) > -1) n = n + 1;
+  if (n < 1 || n > 6) return 0;
+  if ([" ", "\\t"].indexOf(line.charAt(n)) < 0) return 0;
+  return line.slice(n + 1).trim().length > 0 ? n : 0;
+}
+function stripParen(s) {
+  const t = s.trimEnd();
+  if (t.charAt(t.length - 1) !== ")") return t;
+  const open = t.lastIndexOf("(");
+  if (open < 1) return t;
+  return t.slice(0, open).trimEnd();
+}
+function escapesTop(rel) {
+  const norm = rel.split("\\\\").join("/");
+  if (nodePath.win32.isAbsolute(norm) || nodePath.posix.isAbsolute(norm)) return true;
+  return [".."].indexOf(norm) > -1 || ["../"].indexOf(norm.slice(0, 3)) > -1;
+}
+function outsideWorktree(r) {
+  const norm = r.split("\\\\").join("/");
+  if (nodePath.win32.isAbsolute(norm) || nodePath.posix.isAbsolute(norm)) return true;
+  const top = process.cwd();
+  return escapesTop(nodePath.relative(top, nodePath.resolve(top, norm)));
+}
+const art = best.art;
+const grounding = art.grounding;
+const anchor = grounding && grounding.anchor;
+if (!anchor || ["string"].indexOf(typeof anchor.kind) < 0) block("the newest spec run artifact (" + shownFile + ") predates the anchored-evidence rule (no grounding.anchor)");
+const kind = anchor.kind;
+const ref = ["string"].indexOf(typeof anchor.ref) < 0 ? "(no ref)" : anchor.ref;
+const shownKind = safe(kind);
+const shownRef = safe(ref);
+if (kind !== KIND_ISSUE && kind !== KIND_RECORD) block("the newest spec run artifact (" + shownFile + ") is anchored " + shownKind + " (" + shownRef + "), which is not gate evidence");
+let subject = "";
+let shape = "";
+let recordStatus = "";
+if (kind !== KIND_RECORD) {
+  const content = art.output && art.output.content;
+  if (["string"].indexOf(typeof content) < 0) block("the newest spec run artifact (" + shownFile + ") is not evidence: the draft is not text");
+  subject = content;
+  const meta = art.admission && art.admission.runMetadata;
+  const source = meta && meta.promptSource;
+  shape = source !== PROMPT_OVERRIDE ? "TEMPLATE" : "DOCUMENT";
+} else {
+  if (outsideWorktree(ref)) block("the bound record ref is outside the worktree: " + shownRef);
+  const bound = ["string"].indexOf(typeof anchor.sha256) < 0 ? "" : anchor.sha256;
+  if (bound.length < 1) block("the record anchor carries no sha256 — not evidence (" + shownFile + ")");
+  if (!/^[0-9a-f]{64}$/.test(bound)) block("the record anchor sha256 is not a 64-hex digest (" + safe(bound) + ") — not evidence (" + shownFile + ")");
+  const missingRecord = "the bound record is missing at " + shownRef + " (bound by " + shownFile + ")";
+  if (!fs.existsSync(ref)) block(missingRecord);
+  const realRef = fs.realpathSync.native(ref);
+  if (escapesTop(nodePath.relative(fs.realpathSync.native(process.cwd()), realRef))) block("the bound record resolves outside the worktree: " + shownRef + " -> " + safe(realRef));
+  let bytes = null;
+  let read = false;
+  try { bytes = fs.readFileSync(ref); read = true; } catch (err) { read = false; }
+  if (!read) block(missingRecord);
+  subject = bytes.toString("utf8");
+  shape = "DOCUMENT";
+  const now = crypto.createHash("sha256").update(bytes).digest("hex");
+  recordStatus = now !== bound ? "record revised since binding (bound " + bound.slice(0, ${RECORD_HASH_DISPLAY_PREFIX}) + ", now " + now.slice(0, ${RECORD_HASH_DISPLAY_PREFIX}) + ")" : "record sha256 matches";
+}
+if ([65279].indexOf(subject.charCodeAt(0)) > -1) subject = subject.slice(1);
+const lines = subject.split("\\n");
+const tolerated = [];
+// Fences (mmnto-ai/totem#2769), by the CommonMark rule: a line indented at most
+// three spaces whose first run is three or more backticks or tildes OPENS a
+// fence — a backtick run only when the rest of the line carries no backtick —
+// and a CLOSER is the same character, at least as long, with nothing else on
+// the line; an unclosed fence runs to the end of the draft. A delimiter line
+// is neither a heading, a match candidate, nor body. A line inside a fence is
+// neither a heading nor a match candidate — a promised heading quoted there
+// (the skeleton pasted as an example) is not the section it names, and is not
+// body for the section above it either — but any other non-blank fenced line
+// IS body: a section whose content is one code block is a written section.
+const TICK = String.fromCharCode(96);
+const fenceLine = [];
+const inFence = [];
+const fenceOpenedAt = [];
+let fenceChar = "";
+let fenceLen = 0;
+let openedAt = 0;
+for (let i = 0; i < lines.length; i++) {
+  const line = lines[i];
+  let indent = 0;
+  while (indent < line.length && [" "].indexOf(line.charAt(indent)) > -1) indent = indent + 1;
+  const ch = line.charAt(indent);
+  let run = 0;
+  if (indent < 4 && [TICK, "~"].indexOf(ch) > -1) {
+    while (indent + run < line.length && [ch].indexOf(line.charAt(indent + run)) > -1) run = run + 1;
+  }
+  const rest = line.slice(indent + run);
+  if (fenceChar.length < 1) {
+    const opens = run >= 3 && ([TICK].indexOf(ch) < 0 || rest.indexOf(TICK) < 0);
+    if (opens) { fenceChar = ch; fenceLen = run; openedAt = i + 1; fenceLine.push(true); inFence.push(false); fenceOpenedAt.push(0); continue; }
+    fenceLine.push(false); inFence.push(false); fenceOpenedAt.push(0);
+    continue;
+  }
+  // Only spaces and tabs may follow a closer (CommonMark); JS trim() would also
+  // strip Unicode spaces such as U+00A0, so a closer that Markdown keeps open
+  // would read as closed here and a fenced skeleton after it would reach the
+  // gate (Greptile P1 on mmnto-ai/totem#2769).
+  const closes = run >= fenceLen && [fenceChar].indexOf(ch) > -1 && rest.split(" ").join("").split("	").join("").length < 1;
+  if (closes) { fenceChar = ""; fenceLen = 0; fenceLine.push(true); inFence.push(false); fenceOpenedAt.push(0); continue; }
+  fenceLine.push(false); inFence.push(true); fenceOpenedAt.push(openedAt);
+}
+// A line of only # characters and whitespace (mmnto-ai/totem#2769): not a
+// heading (no text) and not body either — it is the skeleton of one. Inside a
+// fence it is code, and code is body.
+function bareHashes(line) {
+  const t = line.trim();
+  return t.length > 0 && t.split("#").join("").length < 1;
+}
+function levelAt(i) {
+  if (fenceLine[i] || inFence[i]) return 0;
+  return headingLevel(lines[i]);
+}
+// A promised heading, spelled exactly or with one trailing parenthetical
+// dropped (the same tolerance the matcher extends), whatever its indentation.
+function promisedHeading(text) {
+  const t = text.trim();
+  if (REQUIRED.indexOf(t) > -1) return true;
+  const w = stripParen(t);
+  for (const h of REQUIRED) { if ([w].indexOf(stripParen(h)) > -1) return true; }
+  return false;
+}
+function isBody(i) {
+  if (fenceLine[i]) return false;
+  if (lines[i].trim().length < 1) return false;
+  if (inFence[i]) return !promisedHeading(lines[i]);
+  return !bareHashes(lines[i]);
+}
+// Why a section read as empty when it was not blank: the reader says which
+// rule emptied it, so the cure is never a line the seat can see and not explain.
+function emptyReason(start, level) {
+  let quoted = false;
+  let hashes = false;
+  let fences = false;
+  for (let i = start + 1; i < lines.length; i++) {
+    const n = levelAt(i);
+    if (n > 0 && n <= level) break;
+    if (n > 0) continue;
+    if (fenceLine[i]) fences = true;
+    else if (inFence[i] && lines[i].trim().length > 0) quoted = true;
+    else if (bareHashes(lines[i])) hashes = true;
+  }
+  const found = [];
+  if (quoted) found.push("a promised heading quoted inside a fenced code block");
+  if (hashes) found.push("a line of # characters");
+  if (fences && !quoted) found.push("an empty fenced code block");
+  if (found.length < 1) return "";
+  return " — nothing under it counts as body: " + found.join("; ");
+}
+function hasBodyAfter(start, level) {
+  for (let i = start + 1; i < lines.length; i++) {
+    const n = levelAt(i);
+    if (n > 0 && n <= level) return false;
+    if (n > 0) continue;
+    if (isBody(i)) return true;
+  }
+  return false;
+}
+function candidate(i) {
+  return !fenceLine[i] && !inFence[i];
+}
+function fencedCopyOf(heading) {
+  const want = stripParen(heading);
+  for (let i = 0; i < lines.length; i++) {
+    if (!inFence[i]) continue;
+    const seen = lines[i].trim();
+    if ([heading].indexOf(seen) > -1 || [want].indexOf(stripParen(seen)) > -1) return i;
+  }
+  return -1;
+}
+// The fence still open when the scan ended, if any — its copy of a heading
+// gets the cure that fits (close it) rather than the one that does not.
+const unclosedAt = fenceChar.length > 0 ? openedAt : 0;
+function fenceCure(openLine) {
+  if (unclosedAt > 0 && [unclosedAt].indexOf(openLine) > -1) return " (that fence is never closed — close it with a bare closing fence: the same character, at least as long, nothing else on the line — or write the section outside it)";
+  return " (write the section outside the fence)";
+}
+if (shape !== "DOCUMENT") {
+  for (const heading of REQUIRED) {
+    let at = -1;
+    for (let i = 0; i < lines.length; i++) { if (candidate(i) && [heading].indexOf(lines[i].trimEnd()) > -1) { at = i; break; } }
+    let matchedAs = "";
+    if (at < 0) {
+      const want = stripParen(heading);
+      for (let i = 0; i < lines.length; i++) { if (candidate(i) && [want].indexOf(stripParen(lines[i].trimEnd())) > -1) { at = i; break; } }
+      if (at > -1) { matchedAs = safe(lines[at].trimEnd()); tolerated.push(safe(heading) + " ~ " + matchedAs); }
+    }
+    if (at < 0) {
+      const fencedAt = fencedCopyOf(heading);
+      if (fencedAt > -1) block("the draft in " + shownFile + " is missing heading " + safe(heading) + " — it appears only inside a fenced code block opened at line " + fenceOpenedAt[fencedAt] + fenceCure(fenceOpenedAt[fencedAt]));
+      block("the draft in " + shownFile + " is missing heading " + safe(heading));
+    }
+    const shownHeading = safe(heading) + (matchedAs.length > 0 ? " (matched as " + matchedAs + ")" : "");
+    if (!hasBodyAfter(at, levelAt(at))) block("the draft in " + shownFile + " has an empty heading " + shownHeading + emptyReason(at, levelAt(at)));
+  }
+} else {
+  let bodied = false;
+  for (let i = 0; i < lines.length; i++) { const n = levelAt(i); if (n > 0 && hasBodyAfter(i, n)) { bodied = true; break; } }
+  if (!bodied && kind !== KIND_RECORD) block("the draft in " + shownFile + " has no heading with a body (custom prompt: the built-in template skeleton is not required)");
+  if (!bodied) block("the bound record at " + shownRef + " has no heading with a body");
+}
+const stamp = best.at ? Date.parse(best.at) : NaN;
+const days = Number.isNaN(stamp) ? -1 : Math.floor((Date.now() - stamp) / 86400000);
+let out = shownFile + " (" + (shownAt || "undated") + (days >= 0 ? ", " + days + " days old" : "") + ")";
+out = out + " · anchor " + shownKind + " " + shownRef + " · shape " + shape;
+if (tolerated.length > 0) out = out + " · tolerated " + tolerated.join("; ");
+if (recordStatus.length > 0) out = out + " · " + recordStatus;
+emit(out);
+' 2>/dev/null)
+  # Reader status: 0 = evidence found · 2 = no spec artifact at all · 3 = the
+  # newest spec artifact is NOT evidence (the reason is on stdout) · anything
+  # else = the reader itself could not run (node missing from PATH, a crash) —
+  # each reported distinctly, never as "no evidence", and all fail-closed.
+  reader_status=$?
+  if [ "$reader_status" = "0" ] && [ -n "$spec_evidence" ]; then
+    printf '%s\\n' "[Totem] spec evidence: $spec_evidence"
+  elif [ "$reader_status" = "3" ]; then
+    printf '%s\\n' "[Totem] BLOCKED: $spec_evidence — run 'totem spec <issue>' or 'totem spec --from <record>' (add --fresh if the response is cached) (strict mode)"
+    exit 1
+  elif [ "$reader_status" != "2" ]; then
+    echo "[Totem] BLOCKED: the spec-evidence reader could not run (node exit status $reader_status — node missing from PATH, or ${runsDir}/ unreadable); fix the runtime and retry (strict mode)"
+    exit 1
+  else
+    echo "[Totem] BLOCKED: Run 'totem spec <issue>' before committing (strict mode) — no totem spec run artifact under ${runsDir}/ in this checkout"
     exit 1
   fi
 fi`;
@@ -479,8 +1258,92 @@ ${strictBlock}
 `;
 }
 
-export function buildPrePushHook(fallbackCmd: string, tier?: 'strict' | 'standard'): string {
-  const effectiveTier = tier ?? 'standard';
+export function buildPrePushHook(options: {
+  fallbackCmd: string;
+  tier: 'strict' | 'standard';
+  totemDir: string;
+}): string {
+  const { fallbackCmd, totemDir } = options;
+  const effectiveTier = options.tier;
+  assertRenderableTotemDir(totemDir);
+  // The review-leg floor (mmnto-ai/totem#2698; doctrine `model-tiering.md`
+  // § Review legs — a self-authored judgment-dense diff owes one falsification
+  // leg before it is presented). The gate itself derives everything: whether
+  // the push is legs-owed (the changed-file set against `hooks.legsOwed.globs`,
+  // read at RUN time so a glob edit needs no hook re-install) and whether a
+  // deposit ancestor-or-equal of HEAD answers for it. The hook maps that
+  // derivation onto exit codes and NOTHING else — the tier changes only which
+  // code blocks, never a line of the text.
+  //
+  // Since mmnto-ai/totem#2771 the repo's `hooks.legsOwed.enforce` (read at run
+  // time by the gate, like the globs) can arm this ONE gate at any tier
+  // (`'block'`) or soften it at every tier (`'advisory'`) without touching the
+  // spec-evidence and shield arms. The hook never reads the knob: it reads the
+  // EXIT CODE the gate has already mapped through it. So 3 and 2 block on
+  // every tier — under the advisory flag they only ever come back when the
+  // knob says block — and only a failure before the derivation (an unloadable
+  // config, which is also how the knob would go unread) stays strict-only,
+  // which keeps a knob-less install byte-for-byte on its old behaviour.
+  //
+  // Slotted BEFORE the shield block deliberately: on strict this is a sub-second
+  // local read, and paying for the slow review gate before discovering the push
+  // is legs-owed wastes the operator's minute and an LLM call.
+  //
+  // The `--help` probe is the `--gate` / `--scope-to-diff` precedent, with the
+  // OPPOSITE fallback (mmnto-ai/totem#2698 OQ2, ruled): those flags degrade to
+  // a bare sensor form that still runs, while an ABSENT VERB has no degraded
+  // form at all. So strict FAILS CLOSED with the one-command cure, and only the
+  // advisory tiers print the compat line and pass.
+  //
+  // It probes the VERB'S OWN help for an option only that verb has, never the
+  // group's help for the word `gate` (mmnto-ai/totem#2698 fold 2). A CLI that
+  // predates `totem legs` answers ANY `legs …` invocation with its curated
+  // TOP-LEVEL help and exits 0 — measured on `@mmnto/cli` 1.122.0 — so a
+  // group-level `grep gate` is really grepping the top-level command list,
+  // which is a moving surface: the queued `merge-gate` verb
+  // (mmnto-ai/totem#2708) would make the probe pass on a CLI that has no
+  // `legs gate` at all. `--advisory` is specific to this verb, so its presence
+  // in that output means the verb itself answered.
+  const legsBlock = `
+  # The review-leg floor: require a fresh falsification-leg deposit for
+  # legs-owed pushes (mmnto-ai/totem#2698, doctrine/model-tiering.md § Review legs).
+  # Exit vocabulary of \`totem legs gate\`: 0 = not owed, or a deposit answers for
+  # this head · 3 = owed with no fresh deposit · 2 = the gate could not derive
+  # (not a git repo, HEAD or the branch diff unresolvable). The strict tier and
+  # agent seats run the bare gate; the other tiers pass --advisory, under which
+  # the gate prints the SAME lines and exits 0 — unless the repo's
+  # hooks.legsOwed.enforce says 'block', in which case the gate exits 3 or 2 at
+  # any tier and this hook blocks on it (mmnto-ai/totem#2771); 'advisory' makes
+  # it exit 0 at any tier. A status other than 0, 2 or 3 is a failure before
+  # the derivation (an unloadable config) and blocks only on the strict arm.
+  if $TOTEM_CMD legs gate --help 2>/dev/null | grep -q -- '--advisory'; then
+    legs_strict=0
+    if [ "$is_agent" = "1" ] || [ "$TOTEM_HOOK_TIER" = "strict" ]; then
+      legs_strict=1
+      $TOTEM_CMD legs gate
+      legs_status=$?
+    else
+      $TOTEM_CMD legs gate --advisory
+      legs_status=$?
+    fi
+    if [ "$legs_status" = "3" ]; then
+      echo "[Totem] BLOCKED: this push is legs-owed and carries no fresh falsification-leg deposit — run the leg, then 'totem legs deposit --sha HEAD --from <findings.json>' (mmnto-ai/totem#2698; strict mode, an agent seat, or hooks.legsOwed.enforce: block)"
+      exit 1
+    elif [ "$legs_status" = "2" ]; then
+      echo "[Totem] BLOCKED: the legs gate could not derive (totem legs gate exit status 2) — fix the checkout and retry (strict mode, an agent seat, or hooks.legsOwed.enforce: block)"
+      exit 1
+    elif [ "$legs_status" != "0" ] && [ "$legs_strict" = "1" ]; then
+      echo "[Totem] BLOCKED: the legs gate failed before deriving (totem legs gate exit status $legs_status) — fix the config or the CLI and retry (strict mode or an agent seat)"
+      exit 1
+    fi
+  else
+    if [ "$is_agent" = "1" ] || [ "$TOTEM_HOOK_TIER" = "strict" ]; then
+      echo "[Totem] BLOCKED: this hook expects 'totem legs gate' (mmnto-ai/totem#2698) but the resolved CLI lacks it — 'npm i -g @mmnto/cli@latest' (strict mode or an agent seat)" >&2
+      exit 1
+    else
+      echo "[totem] Hook running without the legs gate (CLI predates 'totem legs'); 'npm i -g @mmnto/cli@latest' enables it." >&2
+    fi
+  fi`;
   // Strict-tier gate per Proposal 273 § 6 Q2 (mmnto-ai/totem#1908): operator-invoked
   // is the default for new checks while behavior calibrates. Doctor's `--strict`
   // mode gates on repo-state `fail` results; unconditional firing would break
@@ -516,7 +1379,7 @@ ${buildResolveBlock(fallbackCmd)}
 
 if [ -n "$TOTEM_CMD" ]; then
   # Verify compile manifest is current
-  if [ -f ".totem/compile-manifest.json" ]; then
+  if [ -f "${totemDir}/compile-manifest.json" ]; then
     if ! $TOTEM_CMD verify-manifest > /dev/null 2>&1; then
       echo "[totem] Push blocked: compile manifest is stale. Run 'totem lesson compile'." >&2
       exit 1
@@ -524,14 +1387,14 @@ if [ -n "$TOTEM_CMD" ]; then
   fi
 
   # Run deterministic lint
-  if [ -f ".totem/compiled-rules.json" ]; then
+  if [ -f "${totemDir}/compiled-rules.json" ]; then
     if ! $TOTEM_CMD lint; then
       exit 1
     fi
   fi
 
   # Verify shields.io badges in README.md (mmnto-ai/totem#1926 — deterministic claim-discipline)
-  if [ -f "README.md" ] && [ -f ".totem/compiled-rules.json" ]; then
+  if [ -f "README.md" ] && [ -f "${totemDir}/compiled-rules.json" ]; then
     if ! $TOTEM_CMD verify-badges; then
       exit 1
     fi
@@ -554,7 +1417,7 @@ if [ -n "$TOTEM_CMD" ]; then
   # missing-Goal-prefix, covenant-without-backing). Fires only when at
   # least one in-scope surface exists. Bypass with mandatory justification:
   #   TOTEM_GATE_BYPASS_JUSTIFICATION="<reason>" git push
-  if [ -f ".totem/compiled-rules.json" ] && { [ -f "README.md" ] || [ -f "AGENTS.md" ] || [ -f "design-tenets.md" ] || [ -d "docs/wiki" ]; }; then
+  if [ -f "${totemDir}/compiled-rules.json" ] && { [ -f "README.md" ] || [ -f "AGENTS.md" ] || [ -f "design-tenets.md" ] || [ -d "docs/wiki" ]; }; then
     # --scope-to-diff (mmnto-ai/totem#2002): narrow the WWND scan to files
     # touched in the current push diff. Eliminates the standing-gate
     # false-positive class where pre-existing warnings on in-scope surfaces
@@ -577,6 +1440,7 @@ if [ -n "$TOTEM_CMD" ]; then
       fi
     fi
   fi
+${legsBlock}
 ${shieldBlock}
 fi
 
@@ -620,16 +1484,25 @@ const OWNED_WHOLE_FILE_PREAMBLE_RE = /^#![^\n]*\n#[ \t]*$/;
 const HOOK_EXECUTABLE_MODE = 0o755;
 
 /**
- * Write a hook file and mark it executable. On POSIX the chmod failure propagates
- * (Tenet 4 — a hook git cannot execute must fail loud, never silently report
- * `installed`). On Windows the exec bit is skipped explicitly: git-bash owns the
- * executable bit there, and NTFS has no POSIX mode to set.
+ * Write a hook file and mark it executable — ATOMICALLY (core's
+ * `writeFileAtomicSync`, the Tenet 4 user-file mutation helper, mmnto-ai/totem#2620):
+ * the bytes land in a same-directory temp, the mode is applied to the temp, and
+ * the rename comes last, so an interrupted install leaves the old hook or the new
+ * one and never a truncated file. That matters most on the attested-extension
+ * rewrite (mmnto-ai/totem#2753): the trailer is the consumer's own lines, which no
+ * template can regenerate (Greptile P1, mmnto-ai/totem#2760 round 1).
+ *
+ * On POSIX a mode failure propagates from the helper (a hook git cannot execute
+ * must fail loud, never silently report `installed`). On Windows the exec bit is
+ * skipped by the helper's own boundary: git-bash owns the executable bit there,
+ * and NTFS has no POSIX mode to set. Symlinked hooks keep their link identity
+ * (the helper writes through to the real path). A DANGLING symlinked hook is the
+ * one case the old in-place write handled differently: `fs.writeFileSync` followed
+ * the link and created its target, the helper throws ENOENT and leaves the link
+ * untouched — remove or re-point the link first. Declared, not defended.
  */
-function writeExecutableHook(hookPath: string, content: string): void {
-  fs.writeFileSync(hookPath, content);
-  if (process.platform !== 'win32') {
-    fs.chmodSync(hookPath, HOOK_EXECUTABLE_MODE);
-  }
+function writeExecutableHook(hookPath: string, content: string | Buffer): void {
+  writeFileAtomicSync(hookPath, content, { mode: HOOK_EXECUTABLE_MODE });
 }
 
 /**
@@ -651,20 +1524,198 @@ function writeExecutableHook(hookPath: string, content: string): void {
  *     overwrite would clobber it, so such a file is NOT owned (only trailing
  *     whitespace may follow the end marker).
  */
-function isTotemOwnedWholeFile(content: string, marker: string, endMarker: string): boolean {
+export function isTotemOwnedWholeFile(content: string, marker: string, endMarker: string): boolean {
+  const trailerStart = ownedTrailerStart(content, marker, endMarker);
+  if (trailerStart === undefined) return false;
+  return content.slice(trailerStart).trim().length === 0;
+}
+
+/**
+ * The offset just past the totem end marker — where a trailer would begin — for a
+ * hook whose managed region OPENS the file and is BOUNDED. `undefined` when either
+ * rule fails: no start marker, user content before it (beyond a shebang + the start
+ * of the marker comment), or no end marker after it (the legacy-hook path).
+ *
+ * The one shared prefix/bound rule behind {@link isTotemOwnedWholeFile} and
+ * {@link isTotemOwnedWithAttestedTrailer} — the two differ ONLY in what they
+ * accept after this offset (mmnto-ai/totem#2753).
+ */
+function ownedTrailerStart(content: string, marker: string, endMarker: string): number | undefined {
   const idx = content.indexOf(marker);
-  if (idx === -1) return false;
+  if (idx === -1) return undefined;
   const before = content.slice(0, idx);
   if (before.trim().length !== 0 && !OWNED_WHOLE_FILE_PREAMBLE_RE.test(before)) {
-    return false;
+    return undefined;
   }
   const end = content.indexOf(endMarker, idx + marker.length);
   // Start marker present but end marker missing → region cannot be bounded →
-  // not safe to whole-file overwrite without --force (also the legacy-hook path).
-  if (end === -1) return false;
-  if (content.slice(end + endMarker.length).trim().length !== 0) return false;
-  return true;
+  // not safe to rewrite without --force (also the legacy-hook path).
+  if (end === -1) return undefined;
+  return end + endMarker.length;
 }
+
+/**
+ * {@link ownedTrailerStart} as a BYTE offset into the raw file — the offset the
+ * block-rewrite arm slices the trailer at — or `undefined` when the managed region
+ * (start of file through the end marker) does not decode as UTF-8 losslessly.
+ *
+ * The string offset converts to a byte offset only if the region's re-encoded text
+ * equals its raw bytes; totem wrote the region, so it does, and the equality check
+ * PROVES it rather than assuming it. A region that fails it is not totem's text any
+ * more — an ANSI-editor save that turned the template's em dash into one `0x97`
+ * byte, say — so the installer reports that shape (`skipped-non-utf8`) and doctor
+ * classifies it (`non-utf8`) instead of either guessing an offset or prescribing a
+ * bare install that would decline (mmnto-ai/totem#2760 legs F9 and F13). The
+ * trailer's own bytes are never decoded by anything that writes them back.
+ */
+export function ownedTrailerByteStart(
+  raw: Buffer,
+  marker: string,
+  endMarker: string,
+): number | undefined {
+  const existing = raw.toString('utf-8');
+  const trailerStart = ownedTrailerStart(existing, marker, endMarker);
+  if (trailerStart === undefined) return undefined;
+  const prefixBytes = Buffer.from(existing.slice(0, trailerStart), 'utf-8');
+  return raw.subarray(0, prefixBytes.length).equals(prefixBytes) ? prefixBytes.length : undefined;
+}
+
+/**
+ * A trailer (the text after a managed hook's end marker) is ATTESTED when its
+ * LEADING COMMENT RUN carries a full fork attestation — reason, owner and attested
+ * all present and non-empty AFTER TRIMMING; a whitespace-only value does not attest
+ * (mmnto-ai/totem#2753; the trim from mmnto-ai/totem#2760 round 1).
+ *
+ * The leading comment run is every line up to the first line that is neither blank
+ * nor a shell comment — i.e. up to the extension's first COMMAND. Blank lines inside
+ * the run are skipped. The attestation is core's `<!-- totem:fork … -->` marker
+ * (`parseForkMarker`), the same shape the parity detector reads, on a comment line:
+ *
+ *     (blank)
+ *     # [lc] docs-inject extension
+ *     # <!-- totem:fork reason="…" owner="satur8d" attested="2026-06-07" -->
+ *     sh "tools/git-hooks/pre-commit-docs-inject.sh"
+ *
+ * The run, not the first line: a real consumer labels its block before it signs it.
+ * That is the measured liquid-city shape — `tools/git-hooks/install.cjs` emits a
+ * `# [lc] <name> extension` line FIRST and the fork marker SECOND — and a
+ * first-line-only rule declined the very datum this slice was built from
+ * (mmnto-ai/liquid-city#1174).
+ *
+ * Two things do NOT attest, and both matter:
+ *   - A marker below the first command. An attestation buried under code vouches
+ *     for nothing above it, so the run ends at that command.
+ *   - A marker on a NON-comment line. `rm -rf / # <!-- totem:fork … -->` is a
+ *     command, not a signature; only a line whose trimmed text STARTS with `#` can
+ *     carry one.
+ *
+ * The marker must also sit on ONE line: `parseForkMarker` is applied per line here,
+ * so core's multi-line (dotAll) form of the marker is deliberately not in play.
+ *
+ * A BARE `totem:fork` marker — or one missing any of the three fields — is not
+ * attested either. That asymmetry with the parity detector (where a bare marker is
+ * enough to CLAIM a fork) is deliberate: carrying a consumer's lines through a
+ * managed-block rewrite is a maintenance promise, and a promise needs a name, a
+ * reason and a date.
+ */
+export function isAttestedTrailer(trailer: string): boolean {
+  for (const line of trailer.split('\n')) {
+    const trimmed = line.trim();
+    // Blank lines sit inside the run — the measured shape opens with one.
+    if (trimmed.length === 0) continue;
+    // The first command ends the run: nothing below it can vouch for it.
+    if (!trimmed.startsWith('#')) return false;
+    const fork = parseForkMarker(line);
+    // Trimmed: core's parser captures the quoted value raw, so `reason=" "` would
+    // otherwise pass a length check — a promise with no name is not a promise
+    // (Greptile P2, mmnto-ai/totem#2760 round 1).
+    if (
+      fork !== undefined &&
+      typeof fork.reason === 'string' &&
+      fork.reason.trim().length > 0 &&
+      typeof fork.owner === 'string' &&
+      fork.owner.trim().length > 0 &&
+      typeof fork.attested === 'string' &&
+      fork.attested.trim().length > 0
+    ) {
+      return true;
+    }
+  }
+  // Blank/whitespace-only, or a comment run with no full marker in it.
+  return false;
+}
+
+/**
+ * The mmnto-ai/totem#2406 owned-whole-file shape with ONE relaxation: the trailer may
+ * be non-blank if it is attested ({@link isAttestedTrailer}).
+ *
+ * The precondition for the in-place managed-block rewrite: totem still owns
+ * everything from the top of the file through the end marker, and what follows it is
+ * a consumer extension that named itself. Everything before the end marker is
+ * regenerated; everything after it is carried through byte-for-byte.
+ */
+export function isTotemOwnedWithAttestedTrailer(
+  content: string,
+  marker: string,
+  endMarker: string,
+): boolean {
+  const trailerStart = ownedTrailerStart(content, marker, endMarker);
+  if (trailerStart === undefined) return false;
+  return isAttestedTrailer(content.slice(trailerStart));
+}
+
+/**
+ * The trailer as it must be re-attached after a regenerated managed block: the BYTES
+ * after `endMarker` with exactly ONE leading line terminator (`\r\n` or `\n`)
+ * removed. The canonical hook text already ends with the end marker's own
+ * terminator, so re-attaching the raw slice would duplicate it (the `upgradeReflexes`
+ * seam precedent in init.ts). Everything past that one terminator is untouched —
+ * and never decoded: the trailer is the consumer's own file, and a byte that does
+ * not round-trip UTF-8 must come back as itself (mmnto-ai/totem#2760 leg F9).
+ */
+function trailerTailAfterEndMarker(raw: Buffer, trailerStart: number): Buffer {
+  const trailer = raw.subarray(trailerStart);
+  if (trailer[0] === 0x0d && trailer[1] === 0x0a) return trailer.subarray(2);
+  if (trailer[0] === 0x0a) return trailer.subarray(1);
+  return trailer;
+}
+
+/**
+ * The action {@link installGitHook} took on one git hook — the git-hook half of the
+ * vocabulary {@link ManagedSessionHookAction} carries for session hooks:
+ *   - `installed`         — no hook was there; the canonical file was created.
+ *   - `exists`            — present and already current: no write. Includes an
+ *                           attested-extension hook whose managed BLOCK already
+ *                           equals the canonical (mmnto-ai/totem#2753), and the
+ *                           declines — a legacy hook with no end marker, a user hook
+ *                           carrying an appended block, and an UNATTESTED trailer —
+ *                           each of which takes one `totem hook install --force`.
+ *   - `appended`          — a user shell hook carrying no totem marker: the block was
+ *                           appended below the user's own content.
+ *   - `overwritten`       — the WHOLE file was written: a `--force` overwrite, or the
+ *                           bare drift-repair of a totem-owned whole file
+ *                           (mmnto-ai/totem#2138).
+ *   - `block-rewritten`   — the managed block was regenerated IN PLACE and the
+ *                           attested `totem:fork` extension after its end marker was
+ *                           carried through byte-for-byte. Bare only —
+ *                           `--force` still rewrites the whole file.
+ *   - `skipped-non-shell` — a hook with a non-shell interpreter: never touched.
+ *   - `skipped-non-utf8`  — an attested-extension hook whose MANAGED REGION does not
+ *                           decode as UTF-8 (an ANSI-editor save, say): the block
+ *                           cannot be rewritten in place without guessing a byte
+ *                           offset, so the file is left byte-identical and the
+ *                           skip is REPORTED — re-save as UTF-8, or `--force`
+ *                           (mmnto-ai/totem#2760 leg F13). The extension's own
+ *                           bytes are never the reason: they are carried as bytes.
+ */
+export type GitHookAction =
+  | 'installed'
+  | 'exists'
+  | 'appended'
+  | 'skipped-non-shell'
+  | 'skipped-non-utf8'
+  | 'overwritten'
+  | 'block-rewritten';
 
 /**
  * Install a single git hook with idempotency and chain preservation.
@@ -680,6 +1731,17 @@ function isTotemOwnedWholeFile(content: string, marker: string, endMarker: strin
  * templates now emit one. Drift-repair fires only when the caller threads the end
  * marker AND the on-disk hook carries it — a legacy pre-end-marker hook declines to
  * `exists` and takes one `totem hook install --force`.
+ *
+ * Since mmnto-ai/totem#2753 a THIRD arm sits between drift-repair and the decline: a
+ * file totem owns through its end marker whose trailer is an ATTESTED `totem:fork`
+ * extension ({@link isTotemOwnedWithAttestedTrailer}) has its managed block rewritten
+ * IN PLACE (`block-rewritten`) — the canonical text plus the existing trailer,
+ * byte-identical past the seam. That is the liquid-city shape: a consumer appending
+ * its own blocks after totem's end marker never received a managed-hook upgrade
+ * through bare `totem init` (measured at `@mmnto/cli` 1.123.0,
+ * mmnto-ai/liquid-city#1174). An UNATTESTED trailer still declines to `exists`,
+ * unchanged. `--force` is untouched by all of this: it overwrites the WHOLE file,
+ * trailer included.
  */
 export function installGitHook(
   hooksDir: string,
@@ -688,11 +1750,17 @@ export function installGitHook(
   marker: string,
   force?: boolean,
   endMarker?: string,
-): 'installed' | 'exists' | 'appended' | 'skipped-non-shell' | 'overwritten' {
+): GitHookAction {
   const hookPath = path.join(hooksDir, hookName);
 
   if (fs.existsSync(hookPath)) {
-    const existing = fs.readFileSync(hookPath, 'utf-8');
+    // Raw bytes are the user's file; the decoded text serves the PROBES only
+    // (markers, shebang, terminator). Every write below that carries the user's
+    // content carries it as BYTES — a hook that does not round-trip UTF-8 must
+    // never come back with U+FFFD where its bytes were (the mmnto-ai/totem#2620
+    // eject ruling, re-learned on mmnto-ai/totem#2760 leg F8).
+    const raw = fs.readFileSync(hookPath);
+    const existing = raw.toString('utf-8');
     if (existing.includes(marker)) {
       if (force) {
         // Force overwrite — replace the entire hook with the new content
@@ -713,6 +1781,32 @@ export function installGitHook(
         writeExecutableHook(hookPath, hookContent);
         return 'overwritten';
       }
+      // In-place managed-block rewrite (mmnto-ai/totem#2753): totem owns the file
+      // through its end marker and what follows is an ATTESTED `totem:fork`
+      // extension. Regenerate the block, carry the trailer through byte-for-byte.
+      // The currency compare here is the RECOMPOSED file, not the whole existing
+      // one — an attested-trailer hook whose block already equals the canonical is
+      // current (`exists`, no write), which is what makes a second bare run a no-op.
+      if (endMarker !== undefined && isTotemOwnedWithAttestedTrailer(existing, marker, endMarker)) {
+        // "Byte-for-byte" is literal: the trailer is sliced from the RAW file at the
+        // byte offset `ownedTrailerByteStart` PROVES — the region above the
+        // extension (shebang line and managed block) re-encodes to its own bytes.
+        // That is the ONE marker scan, shared with doctor (fold F11's rule, one
+        // implementation); the predicate above ran it too, and a second run on the
+        // same string is cheaper than a second implementation. A region that does
+        // not round-trip is not ours to rewrite — and not something to stay silent
+        // about: the skip is REPORTED, and doctor senses the same shape with the
+        // same predicate (legs F13, F16). The trailer's bytes are never decoded.
+        const trailerByteStart = ownedTrailerByteStart(raw, marker, endMarker);
+        if (trailerByteStart === undefined) return 'skipped-non-utf8';
+        const rewritten = Buffer.concat([
+          Buffer.from(hookContent, 'utf-8'),
+          trailerTailAfterEndMarker(raw, trailerByteStart),
+        ]);
+        if (rewritten.equals(raw)) return 'exists';
+        writeExecutableHook(hookPath, rewritten);
+        return 'block-rewritten';
+      }
       return 'exists';
     }
 
@@ -722,12 +1816,19 @@ export function installGitHook(
       return 'skipped-non-shell';
     }
 
-    // Append to existing hook — preserve user's existing hooks
+    // Append to existing hook — preserve user's existing hooks. One atomic
+    // replacement of the whole file (their RAW bytes + ours), not an append: an
+    // interrupted append leaves a hook truncated mid-block, which git still
+    // runs (mmnto-ai/totem#2760 round 1, leg F2). The helper keeps the user's
+    // file mode and writes through a symlink to its real path.
     const separator = existing.endsWith('\n') ? '\n' : '\n\n';
     const appendBlock = hookContent
       .replace(/^#!\/bin\/sh\n/, '') // Strip shebang when appending
       .trimStart();
-    fs.appendFileSync(hookPath, separator + appendBlock);
+    writeFileAtomicSync(
+      hookPath,
+      Buffer.concat([raw, Buffer.from(separator + appendBlock, 'utf-8')]),
+    );
     return 'appended';
   }
 
@@ -739,8 +1840,8 @@ export function installGitHook(
 }
 
 export interface EnforcementHookResult {
-  preCommit: 'installed' | 'exists' | 'appended' | 'skipped' | 'skipped-non-shell' | 'overwritten';
-  prePush: 'installed' | 'exists' | 'appended' | 'skipped' | 'skipped-non-shell' | 'overwritten';
+  preCommit: GitHookAction | 'skipped';
+  prePush: GitHookAction | 'skipped';
 }
 
 /**
@@ -797,12 +1898,30 @@ export async function installEnforcementHooks(
     console.error(HOOKS_DIR_UNRESOLVED_MSG);
     return skip;
   }
-  const fallbackCmd = getFallbackCommand(gitRoot);
+  // `totem init` writes the config BEFORE this runs, so — when init runs at the
+  // git root, the supported layout — the resolved options are the ones the repo
+  // just declared, and init and `totem hook install` render identically
+  // (mmnto-ai/totem#2692 C1/C7). Off the root, init writes its config at cwd
+  // while every hook writer resolves at the git root: a pre-existing split this
+  // slice names and does not close.
+  const render = await resolveHookRenderOptions(gitRoot, { tier: options?.tier });
 
+  // Render each hook at the tier it is entitled to keep (mmnto-ai/totem#2753 fold
+  // F4): nothing pinned + an installed `--strict` hook → strict, not a silent
+  // downgrade to standard.
   const preCommit = installGitHook(
     hooksDir,
     'pre-commit',
-    buildPreCommitHook(options?.tier),
+    buildPreCommitHook({
+      ...render,
+      tier: tierForHook(
+        hooksDir,
+        'pre-commit',
+        TOTEM_PRECOMMIT_MARKER,
+        TOTEM_PRECOMMIT_END,
+        render,
+      ),
+    }),
     TOTEM_PRECOMMIT_MARKER,
     undefined,
     TOTEM_PRECOMMIT_END,
@@ -811,7 +1930,10 @@ export async function installEnforcementHooks(
   const prePush = installGitHook(
     hooksDir,
     'pre-push',
-    buildPrePushHook(fallbackCmd, options?.tier),
+    buildPrePushHook({
+      ...render,
+      tier: tierForHook(hooksDir, 'pre-push', TOTEM_PREPUSH_MARKER, TOTEM_PREPUSH_END, render),
+    }),
     TOTEM_PREPUSH_MARKER,
     undefined,
     TOTEM_PREPUSH_END,
@@ -827,6 +1949,17 @@ export async function installEnforcementHooks(
     console.error(
       '[Totem] Warning: pre-push hook uses a non-shell interpreter. Manually add: totem lint',
     );
+  }
+  // A skip with its reason, never a silent "already installed" (mmnto-ai/totem#2760 leg F13).
+  for (const [name, action] of [
+    ['pre-commit', preCommit],
+    ['pre-push', prePush],
+  ] as const) {
+    if (action === 'skipped-non-utf8') {
+      console.error(
+        `[Totem] Skipped ${name} hook: the region above its extension (shebang line and managed block) does not decode as UTF-8, so it was left byte-identical. Re-save the hook as UTF-8 and re-run, or take \`totem hook install --force\` (rewrites the whole file and drops your extension).`,
+      );
+    }
   }
 
   return { preCommit, prePush };
@@ -850,11 +1983,11 @@ export async function installHooksCommand(): Promise<void> {
       const hasPostMerge =
         fs.existsSync(postMerge) && fs.readFileSync(postMerge, 'utf-8').includes(TOTEM_HOOK_MARKER);
       if (hasPostMerge) {
-        const fallbackCmd = getFallbackCommand(gitRoot);
+        const render = await resolveHookRenderOptions(gitRoot);
         installGitHook(
           hooksDir,
           'post-checkout',
-          buildPostCheckoutHookContent(fallbackCmd),
+          buildPostCheckoutHookContent(render),
           TOTEM_CHECKOUT_MARKER,
           undefined,
           TOTEM_CHECKOUT_END,
@@ -869,21 +2002,25 @@ export async function installHooksCommand(): Promise<void> {
 // ─── Non-interactive hooks command ───────────────────
 
 export interface HooksCommandResult {
-  preCommit: 'installed' | 'exists' | 'appended' | 'skipped-non-shell' | 'overwritten';
-  prePush: 'installed' | 'exists' | 'appended' | 'skipped-non-shell' | 'overwritten';
-  postMerge: 'installed' | 'exists' | 'appended' | 'skipped-non-shell' | 'overwritten';
-  postCheckout: 'installed' | 'exists' | 'appended' | 'skipped-non-shell' | 'overwritten';
+  preCommit: GitHookAction;
+  prePush: GitHookAction;
+  postMerge: GitHookAction;
+  postCheckout: GitHookAction;
 }
 
 /**
  * Non-interactive hook installer for `totem hooks` and `prepare` scripts.
  * Installs pre-commit, pre-push, and post-merge hooks without prompting.
+ *
+ * Async since mmnto-ai/totem#2692: the hook text is rendered from the repo's
+ * CONFIGURED `totemDir` (and `hooks.tier`), which means one config read —
+ * {@link resolveHookRenderOptions} — before anything is written.
  */
-export function installHooksNonInteractive(
+export async function installHooksNonInteractive(
   cwd: string,
   force?: boolean,
   options?: { tier?: 'strict' | 'standard' },
-): HooksCommandResult | null {
+): Promise<HooksCommandResult | null> {
   // Guard: must be a git repo — resolve root from any subdirectory. Not-a-repo
   // stays a silent null (the documented contract — callers print); the malformed
   // pointer prints its declared-skip line here so a direct API caller honors the
@@ -894,13 +2031,13 @@ export function installHooksNonInteractive(
     return null;
   }
 
-  const fallbackCmd = getFallbackCommand(gitRoot);
+  const render = await resolveHookRenderOptions(gitRoot, { tier: options?.tier });
 
   // Hook managers handle their own installation — generate helper scripts + print guidance
   const manager = detectHookManager(gitRoot);
   if (manager) {
-    generateHookHelpers(gitRoot, fallbackCmd, options);
-    printHookManagerGuidance(manager);
+    generateHookHelpers(gitRoot, render);
+    printHookManagerGuidance(manager, render.totemDir);
     return null;
   }
 
@@ -913,10 +2050,22 @@ export function installHooksNonInteractive(
     return null;
   }
 
+  // Same entitlement rule as the init path (mmnto-ai/totem#2753 fold F4) — and it
+  // has to hold HERE above all, because `totem hook install` is the bare command
+  // the doctor's own stale-block remedy sends people to.
   const preCommit = installGitHook(
     hooksDir,
     'pre-commit',
-    buildPreCommitHook(options?.tier),
+    buildPreCommitHook({
+      ...render,
+      tier: tierForHook(
+        hooksDir,
+        'pre-commit',
+        TOTEM_PRECOMMIT_MARKER,
+        TOTEM_PRECOMMIT_END,
+        render,
+      ),
+    }),
     TOTEM_PRECOMMIT_MARKER,
     force,
     TOTEM_PRECOMMIT_END,
@@ -925,13 +2074,16 @@ export function installHooksNonInteractive(
   const prePush = installGitHook(
     hooksDir,
     'pre-push',
-    buildPrePushHook(fallbackCmd, options?.tier),
+    buildPrePushHook({
+      ...render,
+      tier: tierForHook(hooksDir, 'pre-push', TOTEM_PREPUSH_MARKER, TOTEM_PREPUSH_END, render),
+    }),
     TOTEM_PREPUSH_MARKER,
     force,
     TOTEM_PREPUSH_END,
   );
 
-  const postMergeContent = buildHookContent(fallbackCmd);
+  const postMergeContent = buildHookContent(render);
   const postMerge = installGitHook(
     hooksDir,
     'post-merge',
@@ -941,7 +2093,7 @@ export function installHooksNonInteractive(
     TOTEM_HOOK_END,
   );
 
-  const postCheckoutContent = buildPostCheckoutHookContent(fallbackCmd);
+  const postCheckoutContent = buildPostCheckoutHookContent(render);
   const postCheckout = installGitHook(
     hooksDir,
     'post-checkout',
@@ -1032,32 +2184,18 @@ export async function hooksCommand(opts: {
     return;
   }
 
-  // Resolve tier + pilot: CLI flag > config file > default ('standard')
-  let tier: 'strict' | 'standard' | undefined;
-  // Resolve tier: CLI flag > config file > default ('standard')
-  try {
-    const { loadConfig, loadEnv, resolveConfigPath } = await import('../utils.js');
-    loadEnv(cwd);
-    const configPath = resolveConfigPath(cwd);
-    if (configPath) {
-      const config = await loadConfig(configPath);
-      if (!opts.strict && !opts.standard) {
-        tier = config.hooks?.tier;
-      }
-    }
-  } catch (err) {
-    if (process.env.TOTEM_DEBUG) {
-      console.error('[Totem] Could not load config for tier resolution:', err);
-    }
-  }
+  // Tier precedence (CLI flag > config `hooks.tier` > 'standard') now lives in
+  // `resolveHookRenderOptions`, the ONE config→hook-render seam
+  // (mmnto-ai/totem#2692 C1) — which `installHooksNonInteractive` calls with the
+  // flag below, so the config is read exactly once per invocation and at the
+  // git-root anchor the installer writes from.
+  const tier: 'strict' | 'standard' | undefined = opts.strict
+    ? 'strict'
+    : opts.standard
+      ? 'standard'
+      : undefined;
 
-  if (opts.strict) {
-    tier = 'strict';
-  } else if (opts.standard) {
-    tier = 'standard';
-  }
-
-  const result = installHooksNonInteractive(cwd, opts.force, { tier });
+  const result = await installHooksNonInteractive(cwd, opts.force, { tier });
 
   // The git-hook summary prints ONLY when git hooks were actually written. A null
   // result means a hook manager (husky/lefthook) was detected and
@@ -1096,9 +2234,25 @@ export async function hooksCommand(opts: {
               : `[Totem] Drift-repaired ${name} hook (totem-owned bounded region).`,
           );
           break;
+        case 'block-rewritten':
+          // Distinct from the whole-file line above: this write REGENERATED the
+          // managed block and left everything after the end marker alone. Saying so
+          // is the point — a consumer that extends its hooks needs to read, from the
+          // summary, that its extension survived (mmnto-ai/totem#2753).
+          console.error(
+            `[Totem] Drift-repaired ${name} hook (managed block rewritten in place; the attested extension after its end marker carried through unchanged).`,
+          );
+          break;
         case 'skipped-non-shell':
           console.error(
             `[Totem] Warning: ${name} hook uses a non-shell interpreter. Integrate manually.`,
+          );
+          break;
+        case 'skipped-non-utf8':
+          // The eject precedent (mmnto-ai/totem#2620): a skip is reported with its
+          // reason and the file is left byte-identical — never "already installed".
+          console.error(
+            `[Totem] Skipped ${name} hook: the region above its extension (shebang line and managed block) does not decode as UTF-8, so it was left byte-identical. Re-save the hook as UTF-8 and re-run, or take --force (rewrites the whole file and drops your extension).`,
           );
           break;
       }
@@ -1526,8 +2680,12 @@ async function printGeminiHookMigrationSummary(cwd: string, force?: boolean): Pr
  * stateless format that runs verify-manifest + lint directly.
  *
  * Returns true if the hook was upgraded, false otherwise.
+ *
+ * Async since mmnto-ai/totem#2692: the spliced block is rendered from the repo's
+ * configured `totemDir` and `hooks.tier` like every other writer, so it no
+ * longer silently downgrades a strict hook to standard on the upgrade path.
  */
-export function upgradePrePushHookIfNeeded(cwd: string): boolean {
+export async function upgradePrePushHookIfNeeded(cwd: string): Promise<boolean> {
   try {
     const gitRoot = resolveGitRoot(cwd);
     if (!gitRoot) return false;
@@ -1538,10 +2696,21 @@ export function upgradePrePushHookIfNeeded(cwd: string): boolean {
     const hookPath = path.join(hooksDir, 'pre-push');
     if (!fs.existsSync(hookPath)) return false;
 
-    const content = fs.readFileSync(hookPath, 'utf-8');
+    const rawContent = fs.readFileSync(hookPath);
+    const content = rawContent.toString('utf-8');
 
-    // Only upgrade hooks that Totem owns (have our marker)
+    // Only upgrade hooks that Totem owns (have our marker) — block presence FIRST,
+    // the order eject.ts ruled, so the two sites read alike even though this one
+    // returns a bare `false` either way.
     if (!content.includes(TOTEM_PREPUSH_MARKER)) return false;
+
+    // The splice below is text on both sides of the block, so it is byte-exact
+    // only when the whole file decoded losslessly. A hook that does not
+    // round-trip UTF-8 is declined here — this upgrader's ruled posture is a
+    // silent `false` (mmnto-ai/totem#2692 N4), and declining beats writing U+FFFD
+    // over a user's bytes (mmnto-ai/totem#2620's eject ruling, mmnto-ai/totem#2760
+    // leg F9). Such a hook keeps its old block and takes `totem hook install --force`.
+    if (!Buffer.from(content, 'utf-8').equals(rawContent)) return false;
 
     // Already on the new stateless format — no upgrade needed.
     // SAFETY INVARIANT: old hooks (pre-verify-manifest) have a single top-level
@@ -1588,10 +2757,11 @@ export function upgradePrePushHookIfNeeded(cwd: string): boolean {
 
     const blockEnd = markerIdx + endOffset;
 
-    const fallbackCmd = getFallbackCommand(gitRoot);
+    // totem-context: mmnto-ai/totem#2753 — this upgrader is unreachable for any hook carrying TOTEM_HOOK_TIER (the verify-manifest guard above skips every current template), so it renders from config alone; if that guard ever changes, route through tierForHook.
+    const render = await resolveHookRenderOptions(gitRoot);
 
     // Build the replacement block (strip shebang — we're splicing into existing file)
-    const newBlock = buildPrePushHook(fallbackCmd)
+    const newBlock = buildPrePushHook(render)
       .replace(/^#!\/bin\/sh\n/, '')
       .trimStart();
 
@@ -1600,13 +2770,10 @@ export function upgradePrePushHookIfNeeded(cwd: string): boolean {
     const after = content.slice(blockEnd);
     const upgraded = before + newBlock.trimEnd() + after;
 
-    fs.writeFileSync(hookPath, upgraded);
-
-    try {
-      fs.chmodSync(hookPath, 0o755);
-    } catch {
-      // chmod may fail on Windows — hooks still work via git bash
-    }
+    // The splice keeps the user's lines on BOTH sides of the block — the exact
+    // shape Greptile P1 named on the attested-extension arm — so it takes the same
+    // atomic, executable write (mmnto-ai/totem#2760 round 1, leg F4).
+    writeExecutableHook(hookPath, upgraded);
 
     return true;
   } catch {

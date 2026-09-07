@@ -3,8 +3,8 @@
  *
  * This root barrel re-exports the full core module graph and makes no
  * per-symbol semver promise: consumers cannot tell which exports are stable
- * contract and which are lab surface. It is retained unchanged for backward
- * compatibility (zero removals, zero reordering).
+ * contract and which are lab surface. It is retained for backward
+ * compatibility: zero reordering, and removals only at a major.
  *
  * Prefer the curated, semver-tracked subpath entry points for new code:
  *   - `@mmnto/totem/config`    — `TotemConfig` + config-schema surface
@@ -12,8 +12,11 @@
  *   - `@mmnto/totem/lessons`   — lesson read/write + frontmatter + role/schema
  *   - `@mmnto/totem/artifacts` — Prop 302 verdict-artifact schema/loader
  *
- * Subtraction from this barrel is deferred to a future major (mmnto-ai/totem#2336,
- * ADR-084 / Proposal 294).
+ * Subtraction from this barrel is a major-version event (mmnto-ai/totem#2336,
+ * ADR-084 / Proposal 294). The first subtraction under this policy —
+ * `DEFAULT_SEARCH_RELEVANCE_FLOOR`, mmnto-ai/totem#2727 — rides the 2.0.0 cut
+ * with no shim (mmnto-ai/totem#2691: no legacy carried while every consumer is
+ * a repo we operate).
  */
 
 // Unified findings model (ADR-071)
@@ -77,8 +80,36 @@ export {
   readFreezeConfig,
   RULE_COMPILATION_FREEZE_ID,
 } from './freeze.js';
-export { evaluateGate, FREEZE_CHECK_EVENT, knownGateEvents } from './gate-engine.js';
-export type { GateDisposition, GateEvaluator, GateProvenance, GateVerdict } from './gate-types.js';
+export {
+  evaluateGate,
+  FREEZE_CHECK_EVENT,
+  gateMatcher,
+  knownGateEvents,
+  knownGates,
+} from './gate-engine.js';
+export type {
+  GateDefinition,
+  GateDisposition,
+  GateEvaluator,
+  GateMatcher,
+  GateProvenance,
+  GateVerdict,
+} from './gate-types.js';
+export type {
+  TransportPattern,
+  TransportPatternId,
+  TransportShieldPayload,
+  TransportTool,
+} from './transport-shield.js';
+export {
+  HEREDOC_OVERSIZE_BYTES,
+  MATCHED_FRAGMENT_MAX,
+  parseTransportShieldPayload,
+  TRANSPORT_PATTERNS,
+  TRANSPORT_SHIELD_EVENT,
+  TRANSPORT_SHIELD_SOURCE,
+  transportShieldEvaluator,
+} from './transport-shield.js';
 
 // Config schemas
 export type {
@@ -103,7 +134,6 @@ export {
   ContentTypeSchema,
   DEFAULT_IGNORE_PATTERNS,
   DEFAULT_REVIEW_SOURCE_EXTENSIONS,
-  DEFAULT_SEARCH_RELEVANCE_FLOOR,
   DocTargetSchema,
   DoctorConfigSchema,
   EclConfigSchema,
@@ -112,7 +142,10 @@ export {
   GeminiOrchestratorSchema,
   GeminiProviderSchema,
   getConfigTier,
+  hasUnrenderableHeadingChar,
+  hasUnrenderableHookChar,
   IngestTargetSchema,
+  normalizeTotemDir,
   OllamaProviderSchema,
   OpenAIProviderSchema,
   OrchestratorSchema,
@@ -198,6 +231,15 @@ export { createEmbedder, isOllamaAvailable } from './embedders/embedder.js';
 // Store
 export { TOTEM_TABLE_NAME } from './store/lance-schema.js';
 export { LanceStore } from './store/lance-store.js';
+export type { DistanceMetric } from './store/relevance.js';
+export {
+  assertDistanceMetric,
+  DISTANCE_METRICS,
+  isRelevanceInRange,
+  relevanceFromDistance,
+  VECTOR_DISTANCE_METRIC,
+} from './store/relevance.js';
+export { searchLessons } from './store/search-lessons.js';
 
 // Pipeline
 export type { IndexManifest, ManifestDocument, ResolvedFile } from './ingest/sync.js';
@@ -283,6 +325,7 @@ export {
   extractJustification,
   fileMatchesGlobs,
   hashLesson,
+  isActiveCompiledRule,
   isAuthoredProvenance,
   isMinedProvenance,
   LEDGER_RETRY_PENDING_CODES,
@@ -476,6 +519,13 @@ export {
   verifyRuleExamples,
 } from './compile-lesson.js';
 
+// Compile-time smoke gate (ADR-087) — the role-agnostic "does this rule fire on
+// this snippet" entry point. Exported for `totem rule test`, which runs a Prop 310
+// record rule's own `examples[i]` pairs through the SAME gate the compiler and the
+// §4 preimage-differential use, rather than growing a third firing path (Tenet 20).
+export type { SmokeGateResult } from './compile-smoke-gate.js';
+export { runSmokeGate } from './compile-smoke-gate.js';
+
 // Stage 4 Verify-Against-Codebase verifier (mmnto-ai/totem#1682)
 export type {
   ResolveStage4BaselineInput,
@@ -513,12 +563,20 @@ export {
 // Compile manifest (signing / provenance)
 export type { CompileManifest } from './compile-manifest.js';
 export {
+  attestRecordsHash,
   canonicalizeKeys,
   canonicalStringify,
   CompileManifestSchema,
+  EMPTY_RECORDS_HASH,
   generateInputHash,
   generateOutputHash,
+  generateRecordsHash,
+  isRecordsAttestationFresh,
+  listRecordFiles,
+  listRecordFilesUnder,
   readCompileManifest,
+  RECORD_FILE_SUFFIX,
+  RECORDS_DIR_REL,
   writeCompileManifest,
 } from './compile-manifest.js';
 
@@ -743,6 +801,8 @@ export type {
   BackendAdmissionClass,
   BoundedTextEvidence,
   ContextPolicy,
+  GroundingAnchor,
+  GroundingAnchorKind,
   GroundingBundle,
   GroundingItem,
   InputBundle,
@@ -751,6 +811,7 @@ export type {
   InvokeFailureKind,
   InvokeProcessEvidence,
   OutputContract,
+  PromptSource,
   RunArtifact,
   RunExecutionEvidence,
   RunMetadata,
@@ -761,6 +822,12 @@ export {
   ADMISSION_SELF_GROUNDING_AGENT,
   BoundedTextEvidenceSchema,
   ContextPolicySchema,
+  GROUNDING_ANCHOR_FREE_TEXT,
+  GROUNDING_ANCHOR_ISSUE,
+  GROUNDING_ANCHOR_KINDS,
+  GROUNDING_ANCHOR_MIXED,
+  GROUNDING_ANCHOR_RECORD,
+  GroundingAnchorSchema,
   GroundingBundleSchema,
   GroundingItemSchema,
   INVOCATION_FAILURE_ARTIFACT_SCHEMA_VERSION,
@@ -773,6 +840,9 @@ export {
   InvokeProcessEvidenceSchema,
   MAX_INVOKE_ATTEMPTS,
   OutputContractSchema,
+  PROMPT_SOURCE_BUILTIN,
+  PROMPT_SOURCE_OVERRIDE,
+  PROMPT_SOURCES,
   PROVENANCE_CLASSES,
   PROVENANCE_COMPILED_RULE,
   PROVENANCE_SIMILARITY_ONLY,
@@ -924,6 +994,50 @@ export {
   saveAdmissionRecord,
 } from './artifacts/admission.js';
 
+// Leg-deposit contract — "was THIS head read by a falsification leg" (mmnto-ai/totem#2698)
+export type {
+  LegCoverageQuery,
+  LegDeposit,
+  LegDepositCorruptEntry,
+  LegDepositCoverage,
+  LegDepositRank,
+  LegDepositResolution,
+  LegDepositStale,
+  LegDepositStaleReason,
+  LegDepositSuperseded,
+  LegDepositWinner,
+  LegDepositWithAddress,
+  LegFinding,
+  LegFindingCounts,
+  LegFindingSeverity,
+  LegGitAdapter,
+  LoadLegDepositsResult,
+  SaveLegDepositOptions,
+  SaveLegDepositResult,
+} from './artifacts/legs.js';
+export {
+  countLegFindings,
+  findLegDepositForHead,
+  LEG_DEPOSIT_KNOWN_MAJOR,
+  LEG_DEPOSIT_SCHEMA_VERSION,
+  LEG_FINDING_SEVERITIES,
+  LegDepositExistsError,
+  legDepositPath,
+  LegDepositSchema,
+  LegFindingIdSchema,
+  LegFindingSchema,
+  LegFindingSeveritySchema,
+  legsDir,
+  loadLegDeposits,
+  renderLegField,
+  saveLegDeposit,
+} from './artifacts/legs.js';
+
+// Routing seam — the minimal `legs-owed` predicate `totem route` will grow
+// (mmnto-ai/totem#2534; carried here per mmnto-ai/totem#2698)
+export type { LegsOwedBasisEntry, LegsOwedVerdict } from './routing/legs-owed.js';
+export { classifyLegsOwed, DEFAULT_LEGS_OWED_GLOBS } from './routing/legs-owed.js';
+
 // Strategy-root resolver (mmnto-ai/totem#1710)
 export type {
   StrategyResolverConfig,
@@ -1021,10 +1135,12 @@ export type {
   NetworkSurfaceSnapshot,
   PackageJsonShape,
   ParityContractVerdict,
+  ProjectBinding,
   StrategyDoctrineLock,
   ValueEqualityField,
   ValueEqualityFormat,
 } from './parity-detect.js';
+// The two 472-charter orientation rows' pure derivations (mmnto-ai/totem#2791).
 export {
   deriveCohortRepoId,
   detectCapabilityProbeContract,
@@ -1049,6 +1165,27 @@ export {
   SUPPORTED_LOCK_SCHEMA_VERSION,
   TOOLCHAIN_DIMENSION,
 } from './parity-detect.js';
+export type {
+  CanonicalLabel,
+  LabelCanon,
+  LabelCanonDrift,
+  LabelMerge,
+  LabelRedefinition,
+  LiveLabel,
+  NamespaceSquatter,
+  ProjectSingleSelectField,
+  ProjectVocabularyDrift,
+  ProjectVocabularyFault,
+} from './parity-label-canon.js';
+export {
+  labelCanonDrift,
+  namespaceTokensOf,
+  normalizeLabelColor,
+  optionSetsOfProjectFields,
+  parseExpectedOptionSets,
+  parseLabelCanon,
+  projectVocabularyDrift,
+} from './parity-label-canon.js';
 
 // Semgrep adapter (Pipeline 4 — import rules from Semgrep YAML)
 export type { SemgrepImportResult } from './semgrep-adapter.js';
@@ -1130,10 +1267,12 @@ export type {
   AuthoredRuleRecord,
   AuthoredRulesFile,
   DeclaredEngine,
+  RecordFixtureInput,
   StructEligResult,
   WhitelistEntry,
 } from './spine/authored-rule.js';
 export {
+  AUTHORED_RULE_ID_RE,
   AuthoredOriginSchema,
   AuthoredRuleInputSchema,
   AuthoredRuleRecordSchema,
@@ -1141,6 +1280,7 @@ export {
   DeclaredEngineSchema,
   evaluateStructuralEligibility,
   mintAuthoredRuleId,
+  RecordFixtureInputSchema,
   StructEligResultSchema,
   toCompileFeed,
 } from './spine/authored-rule.js';
@@ -1329,6 +1469,77 @@ export {
   normalizeReviewChrome,
   REVIEW_CHROME_NORMALIZER_VERSION,
 } from './spine/review-normalize.js';
+// Spine: Prop 310 V1 record grammar — lowering + runtime evaluation (slice 2)
+export type { CompileRuleRecordOptions, RecordLanguageResolution } from './spine/record-lower.js';
+export {
+  compileRuleRecord,
+  languageProbeGlobs,
+  resolveRecordLanguage,
+  V1_INEXPRESSIBLE_NAPI_KEYS,
+} from './spine/record-lower.js';
+export type { RequiresScopeText } from './spine/record-runtime.js';
+export type { RuleScopeFields } from './spine/record-runtime.js';
+export {
+  assertNoAstGrepLineScope,
+  assertNoTornRecordRules,
+  assertRequiresPatternsSafe,
+  isInsideRoot,
+  isRecordPathRule,
+  RECORD_COMPILED_HOME_KEYS,
+  recordScopeMatchesFile,
+  requiresContextPresent,
+  requiresSuppressesMatch,
+  ruleAppliesToFile,
+  ruleBadExampleLines,
+  ruleGoodExampleLines,
+} from './spine/record-runtime.js';
+// Spine: Prop 310 V1 record grammar — the `.totem/rules/*.rule.yaml` parser (slice 1)
+export type {
+  GlobDialectRule,
+  GlobDialectViolation,
+  NoSilentSkipConstruct,
+  ParsedRuleRecord,
+  RequiresScope,
+  RuleCuration,
+  RuleExamplePairHash,
+  RuleRecord,
+  RuleRecordExample,
+  RuleRequires,
+  RuleScope,
+  RuleSeverity,
+  RuleTarget,
+  RuleTargetType,
+  VerificationShadow,
+} from './spine/rule-record.js';
+export {
+  checkGlobDialect,
+  CURATION_PROCESS_FIELDS,
+  GLOB_DIALECT_RULES,
+  LEGACY_ENGINE_DETAIL,
+  LEGACY_INERT_ENGINE,
+  ParsedRuleRecordSchema,
+  parseRuleRecord,
+  REQUIRES_SCOPE_RESERVED,
+  RequiresScopeSchema,
+  RULE_RECORD_FORBIDDEN_PROTOTYPE_KEYS,
+  RULE_RECORD_INEXPRESSIBLE_KEYS,
+  RULE_RECORD_SCHEMA_VERSION,
+  RuleCurationSchema,
+  ruleExamplePairHash,
+  RuleExamplePairHashSchema,
+  RuleRecordExampleSchema,
+  RuleRecordNoSilentSkipError,
+  RuleRecordParseError,
+  RuleRecordProducerKeyError,
+  RuleRecordPrototypeKeyError,
+  RuleRecordSchema,
+  RuleRequiresSchema,
+  RuleScopeSchema,
+  RuleSeveritySchema,
+  RuleTargetSchema,
+  RuleTargetTypeSchema,
+  VerificationShadowSchema,
+} from './spine/rule-record.js';
 export type {
   CodePathClassifier,
   PrMeta,

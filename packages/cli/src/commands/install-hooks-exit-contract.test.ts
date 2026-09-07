@@ -13,7 +13,9 @@
  *     never bare-repaired; a no-marker user file is never touched even under --force;
  *   - regenerated artifacts always carry marker + end marker (so they self-repair);
  *   - the two `overwritten` messages are distinct ("Drift-repaired…" vs
- *     "Force-overwritten…").
+ *     "Force-overwritten…"), and the in-place block rewrite behind an ATTESTED
+ *     `totem:fork` extension prints a THIRD, distinct line naming the carry-through
+ *     (mmnto-ai/totem#2753).
  *
  * `hooksCommand` reads `process.cwd()` and gates via `process.exit` on `--check`
  * failure, so the exit-code cases drive it under `process.chdir` + a `process.exit`
@@ -274,6 +276,41 @@ describe('hooksCommand exit-code contract', () => {
     expect(out).not.toContain('Force-overwritten pre-push');
   });
 
+  it('exit 0: bare in-place block rewrite prints the carry-through line, not the whole-file one', async () => {
+    await hooksCommand({});
+    const prePush = path.join(hooksDir(), 'pre-push');
+    const canonical = fs.readFileSync(prePush, 'utf-8');
+    // A stale managed block with an ATTESTED extension after its end marker — the
+    // measured liquid-city shape, transcribed from `tools/git-hooks/install.cjs`
+    // (EXTENSIONS block 2) and joined the way that file joins it
+    // (mmnto-ai/liquid-city#1174). The `# [lc] …` label opens the block and the
+    // attestation is the SECOND comment line, which is why the predicate reads the
+    // trailer's whole leading comment run rather than only its first line.
+    const trailer = [
+      '',
+      '# [lc] validate-fixtures extension',
+      '# <!-- totem:fork reason="lc fail-closed fixture-contract validator pre-push extension (ADR-025 A2; divergence-census justified fork)" owner="satur8d" attested="2026-06-20" -->',
+      'LC_STDIN=$(cat)',
+      'lc_feed() { if [ -n "$LC_STDIN" ]; then printf \'%s\\n\' "$LC_STDIN"; fi; }',
+      'lc_feed | sh "tools/git-hooks/pre-push-validate-fixtures.sh" || exit 1',
+      '',
+    ].join('\n');
+    fs.writeFileSync(
+      prePush,
+      `#!/bin/sh\n# ${TOTEM_PREPUSH_MARKER}\nstale\n# ${TOTEM_PREPUSH_END}\n${trailer}`,
+    );
+    errorSpy.mockClear();
+    await expect(hooksCommand({})).resolves.toBeUndefined();
+    expect(exitSpy).not.toHaveBeenCalled();
+    const out = errorOutput();
+    expect(out).toContain(
+      'Drift-repaired pre-push hook (managed block rewritten in place; the attested extension after its end marker carried through unchanged).',
+    );
+    expect(out).not.toContain('Drift-repaired pre-push hook (totem-owned bounded region).');
+    expect(out).not.toContain('Force-overwritten pre-push');
+    expect(fs.readFileSync(prePush, 'utf-8')).toBe(canonical + trailer);
+  });
+
   it('exit 0: bare session-hook drift-repair prints "Drift-repaired"', async () => {
     fs.mkdirSync(path.join(tmpDir, '.claude', 'hooks'), { recursive: true });
     fs.writeFileSync(
@@ -461,8 +498,8 @@ describe('installHooksNonInteractive (contract sanity)', () => {
     cleanTmpDir(tmpDir);
   });
 
-  it('returns null outside a git repo (declared skip, exit 0 at the command edge)', () => {
-    expect(installHooksNonInteractive(tmpDir)).toBeNull();
+  it('returns null outside a git repo (declared skip, exit 0 at the command edge)', async () => {
+    expect(await installHooksNonInteractive(tmpDir)).toBeNull();
   });
 });
 
@@ -554,8 +591,8 @@ describe('hooksCommand in a linked worktree (mmnto-ai/totem#2418)', () => {
     expect(errorOutput()).toContain('All hooks installed');
   });
 
-  it('installHooksNonInteractive from the worktree classifies all four hooks', () => {
-    const result = installHooksNonInteractive(wtDir);
+  it('installHooksNonInteractive from the worktree classifies all four hooks', async () => {
+    const result = await installHooksNonInteractive(wtDir);
     expect(result).not.toBeNull();
     expect(result!.preCommit).toBe('installed');
     expect(result!.prePush).toBe('installed');
@@ -614,8 +651,8 @@ describe('hooksCommand with an unparseable .git pointer file (declared skip)', (
     expect(out).toContain('not a directory or a resolvable gitdir pointer');
   });
 
-  it('installHooksNonInteractive maps the bad pointer to the declared-skip null (direct API path)', () => {
-    expect(installHooksNonInteractive(tmpDir)).toBeNull();
+  it('installHooksNonInteractive maps the bad pointer to the declared-skip null (direct API path)', async () => {
+    expect(await installHooksNonInteractive(tmpDir)).toBeNull();
   });
 });
 

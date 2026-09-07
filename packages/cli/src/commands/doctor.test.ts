@@ -116,10 +116,86 @@ describe('checkCompiledRules', () => {
 // ─── Git hooks check ────────────────────────────────────
 
 describe('checkGitHooks', () => {
-  it('returns skip when not a git repo', () => {
+  // Shared by the currency cases (mmnto-ai/totem#2753 hoisted this out of the
+  // custom-totemDir describe: since the compare runs on EVERY install, the
+  // default-totemDir cases need the real canonical too). Uses the real builders,
+  // so a template change moves the fixture with the code.
+  async function installCanonical(
+    dir: string,
+    totemDir: string,
+    tier: 'strict' | 'standard' = 'standard',
+  ): Promise<void> {
+    const {
+      buildPreCommitHook,
+      buildPrePushHook,
+      buildHookContent,
+      buildPostCheckoutHookContent,
+      getFallbackCommand,
+    } = await import('./install-hooks.js');
+    const render = { tier, totemDir, fallbackCmd: getFallbackCommand(dir) };
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    fs.writeFileSync(path.join(hooksDir, 'pre-commit'), buildPreCommitHook(render));
+    fs.writeFileSync(path.join(hooksDir, 'pre-push'), buildPrePushHook(render));
+    fs.writeFileSync(path.join(hooksDir, 'post-merge'), buildHookContent(render));
+    fs.writeFileSync(path.join(hooksDir, 'post-checkout'), buildPostCheckoutHookContent(render));
+  }
+
+  /** The measured liquid-city extension shape (`tools/git-hooks/install.cjs`,
+   *  block 1): a `# [lc] …` comment line, THEN the attestation, then the
+   *  extension's commands — joined the way install.cjs joins it. */
+  const ATTESTED_TRAILER = [
+    '',
+    '# [lc] docs-inject extension',
+    '# <!-- totem:fork reason="lc docs-inject pre-commit extension (divergence-census justified fork)" owner="satur8d" attested="2026-06-07" -->',
+    'sh "tools/git-hooks/pre-commit-docs-inject.sh"',
+    '',
+  ].join('\n');
+
+  /** The canonical with ONE comment line inside the managed block altered. */
+  function withStaleComment(canonical: string, endMarker: string): string {
+    const lines = canonical.split('\n');
+    const endLine = lines.findIndex((line) => line.includes(endMarker));
+    const commentLine = lines.findIndex(
+      (line, i) =>
+        i > 1 && i < endLine && line.trimStart().startsWith('#') && !line.includes('[totem]'),
+    );
+    if (commentLine === -1) throw new Error('no alterable comment line inside the managed block');
+    lines[commentLine] = `${lines[commentLine]} (frozen at an older template)`;
+    return lines.join('\n');
+  }
+
+  /** The four hooks, each carrying `trailer` after its end marker — canonical, or
+   *  (`stale`) one comment line behind it. */
+  async function installWithTrailer(
+    dir: string,
+    trailer: string,
+    opts: { stale: boolean },
+  ): Promise<void> {
+    const hooks = await import('./install-hooks.js');
+    const render = {
+      tier: 'standard' as const,
+      totemDir: '.totem',
+      fallbackCmd: hooks.getFallbackCommand(dir),
+    };
+    const hooksDir = path.join(dir, '.git', 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const roster: [string, string, string][] = [
+      ['pre-commit', hooks.buildPreCommitHook(render), hooks.TOTEM_PRECOMMIT_END],
+      ['pre-push', hooks.buildPrePushHook(render), hooks.TOTEM_PREPUSH_END],
+      ['post-merge', hooks.buildHookContent(render), hooks.TOTEM_HOOK_END],
+      ['post-checkout', hooks.buildPostCheckoutHookContent(render), hooks.TOTEM_CHECKOUT_END],
+    ];
+    for (const [file, canonical, endMarker] of roster) {
+      const block = opts.stale ? withStaleComment(canonical, endMarker) : canonical;
+      fs.writeFileSync(path.join(hooksDir, file), block + trailer);
+    }
+  }
+
+  it('returns skip when not a git repo', async () => {
     const tmpDir = makeTmpDir();
     try {
-      const result = checkGitHooks(tmpDir);
+      const result = await checkGitHooks(tmpDir);
       expect(result.status).toBe('skip');
       expect(result.message).toBe('Not a git repository');
     } finally {
@@ -127,12 +203,11 @@ describe('checkGitHooks', () => {
     }
   });
 
-  it('returns warn when hooks are missing in a git repo', () => {
+  it('returns warn when hooks are missing in a git repo', async () => {
     const tmpDir = makeTmpDir();
     try {
-      const { execSync } = require('node:child_process');
       execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
-      const result = checkGitHooks(tmpDir);
+      const result = await checkGitHooks(tmpDir);
       expect(result.status).toBe('warn');
       expect(result.message).toContain('missing');
       expect(result.remediation).toBe('totem hooks');
@@ -141,10 +216,26 @@ describe('checkGitHooks', () => {
     }
   });
 
-  it('returns pass when all hooks contain totem markers', () => {
+  it('returns pass when all four managed blocks are the current canonical', async () => {
     const tmpDir = makeTmpDir();
     try {
-      const { execSync } = require('node:child_process');
+      execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+      await installCanonical(tmpDir, '.totem');
+      const result = await checkGitHooks(tmpDir);
+      expect(result.status).toBe('pass');
+      expect(result.message).toContain('All 4 hooks');
+    } finally {
+      cleanTmpDir(tmpDir);
+    }
+  });
+
+  // mmnto-ai/totem#2753: presence was never the question the row is asked. Until
+  // this slice the marker alone passed on the default totemDir, so a hook frozen at
+  // an older template read as healthy (`All 4 hooks installed` over two 1.121.0
+  // hooks under a 1.123.0 CLI, mmnto-ai/liquid-city#1174).
+  it('WARNs on marker-headed hooks whose managed block is not the canonical (default totemDir)', async () => {
+    const tmpDir = makeTmpDir();
+    try {
       execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
       const hooksDir = path.join(tmpDir, '.git', 'hooks');
       fs.mkdirSync(hooksDir, { recursive: true });
@@ -157,10 +248,685 @@ describe('checkGitHooks', () => {
       for (const { file, marker } of hooks) {
         fs.writeFileSync(path.join(hooksDir, file), `#!/bin/sh\n# ${marker}\necho ok`);
       }
-      const result = checkGitHooks(tmpDir);
-      expect(result.status).toBe('pass');
-      expect(result.message).toContain('All 4 hooks');
+      const result = await checkGitHooks(tmpDir);
+      expect(result.status).toBe('warn');
+      expect(result.message).toContain("totemDir '.totem'");
+      expect(result.message).toContain('the managed block is stale');
     } finally {
+      cleanTmpDir(tmpDir);
+    }
+  });
+
+  // mmnto-ai/totem#2692 C6. `doctor --parity` regenerates the canonical at the
+  // configured `totemDir` and would catch this — but it is pin-gated behind
+  // `orient.parityManifest`, so the always-on row gains ONE conditional
+  // whole-file compare, and ONLY when the repo configures a non-default dir.
+  describe('custom totemDir (mmnto-ai/totem#2692 C6)', () => {
+    it('WARNs when the installed hooks were rendered for a different totemDir', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        // Hooks on disk still name `.totem/`; the repo configures `knowledge/`.
+        await installCanonical(tmpDir, '.totem');
+        const result = await checkGitHooks(tmpDir, { totemDir: 'knowledge' });
+        expect(result.status).toBe('warn');
+        expect(result.message).toContain("totemDir 'knowledge'");
+        expect(result.message).toContain('pre-commit');
+        expect(result.remediation).toBe('totem hook install --force');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('PASSES when the installed hooks match the configured totemDir', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installCanonical(tmpDir, 'knowledge');
+        const result = await checkGitHooks(tmpDir, { totemDir: 'knowledge' });
+        expect(result.status).toBe('pass');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // mmnto-ai/totem#2753 REPLACED the pre-#2753 assertion here ("does NOT compare
+    // content on the default totemDir") — that early return WAS the blind spot. The
+    // default is now compared like any other value, whether it is configured
+    // explicitly or left undefined.
+    it('compares content on the default totemDir too, configured explicitly or not', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installCanonical(tmpDir, '.totem');
+        expect((await checkGitHooks(tmpDir, { totemDir: '.totem' })).status).toBe('pass');
+        expect((await checkGitHooks(tmpDir)).status).toBe('pass');
+
+        // One comment line behind → stale on BOTH spellings of the default.
+        const { buildPrePushHook, getFallbackCommand, TOTEM_PREPUSH_END } =
+          await import('./install-hooks.js');
+        fs.writeFileSync(
+          path.join(tmpDir, '.git', 'hooks', 'pre-push'),
+          withStaleComment(
+            buildPrePushHook({
+              tier: 'standard',
+              totemDir: '.totem',
+              fallbackCmd: getFallbackCommand(tmpDir),
+            }),
+            TOTEM_PREPUSH_END,
+          ),
+        );
+        for (const config of [{ totemDir: '.totem' }, undefined]) {
+          const result = await checkGitHooks(tmpDir, config);
+          expect(result.status).toBe('warn');
+          expect(result.message).toContain('pre-push');
+          expect(result.message).toContain('the managed block is stale');
+          expect(result.remediation).toBe('totem hook install --force');
+        }
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // Amendment A4: the compare is BLOCK-scoped and the remedy is ownership-aware.
+    // `installGitHook --force` rewrites the whole file, so a user hook carrying
+    // an APPENDED totem block must be judged on the block and steered away from
+    // `--force`.
+    async function installWithAppendedPreCommit(
+      dir: string,
+      othersTotemDir: string,
+      preCommitTotemDir: string,
+    ): Promise<void> {
+      const { buildPreCommitHook } = await import('./install-hooks.js');
+      await installCanonical(dir, othersTotemDir);
+      const block = buildPreCommitHook({ tier: 'standard', totemDir: preCommitTotemDir })
+        .replace(/^#!\/bin\/sh\n/, '')
+        .trimStart();
+      fs.writeFileSync(
+        path.join(dir, '.git', 'hooks', 'pre-commit'),
+        `#!/bin/sh\necho "user pre-commit"\n\n${block}`,
+      );
+    }
+
+    it('judges an APPENDED totem block on the block alone, and never prescribes --force for it', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        // The three others are canonical for `knowledge`; pre-commit is a USER
+        // hook whose appended totem block was rendered for `.totem`.
+        await installWithAppendedPreCommit(tmpDir, 'knowledge', '.totem');
+        const result = await checkGitHooks(tmpDir, { totemDir: 'knowledge' });
+        expect(result.status).toBe('warn');
+        expect(result.message).toContain('pre-commit');
+        expect(result.message).not.toContain('pre-push');
+        expect(result.remediation).not.toBe('totem hook install --force');
+        expect(result.remediation).toContain('delete the totem block');
+        expect(result.remediation).toContain('pre-commit');
+        expect(result.remediation).toContain('would overwrite your own hook content');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('PASSES a user hook whose appended block matches the configured totemDir', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithAppendedPreCommit(tmpDir, 'knowledge', 'knowledge');
+        expect((await checkGitHooks(tmpDir, { totemDir: 'knowledge' })).status).toBe('pass');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // Amendment A10 (falsification F5c): a LEGACY hook — start marker, NO end
+    // marker — cannot be bounded, so it is compared whole and takes the one
+    // `--force` install-hooks.ts prescribes for it; the appended-hook remedy
+    // ("delete the block through its end marker") would be unfollowable.
+    it('names --force (not the delete-and-re-append line) for a legacy hook with no end marker', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const { buildPreCommitHook } = await import('./install-hooks.js');
+        await installCanonical(tmpDir, 'knowledge');
+        const legacy = buildPreCommitHook({ tier: 'standard', totemDir: '.totem' })
+          .split('\n')
+          .filter((line) => !line.includes('[totem] end pre-commit'))
+          .join('\n');
+        fs.writeFileSync(path.join(tmpDir, '.git', 'hooks', 'pre-commit'), legacy);
+        const result = await checkGitHooks(tmpDir, { totemDir: 'knowledge' });
+        expect(result.status).toBe('warn');
+        expect(result.message).toContain('pre-commit');
+        expect(result.remediation).toMatch(/^totem hook install --force/);
+        expect(result.remediation).toContain('legacy hook with no end marker');
+        expect(result.remediation).not.toContain('delete the totem block');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // Amendment A10 (falsification F5d): the compare is on the totemDir axis ONLY.
+    // A hook installed with --strict on a repo whose config pins no tier must not
+    // read as totemDir drift — the prescribed `--force` would re-render it at
+    // standard, a silent enforcement downgrade.
+    it('does NOT report a tier-only difference as totemDir drift', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installCanonical(tmpDir, 'knowledge', 'strict');
+        expect((await checkGitHooks(tmpDir, { totemDir: 'knowledge' })).status).toBe('pass');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // Pass-2 F3: the tier is read from the TOTEM-OWNED block, not the whole file —
+    // a user's own line carrying `TOTEM_HOOK_TIER="strict"` above an appended
+    // standard block must not turn a matching hook into "totemDir drift".
+    it('reads the tier from the totem block, not from a user line above it', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const { buildPrePushHook, getFallbackCommand } = await import('./install-hooks.js');
+        await installCanonical(tmpDir, 'knowledge');
+        const block = buildPrePushHook({
+          tier: 'standard',
+          totemDir: 'knowledge',
+          fallbackCmd: getFallbackCommand(tmpDir),
+        })
+          .replace(/^#!\/bin\/sh\n/, '')
+          .trimStart();
+        fs.writeFileSync(
+          path.join(tmpDir, '.git', 'hooks', 'pre-push'),
+          `#!/bin/sh\nTOTEM_HOOK_TIER="strict" # a line of the user's own\necho mine\n\n${block}`,
+        );
+        expect((await checkGitHooks(tmpDir, { totemDir: 'knowledge' })).status).toBe('pass');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // Pass-2 F4: a user line that merely QUOTES an end marker above a genuinely
+    // unbounded (legacy) totem block must not make the sensor call it "appended"
+    // and prescribe the unfollowable delete-through-its-end-marker remedy.
+    it('classifies a legacy block as legacy even when a user line quotes the end marker', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const { buildPreCommitHook } = await import('./install-hooks.js');
+        await installCanonical(tmpDir, 'knowledge');
+        const legacyBlock = buildPreCommitHook({ tier: 'standard', totemDir: '.totem' })
+          .split('\n')
+          .filter((line) => !line.includes('[totem] end pre-commit'))
+          .join('\n')
+          .replace(/^#!\/bin\/sh\n/, '')
+          .trimStart();
+        fs.writeFileSync(
+          path.join(tmpDir, '.git', 'hooks', 'pre-commit'),
+          `#!/bin/sh\n# see the "# [totem] end pre-commit" line below\necho mine\n\n${legacyBlock}`,
+        );
+        const result = await checkGitHooks(tmpDir, { totemDir: 'knowledge' });
+        expect(result.status).toBe('warn');
+        expect(result.remediation).toMatch(/^totem hook install --force/);
+        expect(result.remediation).toContain('legacy hook with no end marker');
+        expect(result.remediation).not.toContain('delete the totem block');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // Pass-2 N5: a configured value the installer REFUSES never produced hooks —
+    // the row stays marker-only rather than crashing or comparing against a
+    // canonical that cannot exist (the same policy as `doctor --parity`).
+    it('stays marker-only when the configured totemDir is one the installer refuses', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installCanonical(tmpDir, '.totem');
+        expect((await checkGitHooks(tmpDir, { totemDir: '.' })).status).toBe('pass');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('still reports totemDir drift on a strict-tier hook (the tier is read from the hook, not assumed)', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installCanonical(tmpDir, '.totem', 'strict');
+        const result = await checkGitHooks(tmpDir, { totemDir: 'knowledge' });
+        expect(result.status).toBe('warn');
+        expect(result.message).toContain('pre-commit');
+        expect(result.message).toContain('pre-push');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+  });
+
+  // ── Attested extensions on the DEFAULT totemDir (mmnto-ai/totem#2753) ──
+  //
+  // The measured liquid-city shape: hooks totem owns through their end marker, with
+  // an attested `totem:fork` extension after it. A bare `totem hook install` now
+  // cures these, so the row must both SEE them and prescribe the bare command.
+  describe('attested extensions (mmnto-ai/totem#2753)', () => {
+    it('WARNs on a stale block beside an attested trailer and prescribes the bare install', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithTrailer(tmpDir, ATTESTED_TRAILER, { stale: true });
+        const result = await checkGitHooks(tmpDir, {});
+        expect(result.status).toBe('warn');
+        expect(result.message).toContain("totemDir '.totem'");
+        expect(result.message).toContain('the managed block is stale');
+        for (const file of ['pre-commit', 'pre-push', 'post-merge', 'post-checkout']) {
+          expect(result.message).toContain(file);
+        }
+        expect(result.remediation).toBe(
+          'totem hook install (the managed block is rewritten in place; your attested extension after the end marker is carried through unchanged)',
+        );
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // The attested shape whose MANAGED REGION does not decode as UTF-8 (an ANSI-editor
+    // save turned the template's em dash into one 0x97 byte): the installer reports
+    // `skipped-non-utf8` and leaves the file alone, so this row must not prescribe
+    // the bare install it would decline — the inert-instruction rule, applied to the
+    // newest shape (re-armed leg F13 on mmnto-ai/totem#2760).
+    it('classifies a non-UTF-8 managed region as non-utf8 and prescribes re-saving, never the bare install', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithTrailer(tmpDir, ATTESTED_TRAILER, { stale: true });
+        const preCommit = path.join(tmpDir, '.git', 'hooks', 'pre-commit');
+        const bytes = fs.readFileSync(preCommit);
+        const emDash = Buffer.from([0xe2, 0x80, 0x94]);
+        const dashAt = bytes.indexOf(emDash);
+        expect(dashAt).toBeGreaterThan(-1);
+        fs.writeFileSync(
+          preCommit,
+          Buffer.concat([
+            bytes.subarray(0, dashAt),
+            Buffer.from([0x97]),
+            bytes.subarray(dashAt + emDash.length),
+          ]),
+        );
+        const result = await checkGitHooks(tmpDir, {});
+        expect(result.status).toBe('warn');
+        expect(result.remediation).toContain('re-save pre-commit as UTF-8');
+        expect(result.remediation).toContain('does not decode as UTF-8');
+        // The other three hooks are still the attested shape and keep the bare-install
+        // clause; pre-commit must be named ONLY in the re-save clause.
+        expect(result.remediation).toContain(
+          'totem hook install for pre-push, post-merge, post-checkout (',
+        );
+        // No install clause — bare or --force — may list pre-commit (re-armed leg F17:
+        // the earlier `[^;]*` form could not match any output of the composer).
+        expect(result.remediation).not.toMatch(
+          /totem hook install(?: --force)? for [^(]*pre-commit/,
+        );
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // The predicate covers the region ABOVE the extension — shebang line included —
+    // while the staleness compare covers the managed block only, so a bad byte on
+    // the shebang line alone leaves the block current. The installer still skips
+    // such a hook, so the row must say so rather than "All 4 hooks installed"
+    // (re-armed leg F16).
+    it('senses a non-decoding shebang line above a CURRENT block and prescribes re-saving', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithTrailer(tmpDir, ATTESTED_TRAILER, { stale: false });
+        const preCommit = path.join(tmpDir, '.git', 'hooks', 'pre-commit');
+        const bytes = fs.readFileSync(preCommit);
+        const shebangEnd = bytes.indexOf(0x0a);
+        expect(bytes.subarray(0, 2).toString('utf-8')).toBe('#!');
+        fs.writeFileSync(
+          preCommit,
+          Buffer.concat([
+            bytes.subarray(0, shebangEnd),
+            Buffer.from([0x20, 0x97]), // " " + the em dash as one cp1252 byte, on the shebang line
+            bytes.subarray(shebangEnd),
+          ]),
+        );
+        const result = await checkGitHooks(tmpDir, {});
+        expect(result.status).toBe('warn');
+        // The headline names the real cause: this block IS the canonical, so "the
+        // managed block is stale (a newer hook template, or a config change)" would be
+        // two false statements about it (final leg, F20). Mixed sets keep the stale
+        // headline for the stale hooks and append the encoding clause.
+        expect(result.message).toContain('does not decode as UTF-8');
+        expect(result.message).not.toContain('the managed block is stale');
+        expect(result.remediation).toContain('re-save pre-commit as UTF-8');
+        expect(result.remediation).not.toMatch(
+          /totem hook install(?: --force)? for [^(]*pre-commit/,
+        );
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // The same case with the totemDir spelled out — this is precisely what the
+    // pre-#2753 early return hid.
+    it('WARNs identically when the default totemDir is configured explicitly', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithTrailer(tmpDir, ATTESTED_TRAILER, { stale: true });
+        const result = await checkGitHooks(tmpDir, { totemDir: '.totem' });
+        expect(result.status).toBe('warn');
+        expect(result.remediation).toContain('totem hook install');
+        expect(result.remediation).toContain(
+          'your attested extension after the end marker is carried through unchanged',
+        );
+        expect(result.remediation).not.toContain('--force');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('PASSES when the managed block is current beside an attested trailer', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithTrailer(tmpDir, ATTESTED_TRAILER, { stale: false });
+        const result = await checkGitHooks(tmpDir, {});
+        expect(result.status).toBe('pass');
+        expect(result.message).toBe('All 4 hooks installed');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('keeps the delete-and-re-append remedy for an UNATTESTED trailer', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        await installWithTrailer(tmpDir, '# my own extension\necho "[me] hi"\n', { stale: true });
+        const result = await checkGitHooks(tmpDir, {});
+        expect(result.status).toBe('warn');
+        expect(result.remediation).toContain('delete the totem block');
+        expect(result.remediation).toContain('would overwrite your own hook content');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // The corner the classification is gated for: the trailer IS attested, but the
+    // user's own lines sit ABOVE the totem block, so the marker does not open the
+    // file and `installGitHook` declines. Prescribing the bare install here would
+    // ship an instruction that does nothing (mmnto-ai/totem#2532) — the row must fall
+    // through to the appended remedy, which does work on this file.
+    it('does NOT prescribe the carry-through for an attested trailer under a user PREAMBLE', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const { buildPreCommitHook, TOTEM_PRECOMMIT_END } = await import('./install-hooks.js');
+        // Three canonical hooks; pre-commit gets user lines ABOVE a stale block and
+        // an attested extension BELOW its end marker.
+        await installCanonical(tmpDir, '.totem');
+        const staleBlock = withStaleComment(
+          buildPreCommitHook({ tier: 'standard', totemDir: '.totem' }),
+          TOTEM_PRECOMMIT_END,
+        )
+          .replace(/^#!\/bin\/sh\n/, '')
+          .trimStart();
+        fs.writeFileSync(
+          path.join(tmpDir, '.git', 'hooks', 'pre-commit'),
+          `#!/bin/sh\necho "user pre-commit"\n\n${staleBlock}${ATTESTED_TRAILER}`,
+        );
+
+        const result = await checkGitHooks(tmpDir, {});
+
+        expect(result.status).toBe('warn');
+        expect(result.message).toContain('pre-commit');
+        expect(result.message).not.toContain('pre-push');
+        expect(result.remediation).toContain('delete the totem block');
+        expect(result.remediation).toContain('pre-commit');
+        expect(result.remediation).toContain('would overwrite your own hook content');
+        // The cure the installer would decline on this file is never named.
+        expect(result.remediation).not.toContain('carried through unchanged');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // ── Mixed shapes in one repo (fold F6/F8, narrowed on fold 3 F5) ──
+    //
+    // Each shape contributes its own clause. A filename is named once, EXCEPT that
+    // the legacy note keeps its names when the `--force` clause lists more than the
+    // legacy hooks — otherwise the reader cannot tell which of the hooks it just
+    // listed is the legacy one. The sibling test below covers the case where the
+    // clause named exactly the legacy file and the note therefore drops its names.
+    it('composes one clause per shape; the legacy note names its file when the --force clause lists more than the legacy hooks (legacy + owned-whole + attested)', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const hooks = await import('./install-hooks.js');
+        const render = {
+          tier: 'standard' as const,
+          totemDir: '.totem',
+          fallbackCmd: hooks.getFallbackCommand(tmpDir),
+        };
+        const hooksDir = path.join(tmpDir, '.git', 'hooks');
+        fs.mkdirSync(hooksDir, { recursive: true });
+        // post-checkout stays canonical; the other three each take a shape.
+        fs.writeFileSync(
+          path.join(hooksDir, 'post-checkout'),
+          hooks.buildPostCheckoutHookContent(render),
+        );
+        // legacy: a stale block with its end-marker line removed.
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-commit'),
+          withStaleComment(hooks.buildPreCommitHook(render), hooks.TOTEM_PRECOMMIT_END)
+            .split('\n')
+            .filter((line) => !line.includes(hooks.TOTEM_PRECOMMIT_END))
+            .join('\n'),
+        );
+        // owned-whole: a stale block, nothing after the end marker.
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-push'),
+          withStaleComment(hooks.buildPrePushHook(render), hooks.TOTEM_PREPUSH_END),
+        );
+        // appended-attested: a stale block with the liquid-city extension after it.
+        fs.writeFileSync(
+          path.join(hooksDir, 'post-merge'),
+          withStaleComment(hooks.buildHookContent(render), hooks.TOTEM_HOOK_END) + ATTESTED_TRAILER,
+        );
+
+        const result = await checkGitHooks(tmpDir, {});
+
+        expect(result.status).toBe('warn');
+        const remediation = result.remediation ?? '';
+        // Three clauses, one per shape present.
+        expect(remediation).toContain('totem hook install');
+        expect(remediation).toContain('carried through unchanged');
+        expect(remediation).toContain('--force');
+        // The `--force` clause names BOTH forceable hooks, so the note must keep the
+        // legacy filename — otherwise the reader cannot tell which of the two is the
+        // legacy one (fold 3 F5). pre-commit therefore appears twice by design.
+        expect(remediation).toContain('`totem hook install --force` for pre-commit, pre-push');
+        expect(remediation).toContain(
+          '(pre-commit: a legacy hook with no end marker — back up any lines of your own first)',
+        );
+        expect(remediation.split('pre-commit').length - 1).toBe(2);
+        for (const file of ['pre-push', 'post-merge']) {
+          expect(remediation.split(file).length - 1).toBe(1);
+        }
+        // No plain `appended` row, so the trailing --force warning is absent.
+        expect(remediation).not.toContain('would overwrite your own hook content');
+        expect(remediation).not.toContain('delete the totem block');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    // The complementary case: the `--force` clause names EXACTLY the legacy file, so
+    // repeating it in the note would read as two hooks. There the note drops names.
+    it('drops the legacy names from the note when the --force clause named exactly them', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const hooks = await import('./install-hooks.js');
+        const render = {
+          tier: 'standard' as const,
+          totemDir: '.totem',
+          fallbackCmd: hooks.getFallbackCommand(tmpDir),
+        };
+        await installCanonical(tmpDir, '.totem');
+        const hooksDir = path.join(tmpDir, '.git', 'hooks');
+        // legacy pre-commit (the only forceable row) + attested pre-push.
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-commit'),
+          withStaleComment(hooks.buildPreCommitHook(render), hooks.TOTEM_PRECOMMIT_END)
+            .split('\n')
+            .filter((line) => !line.includes(hooks.TOTEM_PRECOMMIT_END))
+            .join('\n'),
+        );
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-push'),
+          withStaleComment(hooks.buildPrePushHook(render), hooks.TOTEM_PREPUSH_END) +
+            ATTESTED_TRAILER,
+        );
+
+        const result = await checkGitHooks(tmpDir, {});
+
+        const remediation = result.remediation ?? '';
+        expect(remediation).toContain('`totem hook install --force` for pre-commit');
+        expect(remediation).toContain(
+          '(a legacy hook with no end marker — back up any lines of your own first)',
+        );
+        expect(remediation).not.toContain('(pre-commit: a legacy hook');
+        expect(remediation.split('pre-commit').length - 1).toBe(1);
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('pluralizes the legacy note when more than one hook is legacy', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const hooks = await import('./install-hooks.js');
+        const render = {
+          tier: 'standard' as const,
+          totemDir: '.totem',
+          fallbackCmd: hooks.getFallbackCommand(tmpDir),
+        };
+        await installCanonical(tmpDir, '.totem');
+        const hooksDir = path.join(tmpDir, '.git', 'hooks');
+        const stripEnd = (text: string, endMarker: string): string =>
+          text
+            .split('\n')
+            .filter((line) => !line.includes(endMarker))
+            .join('\n');
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-commit'),
+          stripEnd(
+            withStaleComment(hooks.buildPreCommitHook(render), hooks.TOTEM_PRECOMMIT_END),
+            hooks.TOTEM_PRECOMMIT_END,
+          ),
+        );
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-push'),
+          stripEnd(
+            withStaleComment(hooks.buildPrePushHook(render), hooks.TOTEM_PREPUSH_END),
+            hooks.TOTEM_PREPUSH_END,
+          ),
+        );
+
+        const result = await checkGitHooks(tmpDir, {});
+
+        expect(result.status).toBe('warn');
+        // The two stale hooks are the only stale hooks, so the `--force` clause
+        // covers them all and names none — the note therefore carries the names, and
+        // reads as a plural.
+        expect(result.remediation).toBe(
+          'totem hook install --force (pre-commit, pre-push: legacy hooks with no end marker — back up any lines of your own first)',
+        );
+        expect(result.remediation).not.toContain('a legacy hook with no end marker');
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+
+    it('composes two clauses and keeps the --force warning when appended and attested mix', async () => {
+      const tmpDir = makeTmpDir();
+      try {
+        execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+        const hooks = await import('./install-hooks.js');
+        const render = {
+          tier: 'standard' as const,
+          totemDir: '.totem',
+          fallbackCmd: hooks.getFallbackCommand(tmpDir),
+        };
+        await installCanonical(tmpDir, '.totem');
+        const hooksDir = path.join(tmpDir, '.git', 'hooks');
+        // appended: user lines above a stale block.
+        const staleBlock = withStaleComment(
+          hooks.buildPreCommitHook({ tier: 'standard', totemDir: '.totem' }),
+          hooks.TOTEM_PRECOMMIT_END,
+        )
+          .replace(/^#!\/bin\/sh\n/, '')
+          .trimStart();
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-commit'),
+          `#!/bin/sh\necho "user pre-commit"\n\n${staleBlock}`,
+        );
+        // appended-attested: a stale block with the liquid-city extension after it.
+        fs.writeFileSync(
+          path.join(hooksDir, 'pre-push'),
+          withStaleComment(hooks.buildPrePushHook(render), hooks.TOTEM_PREPUSH_END) +
+            ATTESTED_TRAILER,
+        );
+
+        const result = await checkGitHooks(tmpDir, {});
+
+        expect(result.status).toBe('warn');
+        const remediation = result.remediation ?? '';
+        expect(remediation).toContain('delete the totem block');
+        expect(remediation).toContain('carried through unchanged');
+        expect(remediation).toContain('would overwrite your own hook content');
+        expect(remediation).not.toContain('--force for');
+        for (const file of ['pre-commit', 'pre-push']) {
+          expect(remediation.split(file).length - 1).toBe(1);
+        }
+      } finally {
+        cleanTmpDir(tmpDir);
+      }
+    });
+  });
+
+  // The honest could-not-compare arm (Tenet 13): when the installer module itself
+  // cannot load there is no canonical to compare against AND no default to name, so
+  // the row says so rather than passing on an unexamined tree or printing
+  // `totemDir 'undefined'` (fold F9).
+  it('warns "could not be compared" when the installer module fails to load', async () => {
+    const tmpDir = makeTmpDir();
+    try {
+      execSync('git init', { cwd: tmpDir, stdio: 'ignore' });
+      await installCanonical(tmpDir, '.totem');
+      vi.resetModules();
+      vi.doMock('./install-hooks.js', () => {
+        throw new Error('boom: install-hooks unloadable');
+      });
+      const { checkGitHooks: freshCheckGitHooks } = await import('./doctor.js');
+
+      const result = await freshCheckGitHooks(tmpDir, {});
+
+      expect(result.status).toBe('warn');
+      expect(result.message).toContain('could not be compared');
+      // `totemDir` is resolved FROM the module that failed, so it stays unresolved.
+      expect(result.message).toContain("totemDir 'unresolved'");
+      expect(result.remediation).toContain('totem hook install --force');
+    } finally {
+      vi.doUnmock('./install-hooks.js');
+      vi.resetModules();
       cleanTmpDir(tmpDir);
     }
   });
@@ -2535,6 +3301,71 @@ describe('findLegacyGrandfatheredRules + checkGrandfatheredRules', () => {
         lessonHash: 'rule-no-bad',
         reasons: ['no-badExample'],
       }),
+    ]);
+  });
+
+  // ── Prop 310 § Design 10 (slice 3) — the record rule's exemplar home ──
+  it('flags NEITHER reason for a RECORD rule — both exemplar sides live in `examples`', async () => {
+    // A record rule's exemplars are the § Design 10 editable home for BOTH sides
+    // and are never mirrored onto the legacy `badExample`/`goodExample`, so the
+    // shipped reads would have called every record rule grandfathered. Note it
+    // carries NEITHER legacy field: reading `examples` for one side and the legacy
+    // field for the other would clear one reason and raise the other on the very
+    // same absence (MIN-5).
+    writeRules(tmpDir, [
+      {
+        lessonHash: 'rule-record',
+        lessonHeading: 'Prop 310 rule record (rule-record)',
+        pattern: 'console\\.log',
+        message: 'no console.log',
+        engine: 'regex',
+        compiledAt: POST_1_13_0,
+        createdAt: POST_1_13_0,
+        examples: [{ bad: 'console.log(1)', good: 'logger.info(1)' }],
+      },
+    ]);
+    expect(await findLegacyGrandfatheredRules(tmpDir)).toEqual([]);
+  });
+
+  it('STILL flags no-goodExample for a legacy rule with a whitespace-only goodExample', async () => {
+    // The byte-identity control for the postimage reader swap, mirroring the
+    // badExample row below it.
+    writeRules(tmpDir, [
+      {
+        lessonHash: 'rule-blank-good',
+        lessonHeading: 'blank good',
+        pattern: 'x',
+        message: 'x',
+        engine: 'regex',
+        compiledAt: POST_1_13_0,
+        createdAt: POST_1_13_0,
+        badExample: 'bad snippet',
+        goodExample: ' \n\t ',
+      },
+    ]);
+    expect(await findLegacyGrandfatheredRules(tmpDir)).toEqual([
+      expect.objectContaining({ lessonHash: 'rule-blank-good', reasons: ['no-goodExample'] }),
+    ]);
+  });
+
+  it('STILL flags no-badExample for a legacy rule with a whitespace-only badExample', async () => {
+    // The byte-identity control for the reader swap: dropping blank lines is what
+    // keeps `.length === 0` equal to the shipped `!badExample || trim() === ''`.
+    writeRules(tmpDir, [
+      {
+        lessonHash: 'rule-blank-bad',
+        lessonHeading: 'blank bad',
+        pattern: 'x',
+        message: 'x',
+        engine: 'regex',
+        compiledAt: POST_1_13_0,
+        createdAt: POST_1_13_0,
+        badExample: '   \n\t',
+        goodExample: 'good snippet',
+      },
+    ]);
+    expect(await findLegacyGrandfatheredRules(tmpDir)).toEqual([
+      expect.objectContaining({ lessonHash: 'rule-blank-bad', reasons: ['no-badExample'] }),
     ]);
   });
 

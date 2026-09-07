@@ -1,6 +1,6 @@
 {
   "name": "@mmnto/pack-agent-security",
-  "version": "1.118.0",
+  "version": "2.2.0",
   "private": true,
   "description": "Zero-Trust Agent Governance security pack for Totem (ADR-089). Ships compound ast-grep rules that block known prompt-injection attack patterns at the commit boundary.",
   "license": "Apache-2.0",
@@ -29,7 +29,7 @@
   },
   "engines": {
     "node": ">=24",
-    "@mmnto/totem": "^1.26.0"
+    "@mmnto/totem": ">=1.26.0 <3.0.0"
   },
   "devDependencies": {
     "@mmnto/totem": "workspace:*",

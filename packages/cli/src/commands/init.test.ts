@@ -1897,6 +1897,54 @@ describe('initCommand non-interactive mode (mmnto-ai/totem#2601)', () => {
     expect(stderr.join('\n')).toContain('coexists with the managed SessionStart.cjs');
   }, 60000);
 
+  // Both rewrite actions were SILENT in init's summary before mmnto-ai/totem#2753:
+  // a stale hook was repaired and nothing said so, which is how a consumer read
+  // "Upgraded reflexes" beside hooks that had not moved (mmnto-ai/liquid-city#1174).
+  it('reports BOTH hook rewrite actions in the summary', async () => {
+    Object.defineProperty(process.stdin, 'isTTY', { value: false, configurable: true });
+    spawnSync('git', ['init'], { cwd: tmpDir, stdio: 'ignore' });
+    const hooksDir = path.join(tmpDir, '.git', 'hooks');
+    fs.mkdirSync(hooksDir, { recursive: true });
+    const { TOTEM_PRECOMMIT_END, TOTEM_PRECOMMIT_MARKER, TOTEM_PREPUSH_END, TOTEM_PREPUSH_MARKER } =
+      await import('./install-hooks.js');
+    // pre-commit: stale block + the liquid-city attested extension → the in-place
+    // rewrite that carries the extension through.
+    const attested = [
+      '',
+      '# [lc] docs-inject extension',
+      '# <!-- totem:fork reason="lc docs-inject pre-commit extension (divergence-census justified fork)" owner="satur8d" attested="2026-06-07" -->',
+      'sh "tools/git-hooks/pre-commit-docs-inject.sh"',
+      '',
+    ].join('\n');
+    fs.writeFileSync(
+      path.join(hooksDir, 'pre-commit'),
+      `#!/bin/sh\n# ${TOTEM_PRECOMMIT_MARKER}\nstale body\n# ${TOTEM_PRECOMMIT_END}\n${attested}`,
+    );
+    // pre-push: a stale totem-owned whole file → the #2138 whole-file drift-repair.
+    fs.writeFileSync(
+      path.join(hooksDir, 'pre-push'),
+      `#!/bin/sh\n# ${TOTEM_PREPUSH_MARKER}\nstale body\n# ${TOTEM_PREPUSH_END}\n`,
+    );
+    const stderr: string[] = [];
+    vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => {
+      stderr.push(args.map(String).join(' '));
+    });
+
+    await initCommand({});
+
+    const output = stderr.join('\n');
+    expect(output).toContain(
+      'Drift-repaired main-branch protection (managed block rewritten in place; your attested extension after the end marker carried through unchanged)',
+    );
+    expect(output).toContain(
+      'Drift-repaired deterministic shield gate (totem-owned bounded region)',
+    );
+    // The extension itself survived on disk.
+    expect(fs.readFileSync(path.join(hooksDir, 'pre-commit'), 'utf-8')).toContain(
+      'sh "tools/git-hooks/pre-commit-docs-inject.sh"',
+    );
+  }, 60000);
+
   it('runs to completion with --yes on a TTY', async () => {
     Object.defineProperty(process.stdin, 'isTTY', { value: true, configurable: true });
 
@@ -2282,9 +2330,11 @@ describe('CLAUDE_SESSION_START template', () => {
   it('#2570: stamps a repo-local log and hands the child the same fd (observability leg)', () => {
     // Routed from the status seat's 2026-08-03 silent no-write: under
     // stdio:'ignore' + exit-0-or-nothing, a reaped or dying child left NO
-    // trace. The stamp carries the discriminating fields; the child inherits
-    // the SAME fd so the verb's success line lands after the stamp — a stamp
-    // with nothing after it = the child never finished.
+    // trace. The stamp carries the discriminating fields; the children inherit
+    // the SAME fd so their output lands after the stamps. Narrowed once a
+    // second verb joined the block: child output is unlabelled and interleaves
+    // nondeterministically, so a silent tail attributes only to the LAST verb
+    // stamped — not per child.
     // Repo-local pin: the log must live INSIDE .git — a workspace-parent path
     // would grow an un-gitignorable file outside the repo tree for every
     // consumer of the published template (falsification round, MAJOR 2/4).
@@ -2301,6 +2351,42 @@ describe('CLAUDE_SESSION_START template', () => {
     );
     // …and the parent releases its fd copy after spawn (the child holds its own).
     expect(CLAUDE_SESSION_START).toContain('closeSync(logFd)');
+  });
+
+  // ── slice-two residual: refresh-obligation-store beside refresh-gh ──
+  // (mmnto-ai/totem-status#127; sibling of mmnto-ai/totem#2556.)
+  it('also fires refresh-obligation-store beside refresh-gh, same gate and log', () => {
+    const storeSpawn = "spawn('totem-status', ['refresh-obligation-store']";
+    // A second spawn in the SAME block — detached+unref, and its own ENOENT-silent
+    // arm (the shared `err.code === 'ENOENT'` return) plus its own breadcrumb.
+    expect(CLAUDE_SESSION_START).toContain(storeSpawn);
+    expect(CLAUDE_SESSION_START).toContain('refreshStore.unref()');
+    expect(CLAUDE_SESSION_START).toContain('refresh-obligation-store spawn failed (non-fatal)');
+    // Inside the one primary-checkout gate…
+    expect(CLAUDE_SESSION_START.indexOf('if (primaryCheckout)')).toBeLessThan(
+      CLAUDE_SESSION_START.indexOf(storeSpawn),
+    );
+    // …still ahead of the synchronous briefings (code-anchored, per the twin above)…
+    expect(CLAUDE_SESSION_START.indexOf(storeSpawn)).toBeLessThan(
+      CLAUDE_SESSION_START.indexOf("'describe'"),
+    );
+    // …and the shared fd is released only after BOTH spawns are away: a
+    // close-between-spawns mutant would hand the second child an EBADF.
+    expect(CLAUDE_SESSION_START.indexOf(storeSpawn)).toBeLessThan(
+      CLAUDE_SESSION_START.indexOf('closeSync(logFd)'),
+    );
+    // Each stamp NAMES its verb, so the log records which verbs fired and in
+    // what order. It does NOT restore per-child reap attribution — child
+    // output is unlabelled (see the #2570 test above).
+    expect(CLAUDE_SESSION_START).toContain(' verb=refresh-gh');
+    expect(CLAUDE_SESSION_START).toContain(' verb=refresh-obligation-store');
+    // The BLOCK-level catch covers a block that fires BOTH verbs — neither ran
+    // — so its breadcrumb names the sidecar, not one verb. The per-spawn
+    // breadcrumbs asserted above still name theirs.
+    expect(CLAUDE_SESSION_START).toContain(
+      '[SessionStart] totem-status sidecar refresh unavailable (non-fatal)',
+    );
+    expect(CLAUDE_SESSION_START).not.toContain('refresh-gh unavailable (non-fatal)');
   });
 });
 
@@ -2396,6 +2482,31 @@ describe('GEMINI_SESSION_START template', () => {
       GEMINI_SESSION_START.indexOf("spawn('totem-status'"),
     );
     expect(GEMINI_SESSION_START).toContain('closeSync(logFd)');
+  });
+
+  // ── slice-two residual: refresh-obligation-store beside refresh-gh ──
+  // Vehicle parity again — the moment is "session start", not a vendor.
+  it('also fires refresh-obligation-store beside refresh-gh, matching the Claude twin', () => {
+    const storeSpawn = "spawn('totem-status', ['refresh-obligation-store']";
+    expect(GEMINI_SESSION_START).toContain(storeSpawn);
+    expect(GEMINI_SESSION_START).toContain('refreshStore.unref()');
+    expect(GEMINI_SESSION_START).toContain('refresh-obligation-store spawn failed (non-fatal)');
+    expect(GEMINI_SESSION_START.indexOf('if (primaryCheckout)')).toBeLessThan(
+      GEMINI_SESSION_START.indexOf(storeSpawn),
+    );
+    expect(GEMINI_SESSION_START.indexOf(storeSpawn)).toBeLessThan(
+      GEMINI_SESSION_START.indexOf("'totem describe'"),
+    );
+    expect(GEMINI_SESSION_START.indexOf(storeSpawn)).toBeLessThan(
+      GEMINI_SESSION_START.indexOf('closeSync(logFd)'),
+    );
+    expect(GEMINI_SESSION_START).toContain(' verb=refresh-gh');
+    expect(GEMINI_SESSION_START).toContain(' verb=refresh-obligation-store');
+    // Block-level breadcrumb names the sidecar, matching the Claude twin.
+    expect(GEMINI_SESSION_START).toContain(
+      '[SessionStart] totem-status sidecar refresh unavailable (non-fatal)',
+    );
+    expect(GEMINI_SESSION_START).not.toContain('refresh-gh unavailable (non-fatal)');
   });
 });
 
@@ -2855,6 +2966,27 @@ describe('PreWriteShield runtime behavior', () => {
   });
 });
 
+/**
+ * The verbs an appending stub sidecar has been invoked with so far, sorted.
+ * The session-start block fires TWO verbs (refresh-gh + the slice-two
+ * refresh-obligation-store, mmnto-ai/totem-status#127) as detached children,
+ * so the marker is read as a SET of lines rather than a single value.
+ */
+function firedVerbs(markerPath: string): string[] {
+  try {
+    if (!fs.existsSync(markerPath)) return [];
+    return fs
+      .readFileSync(markerPath, 'utf-8')
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .sort();
+    // totem-context: intentional [] on a read race (marker mid-write) — the poll loop retries
+  } catch {
+    return [];
+  }
+}
+
 describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
   // Fail-fast guard for the spawned hook process, matching the 30s timeout
   // the hook's own internal spawnSync uses — a stalled child must fail the
@@ -2917,9 +3049,12 @@ describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
       const binDir = path.join(tmpDir, 'stub-bin');
       fs.mkdirSync(binDir);
       const markerPath = path.join(tmpDir, 'refresh-fired.marker');
+      // APPEND, not truncate: the block fires TWO verbs and the detached
+      // children land in whatever order they finish (mmnto-ai/totem-status#127
+      // slice two) — a `>` stub would race them into last-writer-wins.
       fs.writeFileSync(
         path.join(binDir, 'totem-status'),
-        `#!/bin/sh\necho "$1" > "${markerPath}"\n`,
+        `#!/bin/sh\necho "$1" >> "${markerPath}"\n`,
         { mode: 0o755 },
       );
 
@@ -2935,15 +3070,12 @@ describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
       expect(result.status).toBe(0);
 
       // Wait for CONTENT, not existence — existence alone races the stub's
-      // open-truncate-then-write window (observed CI flake).
+      // open-then-write window (observed CI flake) — and for BOTH verbs.
       const deadline = Date.now() + 5000;
-      while (
-        Date.now() < deadline &&
-        !(fs.existsSync(markerPath) && fs.readFileSync(markerPath, 'utf-8').trim() !== '')
-      ) {
+      while (Date.now() < deadline && firedVerbs(markerPath).length < 2) {
         await new Promise((r) => setTimeout(r, 50));
       }
-      expect(fs.readFileSync(markerPath, 'utf-8').trim()).toBe('refresh-gh');
+      expect(firedVerbs(markerPath)).toEqual(['refresh-gh', 'refresh-obligation-store']);
     },
   );
 
@@ -2960,7 +3092,7 @@ describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
       const markerPath = path.join(tmpDir, 'refresh-fired.marker');
       fs.writeFileSync(
         path.join(binDir, 'totem-status'),
-        `#!/bin/sh\necho "$1" > "${markerPath}"\necho "refresh-done"\n`,
+        `#!/bin/sh\necho "$1" >> "${markerPath}"\necho "refresh-done"\n`,
         { mode: 0o755 },
       );
 
@@ -2989,6 +3121,13 @@ describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
       const log = fs.readFileSync(logPath, 'utf-8');
       expect(log).toContain('] claude spawn cwd=');
       expect(log.indexOf('claude spawn cwd=')).toBeLessThan(log.indexOf('refresh-done'));
+      // Both stamps are written by the parent before it exits, and each NAMES
+      // its verb — two children sharing one fd would otherwise be unpairable.
+      expect(log).toContain('verb=refresh-gh');
+      expect(log).toContain('verb=refresh-obligation-store');
+      expect(log.indexOf('verb=refresh-gh')).toBeLessThan(
+        log.indexOf('verb=refresh-obligation-store'),
+      );
     },
   );
 
@@ -3008,7 +3147,7 @@ describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
       const markerPath = path.join(tmpDir, 'refresh-fired.marker');
       fs.writeFileSync(
         path.join(binDir, 'totem-status'),
-        `#!/bin/sh\necho "$1" > "${markerPath}"\n`,
+        `#!/bin/sh\necho "$1" >> "${markerPath}"\n`,
         { mode: 0o755 },
       );
 
@@ -3023,12 +3162,15 @@ describe('CLAUDE_SESSION_START runtime behavior (A.3.a ledger write)', () => {
       });
       expect(result.status).toBe(0);
       expect(result.stderr).not.toContain('refresh-gh');
+      expect(result.stderr).not.toContain('refresh-obligation-store');
 
+      // The blind fallback carries BOTH verbs: an unwritable log must not cost
+      // the second spawn either.
       const deadline = Date.now() + 5000;
-      while (Date.now() < deadline && !fs.existsSync(markerPath)) {
+      while (Date.now() < deadline && firedVerbs(markerPath).length < 2) {
         await new Promise((r) => setTimeout(r, 50));
       }
-      expect(fs.existsSync(markerPath)).toBe(true);
+      expect(firedVerbs(markerPath)).toEqual(['refresh-gh', 'refresh-obligation-store']);
     },
   );
 
@@ -3685,6 +3827,63 @@ Force should NOT erase this line.
   });
 });
 
+// ── tracked dogfood copy ⇄ published template parity lock ──
+// The Gemini twin of this lock lives in gemini-sessionstart-contract.test.ts
+// (mmnto-ai/totem#2628); the Claude side had none, so a template change could
+// ship while the file THIS repo's Claude seat actually boots stayed stale —
+// exactly the parity drift #2628 was opened for, just on the other vendor.
+// Byte-equality fails CI, so the next template change demands a regeneration
+// instead of relying on vigilance.
+describe('tracked .claude/hooks/SessionStart.cjs matches the published template', () => {
+  it('is byte-identical to CLAUDE_SESSION_START', () => {
+    const repoRoot = path.resolve(__dirname, '..', '..', '..', '..');
+    const tracked = fs.readFileSync(
+      path.join(repoRoot, '.claude', 'hooks', 'SessionStart.cjs'),
+      'utf-8',
+    );
+    expect(tracked).toBe(CLAUDE_SESSION_START);
+  });
+});
+
+// ── bespoke fourth surface kept in lockstep BY HAND ──
+// `.claude/hooks/session-context.mjs` is the FIRST of two SessionStart entries
+// registered in .claude/settings.json (the managed SessionStart.cjs is second),
+// and it carries its own hand-written copy of the sidecar-refresh block. It is
+// bespoke, not generated: no roster, no regen, no byte-lock covers it, so a
+// template change can silently leave it behind — it was missed once already in
+// this change's first round. These string-locks are the cheapest sensor the
+// repo's existing pattern supports (the repo-root read below is the same one
+// the #1890 skill locks use).
+describe('bespoke .claude/hooks/session-context.mjs stays in lockstep with the templates', () => {
+  const repoRoot = path.resolve(__dirname, '..', '..', '..', '..');
+  const bespoke = (): string =>
+    fs.readFileSync(path.join(repoRoot, '.claude', 'hooks', 'session-context.mjs'), 'utf-8');
+
+  it('fires BOTH sidecar verbs', () => {
+    expect(bespoke()).toContain("spawn('totem-status', ['refresh-gh']");
+    expect(bespoke()).toContain("spawn('totem-status', ['refresh-obligation-store']");
+  });
+
+  it('verb-tags every stamp it writes into the shared log', () => {
+    const source = bespoke();
+    expect(source).toContain(' verb=refresh-gh\\n');
+    expect(source).toContain(' verb=refresh-obligation-store\\n');
+    // Both the spawn stamp and the spawn-error stamp, per verb: four in total.
+    expect(source.match(/ verb=refresh-gh\\n/g)).toHaveLength(2);
+    expect(source.match(/ verb=refresh-obligation-store\\n/g)).toHaveLength(2);
+  });
+
+  it('carries the block-level breadcrumb that names the sidecar, not one verb', () => {
+    expect(bespoke()).toContain('totem-status sidecar refresh unavailable (non-fatal)');
+    expect(bespoke()).not.toContain('refresh-gh unavailable (non-fatal)');
+  });
+
+  it('no longer claims to be the sole SessionStart entry', () => {
+    // It is the first of two; the stale banner outlived the second registration.
+    expect(bespoke()).not.toContain('sole SessionStart entry');
+  });
+});
+
 describe('Distributed skill constants match source-of-truth (mmnto-ai/totem#1890)', () => {
   // The canonical skill content embedded in init-templates.ts MUST match the
   // SKILL.md file checked into .claude/skills/<name>/SKILL.md verbatim. If
@@ -3785,17 +3984,34 @@ describe('Distributed skill constants match source-of-truth (mmnto-ai/totem#1890
   // + the do-not-alter marker into the canonical skill content. v1.1 added the
   // additive ADMISSION form under the mmnto-ai/totem#2473 design (operator-
   // approved 2026-08-14) — this pin fired on that amendment exactly as
-  // intended, and was updated WITH the spec amendment, never around it.
-  it('REVIEW_LOOP_SKILL_CONTENT carries the exact covariate line format v1.1 contract (both shapes)', () => {
+  // intended, and was updated WITH the spec amendment, never around it. v1.2
+  // (mmnto-ai/totem#2698) appends the `leg:` field to BOTH shapes and adds the
+  // `local-lane: none` head for a lineage with a leg deposit and no review
+  // artifact; the same rule applied — the pin moved with the `.totem/specs/2473.md`
+  // v1.2 clause, never around it.
+  it('REVIEW_LOOP_SKILL_CONTENT carries the exact covariate line format v1.2 contract (all three shapes)', () => {
+    // The full shapes INCLUDING the appended field: a pin on the v1.1 prefix
+    // alone would still pass if the field were dropped from a shape.
     expect(REVIEW_LOOP_SKILL_CONTENT).toContain(
-      'local-lane: <verdictHash8> round=<n> settled=<true|false> lanes=<completed>/<attempted>',
+      'local-lane: <verdictHash8> round=<n> settled=<true|false> lanes=<completed>/<attempted> leg: <sha8> blocking=<n> material=<n> folded=<n>',
     );
     expect(REVIEW_LOOP_SKILL_CONTENT).toContain(
-      'local-lane: not-applicable (<reason>) recorded=<recordHash8> at=<createdAt>',
+      'local-lane: not-applicable (<reason>) recorded=<recordHash8> at=<createdAt> leg: <sha8> blocking=<n> material=<n> folded=<n>',
     );
     expect(REVIEW_LOOP_SKILL_CONTENT).toContain(
-      'covariate line format v1.1 — do not alter without a spec amendment',
+      'local-lane: none leg: <sha8> blocking=<n> material=<n> folded=<n>',
     );
+    expect(REVIEW_LOOP_SKILL_CONTENT).toContain(
+      'covariate line format v1.2 — do not alter without a spec amendment',
+    );
+    // The absent-deposit spelling is contract too (the pilot ledger greps it).
+    // The pin follows the sentence CodeRabbit narrowed on PR
+    // mmnto-ai/totem#2745: `leg: none` is a FIRST-TWO-SHAPES statement, and the
+    // deposit-only head is named in the same breath.
+    expect(REVIEW_LOOP_SKILL_CONTENT).toContain(
+      '`leg: none` replaces the field on the FIRST TWO shapes',
+    );
+    expect(REVIEW_LOOP_SKILL_CONTENT).toContain('The third shape is the DEPOSIT-ONLY head');
   });
 
   // The crown-gate + S0 fold (strategy#488 R-table, operator-ruled 2026-08-13/14)

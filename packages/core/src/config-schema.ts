@@ -2,6 +2,10 @@ import { z } from 'zod';
 
 import { ADMISSION_CLASSES } from './artifacts/schema.js';
 import { TotemConfigError } from './errors.js';
+// The legs-owed floor lives with the predicate that consumes it (`routing/legs-owed.ts`),
+// so the schema default and the classifier can never drift apart. That module imports
+// only `sys/glob.ts` (which imports nothing), so this edge introduces no cycle.
+import { DEFAULT_LEGS_OWED_GLOBS } from './routing/legs-owed.js';
 import { CustomSecretSchema } from './secrets.js';
 
 /**
@@ -435,12 +439,87 @@ export const ReviewConfigSchema = z
   .default({});
 
 /**
- * Default `searchRelevanceFloor` (mmnto-ai/totem#2463). Exported as the single
- * source shared by the schema default below and the MCP guard that re-applies
- * it for unvalidated configs — retuning one can never silently strand the
- * other on a stale floor.
+ * Whether `value` carries a character that cannot be rendered SAFELY into the
+ * managed git hooks (mmnto-ai/totem#2692 C4): a single quote (breaks the `sh`
+ * single-quoted word AND the single-quoted `node -e '…'` spec-evidence reader),
+ * a double quote or backslash (breaks the JS string literal inside that reader),
+ * a dollar sign or a backtick (the only characters still active inside the
+ * double-quoted `sh` words the hook guards use), or a control character /
+ * newline (breaks both, and can forge hook lines).
+ *
+ * The CLI installer carries the same clause as a render-path backstop; this
+ * refine is the primary gate, so a validated config never reaches it. Written as
+ * a code-point walk rather than a regex so the predicate carries no escape
+ * sequence of its own to mis-author.
  */
-export const DEFAULT_SEARCH_RELEVANCE_FLOOR = 0.25;
+export function hasUnrenderableHookChar(value: string): boolean {
+  for (const ch of value) {
+    if (ch === "'" || ch === '"' || ch === '\\' || ch === '$' || ch === '`') return true;
+    const code = ch.codePointAt(0) ?? 0;
+    // Control characters, DEL, and everything non-ASCII: git C-quotes any path
+    // byte above 0x7e in the `diff --name-only` output the hooks' `grep -q`
+    // filters read (`core.quotePath`, on by default), so a directory name
+    // carrying one could never match — the silent-skip class this closes.
+    if (code < 0x20 || code > 0x7e) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether `value` carries a character that cannot be rendered safely into the
+ * managed pre-commit hook as a required SPEC HEADING (mmnto-ai/totem#2737).
+ * Forbids the same five shell/JS-active characters as
+ * {@link hasUnrenderableHookChar} — a single quote, a double quote, a
+ * backslash, a dollar sign, a backtick — plus every line-breaking or control
+ * character the reader's own `safe()` collapses: C0 (below 0x20), the DEL/C1
+ * band (0x7f–0x9f), and U+2028/U+2029 (LINE and PARAGRAPH SEPARATOR). Anything
+ * outside that set could otherwise forge a second `[Totem]` line in the hook's
+ * output. U+2028 and U+2029 are printable-plane code points that terminals and
+ * pagers still break a line on, so banning only the two classic bands would
+ * leave the forge channel open on exactly the characters this predicate exists
+ * to permit the rest of.
+ *
+ * It PERMITS printable non-ASCII, and that is the whole difference. The path
+ * predicate bans everything above 0x7e because git C-quotes path bytes above
+ * 0x7e in the `diff --name-only` output the hooks' `grep -q` filters read, so a
+ * non-ASCII directory name could never match. A required heading meets no such
+ * filter: it is rendered by `JSON.stringify` into the reader's JS source and
+ * compared in memory against the draft's own lines. Holding it to the path
+ * rule would ban `### Verification (MANDATORY — do not skip)` — a heading the
+ * built-in prompt has always asked for — over a hazard it cannot encounter.
+ *
+ * The round-trip is not argued, it is EXECUTED: the frozen falsifier in
+ * `install-hooks.test.ts` runs the real hook over the four schema-constrained
+ * R3 drafts, which carry that em-dash heading byte-identical, and requires them
+ * to match on the EXACT pass and name no tolerance. That test fails on any CI
+ * OS where the em dash does not survive `JSON.stringify` → the single-quoted
+ * `node -e` word → `sh` → node intact.
+ */
+export function hasUnrenderableHeadingChar(value: string): boolean {
+  for (const ch of value) {
+    if (ch === "'" || ch === '"' || ch === '\\' || ch === '$' || ch === '`') return true;
+    const code = ch.codePointAt(0) ?? 0;
+    if (code < 0x20 || (code >= 0x7f && code <= 0x9f)) return true;
+    if (code === 0x2028 || code === 0x2029) return true;
+  }
+  return false;
+}
+
+/**
+ * Normalise a configured `totemDir` to the ONE spelling every consumer joins and
+ * every managed hook renders (mmnto-ai/totem#2692 amendment A7): backslashes →
+ * `/`, a leading `./` dropped, trailing slashes stripped. `.totem/` and `.totem`
+ * name the same directory, but rendered into the hooks' `grep -q '<dir>/…'`
+ * diff filters the slash produced `dir//…`, which never matched — silently.
+ * `'.'` is left alone (the global profile's own spelling for "this directory");
+ * an empty result is refused by the schema.
+ */
+export function normalizeTotemDir(value: string): string {
+  return value
+    .replace(/\\/g, '/')
+    .replace(/^(\.\/)+/, '')
+    .replace(/\/+$/, '');
+}
 
 export const TotemConfigSchema = z.object({
   /** Glob patterns and chunking strategies for each ingest target */
@@ -452,11 +531,38 @@ export const TotemConfigSchema = z.object({
   /** Optional: LLM orchestrator for spec/triage/shield commands */
   orchestrator: z.preprocess(autoMigrateOrchestrator, OrchestratorSchema).optional(),
 
-  /** Optional: override the .totem/ directory path */
+  /**
+   * Optional: override the .totem/ directory path.
+   *
+   * The value is RENDERED INTO the managed git hooks at install
+   * (mmnto-ai/totem#2692) — the strict pre-commit spec-evidence reader, the
+   * pre-push gate guards, and the post-merge / post-checkout diff filters all
+   * name it — so re-run `totem hook install --force` after changing it, or the
+   * installed hooks keep reading the previous directory.
+   *
+   * The value is normalised first — a backslash becomes `/`, a leading `./` is
+   * dropped, trailing slashes are stripped (see {@link normalizeTotemDir}) — and
+   * an empty result is refused. Because it is rendered into shell and into a JS
+   * string literal inside the hook, and because git C-quotes non-ASCII bytes in
+   * the paths the hooks' diff filters read, a value carrying a quote, a dollar
+   * sign, a backtick, a non-ASCII character, a newline or a control character
+   * is refused here as well as by the installer. The installer additionally
+   * refuses `.`, a `..` segment and a leading `-`, shapes whose hook diff
+   * filters could never match.
+   */
   totemDir: z
     .string()
     .default('.totem')
-    .refine((p) => !/^(\/|\\|[A-Za-z]:)/.test(p), 'totemDir must be a relative path'),
+    .transform(normalizeTotemDir)
+    .refine(
+      (p) => p.length > 0,
+      'totemDir must not be empty — leave it unset for the default `.totem`, or name a directory inside the repo',
+    )
+    .refine((p) => !/^(\/|\\|[A-Za-z]:)/.test(p), 'totemDir must be a relative path')
+    .refine(
+      (p) => !hasUnrenderableHookChar(p),
+      'totemDir must not contain a quote (\'), a double quote ("), a dollar sign, a backtick, a non-ASCII character, a newline or a control character — it is rendered into the managed git hooks, whose diff filters read paths git C-quotes',
+    ),
 
   /** Optional: override the .lancedb/ directory path */
   lanceDir: z
@@ -490,14 +596,49 @@ export const TotemConfigSchema = z.object({
   contextWarningThreshold: z.number().int().positive().default(40_000),
 
   /**
-   * Minimum per-hit relevance (vector-leg similarity, 0..1) below which the
-   * `search_knowledge` tool reports `status="no_useful_hits"` rather than
-   * returning noise-floor matches (mmnto-ai/totem#2463). Floors on the true
-   * relevance signal, NOT the RRF rank artifact in the displayed `score`. The
-   * per-call `min_relevance` MCP input overrides this; the retrieval-envelope
-   * always discloses the effective floor. Default 0.25 (pilot-calibrated).
+   * Optional relevance floor (0..1). A REFUSAL THRESHOLD compared against the
+   * BEST vector-leg relevance of ONE retrieval — never a per-item filter.
+   * Nothing in the product withholds an individual sub-floor hit while keeping
+   * its siblings. Two consumers:
+   *
+   *   1. the MCP `search_knowledge` tool (mmnto-ai/totem#2463): when a
+   *      response's best relevance is below the floor it answers
+   *      `status="no_useful_hits"` and DISCLOSES the below-floor candidates
+   *      (path + relevance, no content) instead of returning them — and a
+   *      retrieval whose EVERY hit is FAULTED (a relevance that is not a
+   *      finite number in [0, 1]) answers `no_useful_hits` too, floor or no
+   *      floor (mmnto-ai/totem#2770);
+   *   2. `totem spec` (mmnto-ai/totem#2700): an unanchored free-text run is
+   *      REFUSED when the best relevance is below the floor.
+   *
+   * Floors the true relevance signal, NOT the RRF rank artifact in the
+   * displayed `score`. Hits with no vector leg (keyword-only/FTS) carry no
+   * comparable relevance: they are floor-EXEMPT, and in `totem spec` a single
+   * exempt hit from a grounding partition (specs, sessions, code) saves the
+   * run — a keyword-only lesson does not; lessons never ground a run (ruled
+   * final, mmnto-ai/totem#2727).
+   *
+   * NO DEFAULT since mmnto-ai/totem#2727. Relevance is `1 / (1 + squared L2)`
+   * on unit-norm vectors, so it ranges over [0.2, 1] — 0.25 is INSIDE that
+   * range, but on the gemini-embedding-2-preview 768-d profile the LOWEST
+   * best-relevance over 55 recorded `totem spec` queries was 0.559 (0.5687 over
+   * the runs the spec refusal was even eligible to judge), so the former
+   * default fired on none of those 55, and any value below a repo's own
+   * measured floor is inert. An embedder returning UNNORMALIZED vectors
+   * (custom, some Ollama models) is not bounded that way and can produce
+   * relevances under 0.25, so on such a profile the old default could fire.
+   * A repo that wants weak free-text runs refused sets a value just above the
+   * best-relevance of the weakest run it still wants kept; the recipe is in
+   * `docs/wiki/config-reference.md` and the worked measurement is the R4 record
+   * at `.totem/fixtures/floor-arm-2026-09-03/`.
+   *
+   * UNSET = NO FLOOR: the below-floor arms of `no_useful_hits` and the spec
+   * refusal can never fire (each reader's zero-hit / all-faulted arms still
+   * can — they need no floor). The per-call
+   * `min_relevance` MCP input still applies, and still overrides this value;
+   * the retrieval-envelope always discloses the effective floor, or `none`.
    */
-  searchRelevanceFloor: z.number().min(0).max(1).default(DEFAULT_SEARCH_RELEVANCE_FLOOR),
+  searchRelevanceFloor: z.number().min(0).max(1).optional(),
 
   /** Optional: documents to auto-update via `totem docs` */
   docs: z.array(DocTargetSchema).optional(),
@@ -589,9 +730,62 @@ export const TotemConfigSchema = z.object({
   /** Optional: enforcement hook tier configuration */
   hooks: z
     .object({
-      /** Enforcement tier: 'strict' adds spec-completed checks and shield gates.
-       *  Agents are auto-detected and enforced at strict level regardless of this setting. */
+      /** Enforcement tier: 'strict' adds the spec-evidence check before commit — a
+       *  `totem spec` run artifact under `<totemDir>/artifacts/runs/` (`.totem/artifacts/runs/`
+       *  unless `totemDir` overrides it; top-level
+       *  `admission.runMetadata.caller === 'spec'`, mmnto-ai/totem#2690) — and shield
+       *  gates. Since mmnto-ai/totem#2700 that check requires an ANCHORED artifact —
+       *  grounded on an issue, or on a design record bound with `totem spec --from
+       *  <record>` — whose subject carries the shape the command promises; a
+       *  free-text topic run, and any artifact written before the rule, read as
+       *  not-evidence. Agents are auto-detected and enforced at strict level regardless
+       *  of this setting. The tier is rendered into the hook at install, so re-run
+       *  `totem hook install --force` after changing it (mmnto-ai/totem#2692). */
       tier: z.enum(['strict', 'standard']).default('standard'),
+
+      /** The judgment-dense path floor `totem legs gate` judges a push against
+       *  (mmnto-ai/totem#2698). A changed file matching any of these globs owes
+       *  a falsification-leg deposit for the head being pushed; the default is
+       *  the doctrine floor plus `.changeset/**` (see
+       *  {@link DEFAULT_LEGS_OWED_GLOBS}), and a repo declares its own contract
+       *  classes by REPLACING the list.
+       *
+       *  Read at RUN time, never rendered into the hook — unlike `tier`, editing
+       *  these globs needs no `totem hook install --force`, because the hook
+       *  calls back into `totem legs gate` which loads this config itself.
+       *
+       *  ABSENT ⇒ the default floor. PRESENT ⇒ present means ≥1: an explicitly
+       *  EMPTY array (`globs: []`) is a hard config PARSE error, never a silent
+       *  synonym for "nothing is ever owed" (the `review.lanes` precedent —
+       *  omit the key to take the default; there is deliberately no spelling
+       *  for disabling the floor by emptying it). */
+      legsOwed: z
+        .object({
+          globs: z
+            .array(z.string().min(1))
+            .min(
+              1,
+              'hooks.legsOwed.globs must contain at least one glob — omit the key to take the default floor',
+            )
+            .default([...DEFAULT_LEGS_OWED_GLOBS]),
+
+          /** The legs arm's OWN enforcement, decoupled from `tier`
+           *  (mmnto-ai/totem#2771). `'block'`: `totem legs gate` exits with its
+           *  derived state — 3 owed-and-unanswered, 2 could-not-derive — at EVERY
+           *  tier, so the managed pre-push hook blocks a legs-owed push on a
+           *  standard-tier install too, while the spec-evidence and shield gates
+           *  stay at the repo's tier. `'advisory'`: every gate state exits 0 at
+           *  every tier, the strict one included. ABSENT ⇒ today's tier-derived
+           *  behaviour (the strict tier and agent seats block, the others print
+           *  the same lines and pass), so no consumer changes on upgrade.
+           *
+           *  Read at RUN time like `globs` — the gate loads it itself, so setting
+           *  it needs no `totem hook install --force`. It maps onto the verb's
+           *  `--advisory` option inside the gate: the lines are composed once and
+           *  only the exit code follows the knob. */
+          enforce: z.enum(['block', 'advisory']).optional(),
+        })
+        .default({}),
     })
     .optional(),
 

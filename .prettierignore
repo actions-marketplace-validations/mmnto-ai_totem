@@ -24,3 +24,26 @@ packages/pack-agent-workflow/test/fixtures/
 .claude/hooks/
 .gemini/hooks/
 cloc-results.json
+
+# spike branch: gitignored toolchains + generated policies + byte-deterministic evidence emissions
+spikes/spine-adopt/tools/
+spikes/spine-adopt/rego/build/
+spikes/spine-adopt/artifacts/
+spikes/spine-adopt/smt/artifacts/
+spikes/spine-adopt/smt/obligations/
+spikes/spine-adopt/wazero-probe/artifacts/
+# Slice-2 byte pins (`.totem/specs/seed20-apparatus-slice2.md` constraint 4): the K5 control record,
+# the K8 parser-control fixtures and the K3 capture are sha256-pinned copies verified at run time —
+# a prettier rewrap of the chain JSON or the YAML reads as tamper against the pin
+spikes/spine-adopt/seed/controls/
+spikes/spine-adopt/egg-probe/artifacts/
+spikes/serena-pilot/artifacts/
+
+# Round fixtures (mmnto-ai/totem-strategy#1193): sha256-pinned data + the scripts that regenerate it —
+# `SHA256SUMS` seals every byte, so a formatter rewrite would break the pin (same class as `.totem/spine/`).
+.totem/fixtures/
+# Falsification-leg deposits (mmnto-ai/totem#2771): emitted by `totem legs deposit` (JSON.stringify, no
+# trailing newline, arrays expanded) and read JSON-aware by `totem legs gate` — never hand-edited, so a
+# formatter rewrite is churn on evidence, and without this line every seat would have to format an emitted
+# record before every push.
+.totem/artifacts/legs/

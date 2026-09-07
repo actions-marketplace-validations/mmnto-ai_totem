@@ -359,11 +359,21 @@ function lockContentPackageDirFor(contractId: string, gitRoot: string): string |
  * string, so an npm consumer's `npx`-flavored hook does not read as drift against a
  * pnpm canonical (the parameterization-aware contract, mmnto-ai/totem#2053).
  */
+interface HookRenderOptionsShape {
+  tier: 'strict' | 'standard';
+  totemDir: string;
+  fallbackCmd: string;
+}
+
 interface HookBuilderSource {
-  buildPreCommitHook: (tier?: 'strict' | 'standard') => string;
-  buildPrePushHook: (fallbackCmd: string, tier?: 'strict' | 'standard') => string;
-  buildHookContent: (fallbackCmd: string) => string;
-  buildPostCheckoutHookContent: (fallbackCmd: string) => string;
+  buildPreCommitHook: (options: { tier: 'strict' | 'standard'; totemDir: string }) => string;
+  buildPrePushHook: (options: {
+    fallbackCmd: string;
+    tier: 'strict' | 'standard';
+    totemDir: string;
+  }) => string;
+  buildHookContent: (options: { fallbackCmd: string; totemDir: string }) => string;
+  buildPostCheckoutHookContent: (options: { fallbackCmd: string; totemDir: string }) => string;
   markers: {
     preCommit: string;
     prePush: string;
@@ -396,34 +406,33 @@ interface GeneratedArtifact {
  */
 function gitHookArtifactsFor(
   hooksDir: string,
-  tier: 'strict' | 'standard',
-  fallbackCmd: string,
+  render: HookRenderOptionsShape,
   builders: HookBuilderSource,
 ): GeneratedArtifact[] {
   const m = builders.markers;
   return [
     {
       consumerPath: path.join(hooksDir, 'pre-commit'),
-      canonicalContent: builders.buildPreCommitHook(tier),
+      canonicalContent: builders.buildPreCommitHook(render),
       ownershipMarker: m.preCommit,
       lineName: 'Parity: git-hooks (pre-commit)',
     },
     {
       consumerPath: path.join(hooksDir, 'pre-push'),
-      canonicalContent: builders.buildPrePushHook(fallbackCmd, tier),
+      canonicalContent: builders.buildPrePushHook(render),
       ownershipMarker: m.prePush,
       lineName: 'Parity: git-hooks (pre-push)',
     },
     {
       consumerPath: path.join(hooksDir, 'post-merge'),
-      canonicalContent: builders.buildHookContent(fallbackCmd),
+      canonicalContent: builders.buildHookContent(render),
       ownershipMarker: m.postMerge.start,
       endMarker: m.postMerge.end,
       lineName: 'Parity: git-hooks (post-merge)',
     },
     {
       consumerPath: path.join(hooksDir, 'post-checkout'),
-      canonicalContent: builders.buildPostCheckoutHookContent(fallbackCmd),
+      canonicalContent: builders.buildPostCheckoutHookContent(render),
       ownershipMarker: m.postCheckout.start,
       endMarker: m.postCheckout.end,
       lineName: 'Parity: git-hooks (post-checkout)',
@@ -647,10 +656,21 @@ export async function checkParity(cwd: string): Promise<ParityCheckResult> {
   // at the CONFIGURED tier — a hook on disk that does not match its repo's configured
   // tier is genuine drift, which the content compare correctly surfaces.
   let hookTier: 'strict' | 'standard' = 'standard';
+  // Totem directory the git hooks were rendered at, resolved from the SAME
+  // repo-local config load as the tier (mmnto-ai/totem#2692 C6): a hook naming
+  // `.totem/` in a repo that configured something else is genuine drift, and the
+  // content compare below surfaces it with the `--force` remediation. Derived
+  // here rather than through `resolveHookRenderOptions` so this branch keeps its
+  // single config read and its `isGlobalConfigPath` guard.
+  let hookTotemDir = '.totem';
   // Opt-in cross-repo read set for the §14 network-read-only probes (current repo
   // is always probed; this only widens the roster). Captured from the SAME
   // repo-local config load — never leaked from the global profile.
   let probeRepos: string[] | undefined;
+  // The CURRENT repo's bound GH Project number — the one binding the
+  // `gh-project-vocabulary` row can derive locally (mmnto-ai/totem#2791).
+  // Captured from the SAME repo-local config load as `probeRepos`.
+  let projectNumber: number | undefined;
   try {
     const configPath = resolveConfigPath(cwd);
     // Repo-scoped by design: the manifest location is per-repo, so a config-less
@@ -665,7 +685,16 @@ export async function checkParity(cwd: string): Promise<ParityCheckResult> {
       const config = await loadConfig(configPath);
       configValue = config.orient?.parityManifest;
       hookTier = config.hooks?.tier ?? 'standard';
+      // A value the hooks cannot be rendered for (`.`, a `..` segment, …) never
+      // produced installed hooks — the installer refuses it — so the canonical is
+      // regenerated at the default rather than letting a builder throw mid-row
+      // (mmnto-ai/totem#2692 amendment A7).
+      const configuredTotemDir = config.totemDir ?? '.totem';
+      const { hookTotemDirProblem } = await import('./install-hooks.js');
+      hookTotemDir =
+        hookTotemDirProblem(configuredTotemDir) === null ? configuredTotemDir : '.totem';
       probeRepos = config.orient?.parityProbeRepos;
+      projectNumber = config.orient?.projectNumber;
     }
     // totem-context: a missing/corrupt totem config is the honest-absent path (treated as "no parity manifest configured"), not a sensor failure — the doctor runs against config-less repos by design.
   } catch (err) {
@@ -859,8 +888,14 @@ export async function checkParity(cwd: string): Promise<ParityCheckResult> {
       // the manifest ONCE, up front, so the pure detector only verdicts. An empty
       // roster / absent rows → no fetch. The default transport spawns `gh api`;
       // gh-absent degrades every surface to a skip (§14 clause 4). NEVER throws.
-      const { networkPostureRowFor, resolveNetworkSnapshots } =
-        await import('./doctor-parity-fetch.js');
+      const {
+        defaultCurrentSlug,
+        defaultGhFetch,
+        labelCanonNeeded,
+        networkPostureRowFor,
+        resolveLabelCanon,
+        resolveNetworkSnapshots,
+      } = await import('./doctor-parity-fetch.js');
       const networkRowSpecs = contracts.flatMap((c) => {
         if (c.manifestation !== 'capability-probe') return [];
         const row = networkPostureRowFor(c.id);
@@ -875,8 +910,26 @@ export async function checkParity(cwd: string): Promise<ParityCheckResult> {
               gitRoot,
               ...(repoId !== undefined ? { repoId } : {}),
               ...(probeRepos !== undefined ? { probeRepos } : {}),
+              ...(projectNumber !== undefined ? { projectNumber } : {}),
             })
           : [];
+      // The label canon is ROSTER-WIDE (one canon, many repos), so it resolves
+      // once here — and ONLY when the label row is present AND some roster repo
+      // is inside ITS consumers scope, so an empty roster, or a row scoped away
+      // from every roster repo, reads nothing (no `gh`; falsification pass 1, F7).
+      // The local read is keyed to the current ORIGIN slug being the canon's
+      // own repository, never to the cohort id (a fork whose id derives to
+      // `totem` from its package name or directory must take the fetch —
+      // Greptile P1 on mmnto-ai/totem#2797).
+      let labelCanon: ReturnType<typeof resolveLabelCanon> | undefined;
+      if (labelCanonNeeded(networkRowSpecs, networkSnapshots)) {
+        const currentSlug = await defaultCurrentSlug(gitRoot);
+        labelCanon = resolveLabelCanon({
+          gitRoot,
+          ...(currentSlug !== undefined ? { currentSlug } : {}),
+          ghFetch: await defaultGhFetch(),
+        });
+      }
 
       // flatMap, not map: a mechanical contract (claude-skills) expands to one
       // line PER distributed skill, so the per-contract count can exceed the
@@ -907,6 +960,9 @@ export async function checkParity(cwd: string): Promise<ParityCheckResult> {
               repos: networkSnapshots,
               ...(networkRow === 'repo-required-checks-posture'
                 ? { declarationPath: path.join(gitRoot, '.totem', 'rulesets', 'main.json') }
+                : {}),
+              ...(networkRow === 'gh-issue-label-canon' && labelCanon !== undefined
+                ? { labelCanon }
                 : {}),
             }).map((l) => {
               if (l.verdict.status === 'warn' && c.blocking === true) blockingDrift = true;
@@ -1138,8 +1194,7 @@ export async function checkParity(cwd: string): Promise<ParityCheckResult> {
             const parityHooksDir = resolveHooksDir(gitRoot) ?? path.join(gitRoot, '.git', 'hooks');
             generatedArtifacts = gitHookArtifactsFor(
               parityHooksDir,
-              hookTier,
-              fallbackCmd,
+              { tier: hookTier, totemDir: hookTotemDir, fallbackCmd },
               hookBuilders,
             );
             artifactLabel = 'git hook';

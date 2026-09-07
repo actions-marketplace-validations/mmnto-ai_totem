@@ -7,7 +7,18 @@ The `totem.config.ts` file is the heart of your project's governance.
 ```typescript
 export default {
   // Core Paths
-  totemDir: '.totem', // Directory for local storage, lessons, and cache
+  // Directory for local storage, lessons, and cache. Rendered INTO the managed
+  // git hooks at install (mmnto-ai/totem#2692) — the strict pre-commit
+  // spec-evidence reader, the pre-push gate guards, and the post-merge /
+  // post-checkout diff filters all name it — so re-run `totem hook install
+  // --force` after changing it, or the installed hooks keep reading the previous
+  // directory. Must be relative and non-empty, and must not contain a quote, a
+  // dollar sign, a backtick, a non-ASCII character, a newline or a control
+  // character (it cannot be quoted safely into a hook, and git C-quotes
+  // non-ASCII paths the hooks grep); a backslash is normalised to `/` and a
+  // trailing slash is stripped. The hooks additionally refuse `.`, a `..`
+  // segment and a leading `-`.
+  totemDir: '.totem',
 
   // Vector Database Settings
   embedding: {
@@ -48,6 +59,17 @@ export default {
       admissionClasses: ['completion_only'],
     },
   },
+
+  // OPTIONAL, and NO DEFAULT (mmnto-ai/totem#2727). Omit it and no floor
+  // applies. See "The relevance floor" below before setting one.
+  // The relevance being floored is METRIC-BOUND (mmnto-ai/totem#2738):
+  // relevance = relevanceFromDistance('l2', _distance), and `l2` is the metric
+  // every Totem vector query is explicitly issued with. LanceDB's `_distance`
+  // under `l2` is the SQUARED Euclidean distance, so on unit-norm vectors it
+  // lies in [0, 4] and the relevance 1/(1+_distance) lies in [0.2, 1] — on
+  // unit-norm vectors a floor below 0.2 can never fire at all (a non-unit-norm
+  // embedder is not bounded that way; see "The Relevance Floor" below).
+  // searchRelevanceFloor: 0.57,
 
   // Command-Specific Options
   compileOptions: {
@@ -116,8 +138,90 @@ export default {
     junie: '.junie/guidelines.md',
     copilot: '.github/copilot-instructions.md',
   },
+
+  // Enforcement hook configuration.
+  hooks: {
+    // The tier rendered INTO the managed hooks at install — re-run
+    // `totem hook install --force` after changing it.
+    tier: 'standard', // 'strict' | 'standard'
+
+    // The judgment-dense path floor `totem legs gate` judges a push against
+    // (mmnto-ai/totem#2698). See the section below.
+    legsOwed: {
+      globs: ['doctrine/**', 'adr/**', 'docs/wiki/**', '.changeset/**'],
+      // The legs arm's OWN enforcement, at any tier (mmnto-ai/totem#2771):
+      // 'block' | 'advisory'; unset keeps the tier-derived behaviour.
+      enforce: 'block',
+    },
+  },
 };
 ```
+
+## The Relevance Floor (`searchRelevanceFloor`)
+
+**Optional, and it ships with NO default** (mmnto-ai/totem#2727). Omit the key and no floor applies anywhere.
+
+**What it is.** A refusal threshold compared against the **best** vector-leg relevance of **one retrieval** — a whole-run gate, not a per-item filter. Nothing in Totem withholds an individual sub-floor hit while returning its siblings. Two consumers read it:
+
+1. the MCP `search_knowledge` tool: when a response's best relevance falls below the floor it answers `status="no_useful_hits"` and discloses the below-floor candidates (path + relevance, no content) instead of returning them — and a retrieval whose EVERY hit is faulted (a relevance that is not a finite number in [0, 1]) answers `no_useful_hits` too, floor or no floor, with the faulted count in the envelope (mmnto-ai/totem#2770);
+2. `totem spec` (mmnto-ai/totem#2700): an unanchored free-text run is REFUSED when the best relevance is below the floor — the refusal names the value and this key, exits non-zero, and writes no run artifact. `--raw` is exempt.
+
+**Hits with no vector leg are floor-EXEMPT.** A keyword-only (FTS) hit carries no comparable relevance, so absence of a signal is never read as a weak signal — and in `totem spec` a single exempt hit **from a grounding partition** (specs, sessions, code) saves the run. **A hit whose relevance fails the range predicate is FAULTED** (NaN, infinite, or outside [0, 1] — under `l2` only a negative distance, an SDK or data fault the search layer tallies): neither signal nor exemption in both readers, it can never raise the best relevance and cannot save a run or a batch; on a withheld arm it is disclosed by path as `relevance faulted`, and on a batch that proceeds on its real signal it is returned with its field reading `faulted` instead of a number. Lessons are never judged by that gate — they do not ground a run (ruled final, mmnto-ai/totem#2727) — so a keyword-only lesson hit does not save it.
+
+**With the key unset there is no floor at all**: the below-floor arms of `no_useful_hits` and the spec refusal cannot fire (each reader's all-faulted arm still can — it needs no floor). The retrieval envelope prints `floor="none"`. `totem spec`'s zero-hit refusal is unaffected — it is a separate arm and still fires. The MCP `min_relevance` input applies per call regardless, and still overrides a configured value.
+
+**Why no default.** Relevance is `1 / (1 + squared L2)` on unit-norm vectors, so it ranges over `[0.2, 1]` and real retrievals sit high in that range. Measured on the gemini-embedding-2-preview 768-d profile over 55 recorded `totem spec` queries, the **lowest** best-relevance of any run was **0.559** (0.5687 over the runs the spec refusal was eligible to judge at all). `0.25` sits inside the reachable range, but it **fired on none of those 55** — a mechanism claim with no mechanism — and any value below a repo's own measured floor is inert the same way. The reachable value is a property of a corpus, its embedder and its labels, so it is yours to set, not ours to guess. The worked measurement is the R4 record at `.totem/fixtures/floor-arm-2026-09-03/` in this repo.
+
+**If your embedder does not return unit-norm vectors** (some custom providers, some Ollama models), the `[0.2, 1]` bound does not hold and relevances below `0.25` are reachable — so on that profile the old default could fire, and removing it may mean **fewer** refusals and fewer `no_useful_hits` than before. Set a value to restore them; calibrate it the same way.
+
+**Choosing a value — one key, two consumers.** The number you pick governs `totem spec`'s refusal AND every `search_knowledge` answer, and those two do not see the same relevances. `search_knowledge` retrieves over every content type, including the **lesson** pool, and lessons score markedly lower than specs and code: on this repo's profile they sit around `0.34`, and an issue-anchored MCP retrieval starts being withheld from about `0.638`. So a value chosen only to refuse weak `totem spec` runs can quietly empty MCP answers over lessons. Calibrate with both in view.
+
+1. Record real runs — an `.totem/artifacts/` sweep of `totem spec` runs over queries you actually ask; each run's grounding items carry their relevance. Beside them, record the `bestRelevance` from the `<retrieval-envelope>` of real `search_knowledge` calls, including ones that should return lessons.
+2. Mark the runs and the MCP calls whose retrieval you would want KEPT (it produced usable grounding) and the ones you would want refused.
+3. Note the best relevance of each kept run and each kept MCP call. The floor has to sit **below the weakest thing you still want kept across BOTH** — set it there, or a hair under, or you will refuse work you wanted, or answer a legitimate `search_knowledge` call with `no_useful_hits`.
+4. Set `searchRelevanceFloor` to that number. Re-measure whenever the embedder or the corpus changes materially; a floor calibrated on one embedding profile says nothing about another.
+
+If no single value separates what you would keep from what you would refuse — which is the likely outcome when the spec runs and the lesson pool sit far apart — that is a real answer: leave the key unset and let the zero-hit arm and the anchor rules carry the gate, and use the per-call `min_relevance` where you want a floor for one query.
+
+## The Legs-Owed Floor (`hooks.legsOwed.globs`)
+
+`totem legs gate` calls a push **legs-owed** when a changed path in the branch-vs-base diff matches one of these globs. An owed push must carry a falsification-leg deposit for its head; under the strict tier the pre-push hook blocks without one (see [Enforcement Model](enforcement-model.md)).
+
+**The default floor** — used when the key is absent — is the doctrine surfaces, the public-copy surfaces, and one contract proxy:
+
+```text
+doctrine/**
+design-tenets.md
+adr/**
+proposals/**
+README.md
+docs/wiki/**
+.changeset/**
+```
+
+`.changeset/**` is in the default deliberately: a changeset IS the release's compatibility contract, so every releasable slice is owed a leg by derivation rather than by anyone remembering to declare it.
+
+**A configured list REPLACES the default; it does not merge with it.** A repo declaring its own contract classes must restate every default entry it still wants — dropping one silently retires that part of the floor. (Totem's own `totem.config.ts` restates all seven before adding its schemas, its routing seam, its hook/template builders and its distributed skills — the latter under BOTH `.agents/skills/**` and `.claude/skills/**`, because the two are written from one constant and a floor that watches only one of them can be walked around by editing the other.)
+
+**An empty array is a parse error, not a synonym for "nothing is owed."** `globs: []` fails config load with `hooks.legsOwed.globs must contain at least one glob — omit the key to take the default floor`. There is deliberately no spelling for disabling the floor by emptying it; omit the key to take the default (the `review.lanes` precedent).
+
+**Bare patterns match by basename.** The matcher is the same dialect `ignorePatterns` uses, so a bare `README.md` matches a file of that name anywhere in the tree — which is what makes it cover every package README, i.e. the npm-public copy. A `!`-prefixed glob is an exclusion, and a file matching any exclusion is never owed whatever positives it also matched.
+
+**Read at run time.** Unlike `hooks.tier`, these globs are never rendered into the hook — the hook calls back into `totem legs gate`, which loads this config itself — so editing the list needs no `totem hook install --force`.
+
+## The Enforcement Knob (`hooks.legsOwed.enforce`)
+
+Optional; `'block'` or `'advisory'` (mmnto-ai/totem#2771). It decides what `totem legs gate` **exits** — never what it prints — and it wins over the hook tier in both directions:
+
+- **`'block'`**: the gate exits its derived state — `3` owed with no fresh deposit, `2` could not derive — at EVERY tier, so the managed pre-push hook refuses a legs-owed push on a standard-tier install too, while the spec-evidence and shield gates stay at the repo's tier. This is the per-arm shape the cohort asked for: one gate armed without arming all three.
+- **`'advisory'`**: every derived gate state exits `0` at every tier, the strict one included, and on agent seats (a failure before the derivation — an unloadable config — still exits non-zero).
+- **Unset**: the tier-derived behaviour — the strict tier and agent seats block, the other tiers print the same lines and pass. Nothing changes on upgrade.
+
+It is read at run time by the gate itself, like the globs, so setting it needs no `totem hook install --force`. When it is set the gate prints one extra line under either tier — `[Totem] legs: hooks.legsOwed.enforce = block` — so a block on a standard-tier install names the key that caused it, and a strict install softened to advisory says so too.
+
+**The CI arm reads the same knob.** A workflow step running `totem legs gate` exits the derived state with the knob unset or `'block'`; `'advisory'` softens that step as well. A repo adopting the CI arm of the `legs-gate` parity row (a hard `totem legs gate` step in its lint workflow over deposits committed under `.totem/artifacts/legs/`) therefore leaves the knob unset or sets `'block'` — Totem's own repository takes the CI arm with the knob unset, so its local pushes stay advisory and its pull requests are gated.
+
+**The floor sees the unfiltered diff.** The gate resolves the same branch-vs-base scope the push gate lints, but with the ignore configuration EMPTY: neither `ignorePatterns` nor `shieldIgnorePatterns` can hide a path from the floor. Those keys carry index-exclusion semantics that were merged into the review/lint diff filter for back-compat, and letting them narrow this predicate would mean a repo that keeps `README.md` out of its index silently stops owing a leg for its public copy. Every run discloses it: `[Legs] Diff source: branch-vs-base (unfiltered — ignorePatterns do not apply to the floor)`.
 
 ## Secrets Management
 

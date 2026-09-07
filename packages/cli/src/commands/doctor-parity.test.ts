@@ -41,6 +41,25 @@ import {
   TOTEM_PREPUSH_MARKER,
 } from './install-hooks.js';
 
+/**
+ * Spawn recorder for the network-read-only wiring assertions
+ * (mmnto-ai/totem#2791). `cross-spawn`'s `sync` is the single choke point every
+ * `safeExec` in core AND the CLI funnels through, so a FORWARDING partial mock
+ * records the command names while leaving behavior byte-identical for every
+ * other test in this file.
+ */
+const spawnedCommands = vi.hoisted(() => [] as string[]);
+vi.mock('cross-spawn', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('cross-spawn')>();
+  return {
+    ...actual,
+    sync: (...callArgs: Parameters<typeof actual.sync>) => {
+      spawnedCommands.push(callArgs[0]);
+      return actual.sync(...callArgs);
+    },
+  };
+});
+
 // Minimal valid totem config — `targets` is the only required array; everything
 // else defaults. `orient.parityManifest` is added per-test as needed.
 const BASE_CONFIG = `targets:
@@ -898,12 +917,15 @@ function writeGitHook(name: string, content: string): void {
 }
 
 /** Install every git hook VERBATIM from the running generator (the clean PASS case). */
-function installCurrentHooks(): void {
-  const fallbackCmd = getFallbackCommand(tmpDir);
-  writeGitHook('pre-commit', buildPreCommitHook('standard'));
-  writeGitHook('pre-push', buildPrePushHook(fallbackCmd, 'standard'));
-  writeGitHook('post-merge', buildHookContent(fallbackCmd));
-  writeGitHook('post-checkout', buildPostCheckoutHookContent(fallbackCmd));
+function installCurrentHooks(totemDir = '.totem'): void {
+  // mmnto-ai/totem#2692: the builders take a REQUIRED options object, so the
+  // fixture states the tier/totemDir/fallbackCmd the canonical is rendered at —
+  // the same three fields `checkParity` resolves from config.
+  const render = { tier: 'standard' as const, totemDir, fallbackCmd: getFallbackCommand(tmpDir) };
+  writeGitHook('pre-commit', buildPreCommitHook(render));
+  writeGitHook('pre-push', buildPrePushHook(render));
+  writeGitHook('post-merge', buildHookContent(render));
+  writeGitHook('post-checkout', buildPostCheckoutHookContent(render));
 }
 
 describe('checkParity — mechanical git-hooks wiring (#2073)', () => {
@@ -957,7 +979,14 @@ describe('checkParity — mechanical git-hooks wiring (#2073)', () => {
     writeConfig(`${BASE_CONFIG}orient:\n  parityManifest: m.yaml\nhooks:\n  tier: strict\n`);
     writeManifest('m.yaml', HOOKS_MANIFEST_YAML);
     // Install the STANDARD pre-push, but the repo is configured strict → drift.
-    writeGitHook('pre-push', buildPrePushHook(getFallbackCommand(tmpDir), 'standard'));
+    writeGitHook(
+      'pre-push',
+      buildPrePushHook({
+        tier: 'standard',
+        totemDir: '.totem',
+        fallbackCmd: getFallbackCommand(tmpDir),
+      }),
+    );
 
     const { results } = await checkParity(tmpDir);
     const prePush = results.find((r) => r.name === 'Parity: git-hooks (pre-push)')!;
@@ -1991,5 +2020,59 @@ describe('doctorParityCliCommand — --json verdict artifact (#2327 R4)', () => 
     }
     const artifact = JSON.parse(cap.writes.join('')) as JsonArtifact;
     expect(artifact['readout-schema-version']).toBe(1);
+  });
+});
+
+// ─── the two 472-charter orientation rows (mmnto-ai/totem#2791) ─────────────
+const ORIENTATION_ROWS_MANIFEST_YAML = `schema-version: 1
+status: active
+contracts:
+  - id: gh-issue-label-canon
+    dimension: orientation
+    canonical-source: mmnto-ai/totem:scripts/sync-labels.ps1
+    detection-method: repo label list (REST) vs the canon parsed from sync-labels.ps1
+    expected-value-or-derivation: 'every canonical label present with its color + description'
+    tractability: mechanical
+    manifestation: capability-probe
+    senses: present
+    tracking-issue: mmnto-ai/totem#2791
+  - id: gh-project-vocabulary
+    dimension: orientation
+    canonical-source: null
+    detection-method: bound GH Project single-select fields (GraphQL) vs the row's expected sets
+    expected-value-or-derivation: 'Status = Todo | Done; Priority = Now | Next; extra fields permitted'
+    tractability: mechanical
+    manifestation: capability-probe
+    senses: present
+    tracking-issue: mmnto-ai/totem#2791
+`;
+
+describe('checkParity — orientation network rows (mmnto-ai/totem#2791)', () => {
+  it('routes both rows to the network family and renders the honest-absent skip with NO gh spawn', async () => {
+    writeConfig(`${BASE_CONFIG}orient:\n  parityManifest: parity-manifest.yaml\n`);
+    writeManifest('parity-manifest.yaml', ORIENTATION_ROWS_MANIFEST_YAML);
+    spawnedCommands.length = 0;
+
+    const { results } = await checkParity(tmpDir);
+
+    const labelLine = results.find((r) => r.name === 'Parity: gh-issue-label-canon');
+    const vocabLine = results.find((r) => r.name === 'Parity: gh-project-vocabulary');
+    // Both rows reach the network detector (not the "probe not yet implemented"
+    // stub), and the temp dir has no git remote, so the roster is empty and the
+    // detector renders one honest-absent skip per row.
+    expect(labelLine?.status).toBe('skip');
+    expect(vocabLine?.status).toBe('skip');
+    expect(labelLine?.message).toContain('no roster repo resolved to probe');
+    expect(vocabLine?.message).toContain('no roster repo resolved to probe');
+    expect(labelLine?.message).not.toContain('not yet implemented');
+    expect(vocabLine?.message).not.toContain('not yet implemented');
+
+    // The recorder is live — a `git` spawn is recorded (the cohort-id
+    // derivation's remote read runs before the network step; this pins
+    // liveness, not which probe) — and no `gh` was spawned: an empty roster
+    // reads nothing — not the labels, not the project, and not the canonical
+    // label script.
+    expect(spawnedCommands).toContain('git');
+    expect(spawnedCommands).not.toContain('gh');
   });
 });

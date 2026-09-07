@@ -288,9 +288,19 @@ program
   });
 
 program
-  .command('spec <inputs...>')
-  .description('Generate a pre-work spec briefing for GitHub issue(s) or topic(s)')
+  // `[inputs...]` (OPTIONAL variadic) since mmnto-ai/totem#2700: a required
+  // variadic made `--from <record>` unreachable — commander refused the
+  // invocation before `specCommand` could bind the record. "No inputs and no
+  // --from" is now the command's own CONFIG_INVALID, carrying the usage line.
+  .command('spec [inputs...]')
+  .description(
+    'Generate a pre-work spec briefing for GitHub issue(s), topic(s), or a design record',
+  )
   .option('--raw', 'Output retrieved context without LLM synthesis')
+  .option(
+    '--from <record>',
+    'Ground the run on a hand-authored design record (the record is the anchor; it is never written)',
+  )
   .option(
     '--out <path>',
     'Write output to a specific file (overrides default .totem/specs/<topic>.md)',
@@ -304,7 +314,14 @@ program
   .action(
     async (
       inputs: string[],
-      opts: { raw?: boolean; out?: string; stdout?: boolean; model?: string; fresh?: boolean },
+      opts: {
+        raw?: boolean;
+        out?: string;
+        stdout?: boolean;
+        model?: string;
+        fresh?: boolean;
+        from?: string;
+      },
     ) => {
       try {
         const { specCommand } = await import('./commands/spec.js');
@@ -611,6 +628,50 @@ artifactCommand
     }
   });
 
+// Falsification-leg deposits (mmnto-ai/totem#2698): `deposit` is the single
+// writer over `<totemDir>/artifacts/legs/`, `gate` the read-only push gate the
+// managed pre-push hook probes for and invokes. `gate` owns its exit vocabulary
+// (0 not owed / evidence · 2 could not derive · 3 owed with no fresh deposit)
+// and exits itself; the handleError boundary here catches everything BEFORE the
+// derivation — a missing config, an unreadable repo.
+const legsCommand = program
+  .command('legs')
+  .description('Leg deposits — record what a review leg read, and gate a legs-owed push on it');
+
+legsCommand
+  .command('deposit')
+  .description("Record a review leg's findings against the head it read")
+  .requiredOption('--from <file>', "Path to the leg's findings JSON")
+  .option('--sha <ref>', 'The head the leg read (default: HEAD)')
+  .option('--replace', 'Overwrite an existing deposit for this sha, reporting what it replaced')
+  .option('--read-at <iso>', "The leg's own instant (ISO-8601)")
+  .action(async (opts: { from: string; sha?: string; replace?: boolean; readAt?: string }) => {
+    try {
+      const { legsDepositCommand } = await import('./commands/legs.js');
+      await legsDepositCommand(opts);
+      // totem-context: handleError is the CLI error boundary (returns `never` — prints + process.exit), identical to every sibling command action in this file; nothing is swallowed.
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
+legsCommand
+  .command('gate')
+  .description('Is this push legs-owed, and does a fresh deposit answer for HEAD?')
+  .option(
+    '--advisory',
+    'Print the same lines for every state, exiting 0 for every gate state (a failure before the derivation still exits non-zero)',
+  )
+  .action(async (opts: { advisory?: boolean }) => {
+    try {
+      const { legsGateCommand } = await import('./commands/legs.js');
+      await legsGateCommand(opts);
+      // totem-context: handleError is the CLI error boundary (returns `never` — prints + process.exit), identical to every sibling command action in this file; nothing is swallowed.
+    } catch (err) {
+      handleError(err);
+    }
+  });
+
 program
   .command('triage-pr <pr-number>')
   .description('Categorized triage view of bot review comments on a PR')
@@ -863,6 +924,15 @@ const mailCmd = program
       'In a multi-seat repo, an identity-less poll serves broadcast mail only',
       '(directed mail is withheld as a count, exit 2) until identity is explicit:',
       'per-shell TOTEM_SELF_AGENT, `--as <seat>`, or `--all-seats` by name.',
+      '',
+      'Exit codes: 0 = verdict derived. 2 = NOT DERIVED (no self agent, or an',
+      'identity-gated poll) — fix identity and re-poll. 4 = SENDER FAULT',
+      '(mmnto-ai/totem#2685): the verdict IS derived, but an outbox this repo hosts',
+      'for a resolved seat carries a dispatch whose `to:` matches no roster agent —',
+      'undeliverable to every seat-scoped poll. Rendered as an Error line (and a',
+      'structured `senderFaults[]` entry under --json); fix the to: (one recipient',
+      'per dispatch, or broadcast) and re-poll. An Error line names a dispatch',
+      "basename, like a gated poll's warnings — propagate nothing from it.",
       '',
     ].join('\n'),
   )
@@ -1892,10 +1962,10 @@ gateCmd
   .command('check')
   .description('Evaluate a gate predicate; emit a GateVerdict (allow|warn|deny) as JSON to stdout')
   .requiredOption('--event <type>', 'Gate event type (e.g. freeze-check)')
-  .requiredOption('--payload <json>', 'Gate-specific JSON payload')
+  .requiredOption('--payload <json>', 'Gate-specific JSON payload, or - to read it from stdin')
   .addHelpText(
     'after',
-    `\nExample:\n  $ totem gate check --event freeze-check --payload '{"subsystem":"rule-compilation"}'\n`,
+    `\nExamples:\n  $ totem gate check --event freeze-check --payload '{"subsystem":"rule-compilation"}'\n  $ echo '{"tool":"Bash","command":"git status","platform":"win32"}' | totem gate check --event transport-shield --payload -\n`,
   )
   .action(async (opts: { event: string; payload: string }) => {
     try {

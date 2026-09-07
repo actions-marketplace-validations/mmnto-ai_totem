@@ -30,9 +30,12 @@ The hook engine. `totem hook install` installs or updates background git hooks (
 
 - **`hook install` flags:**
   - `--check`: Verifies the hooks are installed and exits non-zero if any are missing (no writes).
-  - `-f, --force`: Overwrites existing Totem hooks. Use this after a major version upgrade.
+  - `-f, --force`: Overwrites existing Totem hooks — the WHOLE file, including anything you added after the end marker. Use this after a major version upgrade, or for a legacy hook that predates the end markers.
   - `--strict`: Installs the strict enforcement tier (spec-required plus a review gate).
   - `--standard`: Installs the standard enforcement tier (default).
+- **Upgrading a hook you extended:** a bare `totem hook install` (and `totem init`) rewrites the managed block in place when the content after the hook's end marker is an attested `totem:fork` extension. The attestation must appear in the comment lines that open your extension, before its first command, and must carry `reason`, `owner` and `attested`, each non-empty after trimming (a whitespace-only value does not attest) — e.g. `# <!-- totem:fork reason="deploy notice" owner="you" attested="2026-06-07" -->`. Your extension is carried through unchanged; only the block above it is regenerated. Trailing content that is NOT attested still declines to overwrite: delete the totem block (from its start marker through its end marker) and re-run `totem hook install` to re-append it, or take `--force` and lose the extension. `totem hook install` rewrites any of the four hooks; `totem init` refreshes `pre-commit` and `pre-push` only.
+- **Enforcement tier on a rewrite:** with no `--strict` / `--standard` flag and no `hooks.tier` in config, each hook is re-rendered at the tier the installed hook itself declares — keeping a hook current never silently downgrades a strict one. Every git-hook write — rewrite, append, helper script, upgrade — is atomic (a same-directory temp, then a rename), so an interrupted install leaves the old file or the new one, never a truncated hook; session hooks under `.claude/hooks` and `.gemini/hooks` are a separate writer and not covered by this rule.
+- **Files `hook install` will not rewrite in place:** an extended hook whose shebang line or managed block no longer decodes as UTF-8 (an ANSI-editor save that turned the template's em dash into a single byte, say) is reported as skipped and left byte-identical — the block cannot be regenerated without guessing where your extension starts. Re-save the hook as UTF-8 and re-run, or take `--force`, which rewrites the whole file and drops the extension. `totem doctor` names this shape with the same remedy. Your own bytes after the end marker never need to decode: they are carried as bytes.
 - **Other subcommands:** `hook run` evaluates compiled hooks against a tool-call payload (the PreToolUse runtime entrypoint); `hook test` runs hook fixtures against the compiled-hooks rules.
 - **Troubleshooting (Mac/Linux):** If you clone a repository initialized on Windows and the hooks fail to fire, Git may not recognize them as executable. Fix this by running: `chmod +x .git/hooks/pre-commit .git/hooks/pre-push .git/hooks/post-merge`
 
@@ -102,17 +105,18 @@ Manage your deterministic rules (Pipeline 1). Subcommands: `list`, `inspect`, `t
 
 - `rule list` outputs active rules.
 - `rule inspect <id>` shows rule details by hash (supports prefix matching).
-- `rule test <id>` tests a rule against its inline Example Hit/Miss.
+- `rule test <id>` tests a rule against its inline Example Hit/Miss; for a Prop 310 record rule it instead runs every `examples[i]` pair through the smoke gate (the `bad` side must fire, the `good` side must stay silent) and reports one line per ordinal.
 - `rule scaffold <id>` generates a test fixture skeleton for a compiled rule.
 - `rule promote <hash>` flips a rule from `unverified` to active per ADR-089 (Zero-Trust Default). Pipeline 2 and Pipeline 3 LLM-generated rules ship `unverified: true` unconditionally; this command is the atomic activation surface. Supports partial hash prefixes; ambiguous prefixes print candidates and exit non-zero with no mutation. Idempotent.
-- `rule author` ingests `.totem/spine/authored-rules.yaml` into authored rules and the §8 authoring-ledger (ADR-112).
+- `rule author` ingests `.totem/spine/authored-rules.yaml` into authored rules and the §8 authoring-ledger (ADR-112); each entry references its rule as a `.totem/rules/<slug>.rule.yaml` record rather than carrying the matcher inline (Prop 310).
 
 ### `totem gate` (check / install)
 
 Gate engine. Evaluates decidable predicates against deterministic state.
 
-- `gate check` evaluates a gate predicate and emits a `GateVerdict` (`allow` / `warn` / `deny`) as JSON to stdout.
-- `gate install [name]` installs a gate PreToolUse hook into the committed `.claude/settings.json` (idempotent).
+- `gate check` evaluates a gate predicate and emits a `GateVerdict` (`allow` / `warn` / `deny`) as JSON to stdout. `--payload <json>` carries the gate's input; `--payload -` reads it from stdin (the installed wrapper's channel, so a long shell command never meets the win32 command-line limit).
+- `gate install [name]` installs a gate PreToolUse hook into the committed `.claude/settings.json` (idempotent). Each gate installs under the matcher its registry entry declares, so `freeze-check` lands on `Write|Edit` and `transport-shield` on `Bash|PowerShell`.
+- `transport-shield` (PreToolUse on Bash and PowerShell) refuses the known payload-mangling shapes — heredoc escapes and `sed -i` expression escapes on both tools; a leading-slash `gh --body` under MSYS and inline `node -e` / `python -c` escapes from the Bash tool only — and warns on oversize heredocs (both tools) and on `<rev>:<path>` in a subshell from the Bash tool on win32. Comments are discarded as each shell discards them (bash `#` lines; PowerShell `#` lines and `<# … #>` blocks); PowerShell here-strings are not parsed, a disclosed gap.
 
 ### `totem install pack/<name>`
 
@@ -139,6 +143,8 @@ Imports rules from existing tools into the Totem engine (Pipeline 4).
 ### `totem verify-manifest`
 
 Verifies the integrity of the compiled rule manifest against current active rules (CI gate).
+
+The manifest also attests `.totem/rules/**/*.rule.yaml` as `records_hash` over the git-tracked records (untracked drafts are neither hashed nor counted); an absent `records_hash` is accepted only while no tracked record exists, and a mismatch is never downgraded by an active freeze.
 
 - **Flags:**
   - `--allow-compile-drift`: Override compile-worker fingerprint drift. In CI this requires a `## Compile Drift Justification` heading in the PR body; a pre-push run without an open PR requires the `TOTEM_DRIFT_JUSTIFICATION` env var to be set.
@@ -372,9 +378,46 @@ The classifier is a fixed table over the four-axis cube `(severityBucket × roun
 
 Extracts systemic lessons from resolved bot review comments on a merged PR. The input half of the extract → compile → enforce loop.
 
-### `totem spec <issue-ids...>`
+### `totem spec [inputs...]`
 
-Fetches GitHub Issues and synthesizes a pre-work spec. Injects a prior art concierge (shared helper registry) enriched by your project's vector DB lessons to prevent hallucinations.
+Fetches GitHub Issues (or takes free-text topics) and synthesizes a pre-work spec. Injects a prior art concierge (shared helper registry) enriched by your project's vector DB lessons to prevent hallucinations.
+
+Inputs are OPTIONAL because `--from <record>` is an alternative subject. Running `totem spec` with neither inputs nor `--from` is an error naming the usage line.
+
+- **Flags:**
+  - `--from <record>`: Ground the run on a hand-authored design record. The LLM still runs — the record and the retrieved context are its input — but the RECORD is the anchor (repo-relative path plus the sha256 of the bytes rendered into the prompt) and the record is **never written**. The draft goes to `--stdout` or `--out`; with neither it goes to stdout, because a record derives no default path. `--out` resolving to the record itself is refused, as are a missing, unreadable, empty or whitespace-only record, `--from` combined with positional inputs, and **a record outside the git root the command runs in** (outside a git repo, the root is the cwd) — the bound ref is stored repo-relative and the pre-commit gate resolves it from the worktree top, so a record it cannot reach from there is not a binding. A cohort seat binding a record from a sibling checkout (`--from ../other-repo/design.md`) is therefore refused: copy the record into this repo, or reference it from a record that lives here.
+  - `--raw`: Output the retrieved context without LLM synthesis (no artifact is written).
+  - `--out <path>`: Write the draft to a specific file.
+  - `--stdout`: Print the draft to standard output (mutually exclusive with `--out`).
+  - `--model <name>`: Override the default orchestrator model.
+  - `--fresh`: Bypass the cache and force a fresh LLM call.
+
+#### The unanchored-topic refusal
+
+Every run publishes what it was ANCHORED on, in `grounding.anchor.kind` of the run artifact: `issue` (every input resolved to an issue), `record` (`--from`), `free-text` (every input was a topic), or `mixed` (issues and topics together).
+
+A run with **no issue and no record** refuses when retrieval returns zero items, or — only when `searchRelevanceFloor` is configured — when the best relevance of the retrieval is below it and no floor-exempt (keyword-only) hit from a grounding partition (specs, sessions, code) exists — a keyword-only lesson does not count, since lessons never ground a run. A third arm needs no floor: when every hit carries a relevance that is not a finite number in [0, 1] (tallied out of range by the search layer — under `l2` that can only be a negative `_distance`, a fault), nothing usable grounds the run and it refuses; such a hit never saves a run the way a keyword-only hit does, and is never withheld as a measurement. The error names the topic, the measurement, the floor's value and its place, every withheld candidate, and any faulted count.
+
+`searchRelevanceFloor` carries **no default** (mmnto-ai/totem#2727), so with the key unset only the arms that need no floor can fire — zero hits, or every hit faulted — and the floor line says so rather than naming a number no run was judged against:
+
+```text
+[Totem Error] Refusing to draft an unanchored spec for topic(s): an-unanchored-slug.
+Retrieval returned 0 hits — nothing in the index grounds this run.
+floor none — searchRelevanceFloor unset in totem.config.ts (no default; calibrate per repo — see config-reference)
+```
+
+Lessons are retrieved but do not ground a run, so a topic that matched only lessons still refuses. When that happens the refusal names them, so the count line above it (`Found: … N lessons`) does not read as a contradiction. Here with a floor configured:
+
+```text
+[Totem Error] Refusing to draft an unanchored spec for topic(s): an-unanchored-slug.
+Retrieval returned 0 grounding hits (specs, sessions, code) — nothing in the index grounds this run.
+3 lessons were retrieved, but lessons do not ground a run (ruled mmnto-ai/totem#2727).
+floor 0.570 — searchRelevanceFloor in totem.config.ts
+```
+
+The first form of the lessons clause renders when no lessons were retrieved, the second when some were; the floor line takes its `none` form or its value form independently. It exits non-zero and writes **no run artifact** — and the artifact of a run that PROCEEDS records `grounding.floor` only when a floor was configured. A free-text or mixed run that proceeds prints one warning that it is not gate evidence.
+
+`--raw` is **exempt**: it makes no LLM call and mints nothing, so it stays the way to inspect a weak topic's retrieval before deciding how to anchor it.
 
 ### `totem handoff`
 
@@ -466,6 +509,7 @@ Shows unread cross-repo mail addressed to this repo's agent(s) (ADR-106 § 3). S
   - `--as <seat>`: Serve exactly this seat's mail. The seat must be one this repo resolves (config / seat dirs / cohort map — or the env-declared list when those are empty); a foreign seat is refused, because its processed-marks cursor lives in its home repo and a foreign-anchored poll answers "ever addressed," never "unread." Poll-only: the flag is parent-scoped, so `mail reply` ignores it — use `mail reply --from <seat>`.
   - `--all-seats`: Serve the full multi-seat union (repo dashboard view) — bypasses the identity gate by name.
 - **Identity gate (multi-seat repos):** an identity-less poll (no per-shell `TOTEM_SELF_AGENT`, no `--as`) in a repo that resolves more than one seat serves **broadcast mail only** — directed mail is withheld as a count and the poll exits `2` until identity is explicit. Reading never consumes: `mail mark` is the single-writer mark actuator (ADR-106 § A1.3).
+- **Exit codes:** `0` — verdict derived. `2` — NOT DERIVED (no self agent resolved, or an identity-gated poll): fix identity and re-poll. `4` — SENDER FAULT (mmnto-ai/totem#2685): the verdict IS derived and rendered, but an outbox this repo hosts for a resolved seat carries a dispatch whose `to:` matches no roster agent — undeliverable to every seat-scoped poll (`to:` is single-valued per ADR-098; a comma list is refused by `mail send` and faults when hand-written). Rendered as an `Error:` line and as a structured `senderFaults[]` entry under `--json`; fix the `to:` and re-poll. A foreign repo's undeliverable dispatch stays a `Warning:`. `2` wins over `4` when both hold. Like a gated poll's warnings, an `Error:` line names a dispatch basename — propagate nothing from it.
 - **Subcommands:**
   - `mail send` composes and writes a validated ADR-098 dispatch to your outbox.
   - `mail reply <source>` replies to a dispatch, inferring recipient and subject from the source.
@@ -518,6 +562,52 @@ Inspects grounded run artifacts under `.totem/artifacts/runs/`.
 
 - `artifact rerun <hash>` re-invokes a recorded run with its exact stored bundle and backend, emitting a new artifact.
 - `artifact compare <hashA> <hashB>` produces a deterministic artifact-vs-artifact diff (structural equality plus metric deltas).
+
+### `totem legs` (deposit / gate)
+
+The two verbs over the falsification-leg deposit store under `<totemDir>/artifacts/legs/`. A **deposit** is the machine-readable record a review leg leaves behind after it READ a diff: the head it read (`diffSha`), when it read it (`readAt`), its typed findings, which of them the seat folded, and its one-line verdict. The gate's question is narrow and it is the only one either verb answers — _was this head read by a leg?_
+
+`totem legs deposit --sha <ref> --from <file> [--replace] [--read-at <iso>]` is the single writer.
+
+- `--from <file>` (required): the leg's findings JSON. Each finding carries `id` (unique, `[A-Za-z0-9_-]{1,32}`), `severity` (`BLOCKING` | `MATERIAL` | `MINOR`), `file`, `line`, `claim` and `counterexample`; `folded` may only name ids that exist in `findings`.
+- `--sha <ref>` (default `HEAD`): the head the leg read, resolved through `git rev-parse --verify <ref>^{commit}`. A ref that is not a commit in this repository is refused by name, and a file whose own `diffSha` disagrees with the resolved sha is refused naming both — a deposit must name the head it read.
+- `--replace`: overwrite an existing deposit for this sha. Without it an occupied address is refused, carrying the incumbent's `readAt`; with it, the replaced instant is printed.
+- `--read-at <iso>`: the leg's own instant. Absent from both the flag and the file, `now` is stamped and the substitution is printed (`readAt defaulted to … — pass --read-at for the leg's own instant`), because ties between deposits are broken on it.
+
+The write is validated before the filesystem is touched, so a refused deposit leaves no file and no temp behind; a schema violation is reported with its path (`findings.0.severity`, `folded.0`). On success the stored path is printed with `blocking=N material=N minor=N folded=N`.
+
+`totem legs gate [--advisory]` is the reader the managed pre-push hook and the CI arm call. It judges `HEAD` and only `HEAD` — there is deliberately no flag for choosing another, because a caller-chosen head turns a block into a pass (a deposit written on a sibling branch answers for a commit the push does not contain). It writes nothing, and it never judges a finding's severity or disposition — the floor is that a leg read this diff.
+
+- **Exit vocabulary:** `0` the push is not legs-owed, or a deposit answers for its head · `3` the push is legs-owed and no deposit answers · `2` the gate could not derive (not a git repo, an unresolvable head, a branch diff that will not resolve).
+- `--advisory`: print the byte-identical lines of every state and exit `0` for every GATE state (not owed, evidence, blocked, not derived). A failure BEFORE the derivation — an unloadable config, an unknown flag — still exits non-zero through the CLI's error boundary. The tier changes the gate's exit code and nothing else.
+- **`hooks.legsOwed.enforce`** (mmnto-ai/totem#2771) overrides the flag in both directions: `'block'` exits the derived state — `3` or `2` — with or without `--advisory`, `'advisory'` exits `0` with or without it, and an absent knob leaves the flag in charge. When the knob is set the gate appends one line, `[Totem] legs: hooks.legsOwed.enforce = block`, under either flag, so the two tiers' output stays identical for one config. The managed pre-push hook blocks on `3` and `2` at every tier (under `--advisory` those only come back when the knob says block) and on any other non-zero on the strict tier only; a CI step running the bare verb exits the derived state unless the knob says advisory.
+
+A push is legs-owed when a changed path in the branch-vs-base diff matches `hooks.legsOwed.globs`. That diff is resolved UNFILTERED — `ignorePatterns` and `shieldIgnorePatterns` never hide a path from the floor, and the `[Legs] Diff source:` line says so. Not owed prints what it judged against and never consults the store:
+
+```text
+[Totem] legs: not owed — no changed path matched hooks.legsOwed.globs (7 globs; head 4f21ab90)
+```
+
+A deposit answers for its own head and for every descendant of it (ancestor-or-equal), with the exact read outranking the nearest ancestor — and, for an ancestor, only when it COVERS at least one of the owed paths (the branch diff up to its own head, intersected with what this push owes). The pass line carries the read's age, how far the head has moved since, and how much of the owed set that read could have seen, so a stale-but-valid pass is visible rather than silent:
+
+```text
+[Totem] legs evidence: .totem/artifacts/legs/b7d3e0a1f4c25e6890ab3d71c0e4f2a8b95d6c37.json (read 2026-09-02T04:00:00.000Z, 1 days old) · head 4f21ab90 · nearest ancestor, +3 commits since the leg read · covers 2/3 owed paths · blocking=2 material=1 folded=3
+```
+
+Owed with nothing fresh names the basis — which glob matched which file — plus every stale candidate with its own reason, and the cure:
+
+```text
+[Totem] BLOCKED: this push is legs-owed (docs/wiki/** → docs/wiki/enforcement-model.md, .changeset/** → .changeset/five-cats-smile.md) and carries no fresh falsification-leg deposit for head 4f21ab90
+[Totem] legs: stale deposit 9c02be71: not an ancestor of head
+[Totem] legs: stale deposit 51ba07cc: covers none of the owed paths (the deposit predates every owed change)
+[Totem] legs: run the leg, then: totem legs deposit --sha HEAD --from <findings.json>
+```
+
+A candidate is stale for one of three reasons, each named because each has a different repair: it names no commit here (`unknown to this repo` — fetch the history), it is not an ancestor of HEAD (`not an ancestor of head` — deposit against this branch), or it covers none of the owed paths (`covers none of the owed paths` — run the leg over the diff this push proposes). `covers K/N` on a passing line is disclosure only: a leg that read some of what this push owes still read this head, and re-arming after a fold is doctrine's rule, not the gate's.
+
+A deposit file that is unreadable, not JSON, schema-invalid, or named for a sha other than the one it stores is a per-file sensor row on stderr (`[Totem] legs: sensor — ignoring corrupt deposit <file>: <reason>`). It never counts as evidence and never masks a valid sibling.
+
+**Covariate.** Since format **v1.2** the `local-lane:` line `totem review --covariate` prints carries a `leg:` field: `leg: <sha8> blocking=N material=N folded=N` when a deposit answers for the checkout's `HEAD` — the deposit is resolved against HEAD, not against the review lineage — and `leg: none` when none does (including when `HEAD` itself does not resolve, and when HEAD has no branch base for coverage to be measured against — announced as one sensor line, never a name resolved on ancestry alone). The coverage inputs come from HEAD's OWN branch scope whatever scope the review ran on, so the field can never name a deposit `totem legs gate` would reject; the cost is that `--covariate` resolves that branch diff a second time, quietly. When no verdict and no admission record exists for the lineage but a deposit does, the line renders as `local-lane: none leg: <sha8> …`, so a diff is never presented with no evidence line at all. A folded finding is counted in BOTH its severity bucket and in `folded`, so `blocking=3 folded=3` reads "all three were addressed" and `blocking=3 folded=0` reads "none were". The v1 shapes before the field are byte-unchanged; consumers keep discriminating on the second token.
 
 ### `totem spine` (windtunnel / freeze-split)
 

@@ -17,10 +17,287 @@ if [ "$branch" = "main" ] || [ "$branch" = "master" ]; then
   exit 1
 fi
 
-# Strict mode: require spec before commit
+# Strict mode: require spec EVIDENCE before commit (mmnto-ai/totem#2690, mmnto-ai/totem#2700).
+# Evidence = a totem spec run artifact (.totem/artifacts/runs/*.json with a
+# top-level admission.runMetadata.caller of "spec"), read JSON-aware — a
+# substring match would accept a review artifact that merely quotes the key —
+# that is ANCHORED on an issue or a bound design record, and whose subject
+# carries a real shape: every promised heading (level-exact; a trailing
+# parenthetical may differ or be dropped, and the evidence line names it) each
+# with a non-blank body before the next heading of the same or shallower level
+# (an issue run drafted by the built-in prompt), or at least one heading with a body (a
+# record run, or an issue run drafted under a custom prompt). A record run is
+# judged on the bytes of the record at grounding.anchor.ref, re-read here from
+# the worktree top; its sha256 is REPORTED, never enforced.
+# The former .totem/cache/.spec-completed marker is not honored (no CLI wrote it).
 if [ "$is_agent" = "1" ] || [ "$TOTEM_HOOK_TIER" = "strict" ]; then
-  if [ ! -f ".totem/cache/.spec-completed" ]; then
-    echo "[Totem] BLOCKED: Run 'totem spec <issue>' before committing (strict mode)"
+  spec_evidence=$(node -e '
+const fs = require("fs");
+const crypto = require("crypto");
+const nodePath = require("path");
+const dir = ".totem/artifacts/runs";
+const REQUIRED = ["### Problem Statement","### Architectural Context","### Files to Examine","### Technical Approach & Contracts","### Edge Cases & Traps","### Implementation Tasks","### Execution Flow (structural constraint)","### Verification (MANDATORY — do not skip)","### Test Plan"];
+const KIND_ISSUE = "issue";
+const KIND_RECORD = "record";
+const PROMPT_OVERRIDE = "override";
+let names = [];
+try { names = fs.readdirSync(dir); } catch (err) { names = []; }
+let best = null;
+for (const name of names) {
+  if (!name.endsWith(".json")) continue;
+  let a = null;
+  try { a = JSON.parse(fs.readFileSync(dir + "/" + name, "utf8")); } catch (err) { continue; }
+  const caller = a && a.admission && a.admission.runMetadata && a.admission.runMetadata.caller;
+  if (["spec"].indexOf(caller) < 0) continue;
+  const at = ["string"].indexOf(typeof a.createdAt) < 0 ? "" : a.createdAt;
+  if (!best || at > best.at) best = { name: name, at: at, art: a };
+}
+if (!best) process.exit(2);
+const file = dir + "/" + best.name;
+// fs.writeSync, not process.stdout.write: stdout is a PIPE here (the sh arm
+// captures it) and a piped write is asynchronous on macOS, so process.exit
+// below could truncate the very text the sh arm is about to echo.
+function emit(text) { fs.writeSync(1, text); }
+function block(reason) { emit(reason); process.exit(3); }
+function safe(text) {
+  let out = "";
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    const control = code < 32 || (code >= 127 && code <= 159) || [8232, 8233].indexOf(code) > -1;
+    out = out + (control ? "?" : text.charAt(i));
+  }
+  return out;
+}
+const shownFile = safe(file);
+const shownAt = safe(best.at);
+function headingLevel(line) {
+  let n = 0;
+  while (n < line.length && ["#"].indexOf(line.charAt(n)) > -1) n = n + 1;
+  if (n < 1 || n > 6) return 0;
+  if ([" ", "\t"].indexOf(line.charAt(n)) < 0) return 0;
+  return line.slice(n + 1).trim().length > 0 ? n : 0;
+}
+function stripParen(s) {
+  const t = s.trimEnd();
+  if (t.charAt(t.length - 1) !== ")") return t;
+  const open = t.lastIndexOf("(");
+  if (open < 1) return t;
+  return t.slice(0, open).trimEnd();
+}
+function escapesTop(rel) {
+  const norm = rel.split("\\").join("/");
+  if (nodePath.win32.isAbsolute(norm) || nodePath.posix.isAbsolute(norm)) return true;
+  return [".."].indexOf(norm) > -1 || ["../"].indexOf(norm.slice(0, 3)) > -1;
+}
+function outsideWorktree(r) {
+  const norm = r.split("\\").join("/");
+  if (nodePath.win32.isAbsolute(norm) || nodePath.posix.isAbsolute(norm)) return true;
+  const top = process.cwd();
+  return escapesTop(nodePath.relative(top, nodePath.resolve(top, norm)));
+}
+const art = best.art;
+const grounding = art.grounding;
+const anchor = grounding && grounding.anchor;
+if (!anchor || ["string"].indexOf(typeof anchor.kind) < 0) block("the newest spec run artifact (" + shownFile + ") predates the anchored-evidence rule (no grounding.anchor)");
+const kind = anchor.kind;
+const ref = ["string"].indexOf(typeof anchor.ref) < 0 ? "(no ref)" : anchor.ref;
+const shownKind = safe(kind);
+const shownRef = safe(ref);
+if (kind !== KIND_ISSUE && kind !== KIND_RECORD) block("the newest spec run artifact (" + shownFile + ") is anchored " + shownKind + " (" + shownRef + "), which is not gate evidence");
+let subject = "";
+let shape = "";
+let recordStatus = "";
+if (kind !== KIND_RECORD) {
+  const content = art.output && art.output.content;
+  if (["string"].indexOf(typeof content) < 0) block("the newest spec run artifact (" + shownFile + ") is not evidence: the draft is not text");
+  subject = content;
+  const meta = art.admission && art.admission.runMetadata;
+  const source = meta && meta.promptSource;
+  shape = source !== PROMPT_OVERRIDE ? "TEMPLATE" : "DOCUMENT";
+} else {
+  if (outsideWorktree(ref)) block("the bound record ref is outside the worktree: " + shownRef);
+  const bound = ["string"].indexOf(typeof anchor.sha256) < 0 ? "" : anchor.sha256;
+  if (bound.length < 1) block("the record anchor carries no sha256 — not evidence (" + shownFile + ")");
+  if (!/^[0-9a-f]{64}$/.test(bound)) block("the record anchor sha256 is not a 64-hex digest (" + safe(bound) + ") — not evidence (" + shownFile + ")");
+  const missingRecord = "the bound record is missing at " + shownRef + " (bound by " + shownFile + ")";
+  if (!fs.existsSync(ref)) block(missingRecord);
+  const realRef = fs.realpathSync.native(ref);
+  if (escapesTop(nodePath.relative(fs.realpathSync.native(process.cwd()), realRef))) block("the bound record resolves outside the worktree: " + shownRef + " -> " + safe(realRef));
+  let bytes = null;
+  let read = false;
+  try { bytes = fs.readFileSync(ref); read = true; } catch (err) { read = false; }
+  if (!read) block(missingRecord);
+  subject = bytes.toString("utf8");
+  shape = "DOCUMENT";
+  const now = crypto.createHash("sha256").update(bytes).digest("hex");
+  recordStatus = now !== bound ? "record revised since binding (bound " + bound.slice(0, 8) + ", now " + now.slice(0, 8) + ")" : "record sha256 matches";
+}
+if ([65279].indexOf(subject.charCodeAt(0)) > -1) subject = subject.slice(1);
+const lines = subject.split("\n");
+const tolerated = [];
+// Fences (mmnto-ai/totem#2769), by the CommonMark rule: a line indented at most
+// three spaces whose first run is three or more backticks or tildes OPENS a
+// fence — a backtick run only when the rest of the line carries no backtick —
+// and a CLOSER is the same character, at least as long, with nothing else on
+// the line; an unclosed fence runs to the end of the draft. A delimiter line
+// is neither a heading, a match candidate, nor body. A line inside a fence is
+// neither a heading nor a match candidate — a promised heading quoted there
+// (the skeleton pasted as an example) is not the section it names, and is not
+// body for the section above it either — but any other non-blank fenced line
+// IS body: a section whose content is one code block is a written section.
+const TICK = String.fromCharCode(96);
+const fenceLine = [];
+const inFence = [];
+const fenceOpenedAt = [];
+let fenceChar = "";
+let fenceLen = 0;
+let openedAt = 0;
+for (let i = 0; i < lines.length; i++) {
+  const line = lines[i];
+  let indent = 0;
+  while (indent < line.length && [" "].indexOf(line.charAt(indent)) > -1) indent = indent + 1;
+  const ch = line.charAt(indent);
+  let run = 0;
+  if (indent < 4 && [TICK, "~"].indexOf(ch) > -1) {
+    while (indent + run < line.length && [ch].indexOf(line.charAt(indent + run)) > -1) run = run + 1;
+  }
+  const rest = line.slice(indent + run);
+  if (fenceChar.length < 1) {
+    const opens = run >= 3 && ([TICK].indexOf(ch) < 0 || rest.indexOf(TICK) < 0);
+    if (opens) { fenceChar = ch; fenceLen = run; openedAt = i + 1; fenceLine.push(true); inFence.push(false); fenceOpenedAt.push(0); continue; }
+    fenceLine.push(false); inFence.push(false); fenceOpenedAt.push(0);
+    continue;
+  }
+  // Only spaces and tabs may follow a closer (CommonMark); JS trim() would also
+  // strip Unicode spaces such as U+00A0, so a closer that Markdown keeps open
+  // would read as closed here and a fenced skeleton after it would reach the
+  // gate (Greptile P1 on mmnto-ai/totem#2769).
+  const closes = run >= fenceLen && [fenceChar].indexOf(ch) > -1 && rest.split(" ").join("").split("	").join("").length < 1;
+  if (closes) { fenceChar = ""; fenceLen = 0; fenceLine.push(true); inFence.push(false); fenceOpenedAt.push(0); continue; }
+  fenceLine.push(false); inFence.push(true); fenceOpenedAt.push(openedAt);
+}
+// A line of only # characters and whitespace (mmnto-ai/totem#2769): not a
+// heading (no text) and not body either — it is the skeleton of one. Inside a
+// fence it is code, and code is body.
+function bareHashes(line) {
+  const t = line.trim();
+  return t.length > 0 && t.split("#").join("").length < 1;
+}
+function levelAt(i) {
+  if (fenceLine[i] || inFence[i]) return 0;
+  return headingLevel(lines[i]);
+}
+// A promised heading, spelled exactly or with one trailing parenthetical
+// dropped (the same tolerance the matcher extends), whatever its indentation.
+function promisedHeading(text) {
+  const t = text.trim();
+  if (REQUIRED.indexOf(t) > -1) return true;
+  const w = stripParen(t);
+  for (const h of REQUIRED) { if ([w].indexOf(stripParen(h)) > -1) return true; }
+  return false;
+}
+function isBody(i) {
+  if (fenceLine[i]) return false;
+  if (lines[i].trim().length < 1) return false;
+  if (inFence[i]) return !promisedHeading(lines[i]);
+  return !bareHashes(lines[i]);
+}
+// Why a section read as empty when it was not blank: the reader says which
+// rule emptied it, so the cure is never a line the seat can see and not explain.
+function emptyReason(start, level) {
+  let quoted = false;
+  let hashes = false;
+  let fences = false;
+  for (let i = start + 1; i < lines.length; i++) {
+    const n = levelAt(i);
+    if (n > 0 && n <= level) break;
+    if (n > 0) continue;
+    if (fenceLine[i]) fences = true;
+    else if (inFence[i] && lines[i].trim().length > 0) quoted = true;
+    else if (bareHashes(lines[i])) hashes = true;
+  }
+  const found = [];
+  if (quoted) found.push("a promised heading quoted inside a fenced code block");
+  if (hashes) found.push("a line of # characters");
+  if (fences && !quoted) found.push("an empty fenced code block");
+  if (found.length < 1) return "";
+  return " — nothing under it counts as body: " + found.join("; ");
+}
+function hasBodyAfter(start, level) {
+  for (let i = start + 1; i < lines.length; i++) {
+    const n = levelAt(i);
+    if (n > 0 && n <= level) return false;
+    if (n > 0) continue;
+    if (isBody(i)) return true;
+  }
+  return false;
+}
+function candidate(i) {
+  return !fenceLine[i] && !inFence[i];
+}
+function fencedCopyOf(heading) {
+  const want = stripParen(heading);
+  for (let i = 0; i < lines.length; i++) {
+    if (!inFence[i]) continue;
+    const seen = lines[i].trim();
+    if ([heading].indexOf(seen) > -1 || [want].indexOf(stripParen(seen)) > -1) return i;
+  }
+  return -1;
+}
+// The fence still open when the scan ended, if any — its copy of a heading
+// gets the cure that fits (close it) rather than the one that does not.
+const unclosedAt = fenceChar.length > 0 ? openedAt : 0;
+function fenceCure(openLine) {
+  if (unclosedAt > 0 && [unclosedAt].indexOf(openLine) > -1) return " (that fence is never closed — close it with a bare closing fence: the same character, at least as long, nothing else on the line — or write the section outside it)";
+  return " (write the section outside the fence)";
+}
+if (shape !== "DOCUMENT") {
+  for (const heading of REQUIRED) {
+    let at = -1;
+    for (let i = 0; i < lines.length; i++) { if (candidate(i) && [heading].indexOf(lines[i].trimEnd()) > -1) { at = i; break; } }
+    let matchedAs = "";
+    if (at < 0) {
+      const want = stripParen(heading);
+      for (let i = 0; i < lines.length; i++) { if (candidate(i) && [want].indexOf(stripParen(lines[i].trimEnd())) > -1) { at = i; break; } }
+      if (at > -1) { matchedAs = safe(lines[at].trimEnd()); tolerated.push(safe(heading) + " ~ " + matchedAs); }
+    }
+    if (at < 0) {
+      const fencedAt = fencedCopyOf(heading);
+      if (fencedAt > -1) block("the draft in " + shownFile + " is missing heading " + safe(heading) + " — it appears only inside a fenced code block opened at line " + fenceOpenedAt[fencedAt] + fenceCure(fenceOpenedAt[fencedAt]));
+      block("the draft in " + shownFile + " is missing heading " + safe(heading));
+    }
+    const shownHeading = safe(heading) + (matchedAs.length > 0 ? " (matched as " + matchedAs + ")" : "");
+    if (!hasBodyAfter(at, levelAt(at))) block("the draft in " + shownFile + " has an empty heading " + shownHeading + emptyReason(at, levelAt(at)));
+  }
+} else {
+  let bodied = false;
+  for (let i = 0; i < lines.length; i++) { const n = levelAt(i); if (n > 0 && hasBodyAfter(i, n)) { bodied = true; break; } }
+  if (!bodied && kind !== KIND_RECORD) block("the draft in " + shownFile + " has no heading with a body (custom prompt: the built-in template skeleton is not required)");
+  if (!bodied) block("the bound record at " + shownRef + " has no heading with a body");
+}
+const stamp = best.at ? Date.parse(best.at) : NaN;
+const days = Number.isNaN(stamp) ? -1 : Math.floor((Date.now() - stamp) / 86400000);
+let out = shownFile + " (" + (shownAt || "undated") + (days >= 0 ? ", " + days + " days old" : "") + ")";
+out = out + " · anchor " + shownKind + " " + shownRef + " · shape " + shape;
+if (tolerated.length > 0) out = out + " · tolerated " + tolerated.join("; ");
+if (recordStatus.length > 0) out = out + " · " + recordStatus;
+emit(out);
+' 2>/dev/null)
+  # Reader status: 0 = evidence found · 2 = no spec artifact at all · 3 = the
+  # newest spec artifact is NOT evidence (the reason is on stdout) · anything
+  # else = the reader itself could not run (node missing from PATH, a crash) —
+  # each reported distinctly, never as "no evidence", and all fail-closed.
+  reader_status=$?
+  if [ "$reader_status" = "0" ] && [ -n "$spec_evidence" ]; then
+    printf '%s\n' "[Totem] spec evidence: $spec_evidence"
+  elif [ "$reader_status" = "3" ]; then
+    printf '%s\n' "[Totem] BLOCKED: $spec_evidence — run 'totem spec <issue>' or 'totem spec --from <record>' (add --fresh if the response is cached) (strict mode)"
+    exit 1
+  elif [ "$reader_status" != "2" ]; then
+    echo "[Totem] BLOCKED: the spec-evidence reader could not run (node exit status $reader_status — node missing from PATH, or .totem/artifacts/runs/ unreadable); fix the runtime and retry (strict mode)"
+    exit 1
+  else
+    echo "[Totem] BLOCKED: Run 'totem spec <issue>' before committing (strict mode) — no totem spec run artifact under .totem/artifacts/runs/ in this checkout"
     exit 1
   fi
 fi

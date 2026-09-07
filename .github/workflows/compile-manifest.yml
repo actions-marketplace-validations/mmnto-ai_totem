@@ -8,7 +8,15 @@ on:
       - '.totem/compiled-rules.json'
       - '.totem/compile-manifest.json'
       - '.totem/lessons/**'
+      # Prop 310 § Design 1 — the record file class the manifest's `records_hash`
+      # attests. Without this path, a records-only change would skip the gate that
+      # is the only thing checking that attestation.
+      - '.totem/rules/**'
       - 'packages/core/src/compiler*'
+      # The hashing implementation itself — `generateInputHash`, `generateRecordsHash`,
+      # and the manifest schema all live here, so a change to it must re-run the gate
+      # that checks its output.
+      - 'packages/core/src/compile-manifest.ts'
       - 'packages/cli/src/commands/compile.ts'
 
 concurrency:
@@ -34,13 +42,13 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: steps.bypass.outputs.skip != 'true'
 
-      - uses: pnpm/action-setup@v5
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
         if: steps.bypass.outputs.skip != 'true'
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: steps.bypass.outputs.skip != 'true'
         with:
           node-version: 24

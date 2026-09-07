@@ -9,7 +9,7 @@ import type { ConfigFormat, EmbeddingTier } from './init-detect.js';
 // Bump REFLEX_VERSION whenever the AI_PROMPT_BLOCK content changes materially.
 // This allows `totem init` to detect stale blocks and offer upgrades.
 
-export const REFLEX_VERSION = 10;
+export const REFLEX_VERSION = 14;
 export const REFLEX_START = '<!-- totem:reflexes:start -->';
 export const REFLEX_END = '<!-- totem:reflexes:end -->';
 export const REFLEX_VERSION_RE = /<!-- totem:reflexes:version:(\d+) -->/;
@@ -45,7 +45,7 @@ When deciding where to store information or rules, use this decision tree:
 [FOR LOCAL CLI/TERMINAL AGENTS ONLY] Do not attempt to run these commands if you are a headless bot or operating in a cloud PR environment (e.g., Gemini Code Assist on GitHub).
 Totem provides CLI commands that map to your development lifecycle. Use them at these moments:
 1. **Start of Session:** The SessionStart hook automatically runs \`totem describe\` to emit the project-orientation banner (project, tier, rule/lesson counts, targets, hooks). For richer derived project state (recent merged PRs, current branch + uncommitted files, latest strategy journal pointer, package versions, rule/lesson counts), call the MCP \`describe_project\` tool — the derived view replaces the retired \`docs/active_work.md\` convention (state is observed, not declared). For a freshness check (manifest staleness, shield drift, review state), run \`totem status\`. Run \`totem triage\` if you need to pick a new task. On a seat without the SessionStart hook (a cold start, or a vehicle that doesn't run hooks), run \`totem orient\` to derive in-flight and parked project state from primitives.
-2. **Before Implementation:** Optionally run \`totem spec <issue-url-or-topic>\` to retrieve related context (lessons, specs, code) before writing code. Treat any generated plan as one retrieval input, never the contract — derive the actual design from primary sources (the issue, the code, project doctrine).
+2. **Before Implementation:** Run \`totem spec <issue-url-or-topic>\` to retrieve related context (lessons, specs, code) before writing code. Treat any generated plan as one retrieval input, never the contract — derive the actual design from primary sources (the issue, the code, project doctrine). Under the strict hook tier — which AI agents get automatically — this is REQUIRED, not optional: the pre-commit hook blocks until the checkout carries an ANCHORED \`totem spec\` run artifact, and prints the evidence it found. ANCHORED means the run was grounded on an ISSUE, or on a hand-authored design record bound with \`totem spec --from <record>\` — and that its SUBJECT carries the shape the command promises: for an issue run, every required heading with a non-empty body (or, when your project overrides the spec system prompt, just one heading with a body — a custom prompt is not held to the built-in skeleton); for a bound record, at least one heading with a body in the RECORD's own bytes, re-read from disk at commit time. A free-text topic run is NOT evidence (that is the confabulation surface the rule exists for), and neither is an artifact written before this rule — re-run it anchored. A response served from the cache writes no artifact, so add \`--fresh\` when the gate says there is nothing new (mmnto-ai/totem#2690, mmnto-ai/totem#2700). Under the same strict tier the pre-push hook additionally blocks a legs-owed push — a diff touching the paths in \`hooks.legsOwed.globs\` (doctrine, public copy, \`.changeset/**\` and the contract classes your project declares) — until the checkout carries a fresh leg deposit for its head, written with \`totem legs deposit --sha HEAD --from <findings.json>\` once the leg returns, and the gate prints the evidence it found (mmnto-ai/totem#2698). That legs gate can also be armed on its own, at any tier, with \`hooks.legsOwed.enforce: 'block'\` — a standard-tier install then refuses a legs-owed push too, and the gate's line names the key (mmnto-ai/totem#2771).
 3. **Before Push:** Run \`totem lint\` — the deterministic enforcement floor (zero LLM, ~2s). **Before PR:** \`totem review\` runs supplementary AI lanes over the diff (~18s) — advisory sensors, not a merge gate; known limits are disclosed in the run output (LLM window truncation on large diffs; non-code files skipped). Your team's own review discipline decides what constitutes the review of record.
 4. **End of Session:** Run \`totem handoff\` to generate a snapshot for the next agent session with current progress and open threads.
 5. **Managed hooks self-repair:** \`totem init\` distributes \`.totem/prepare.cjs\` and wires \`package.json\` \`prepare\` to it only when no \`prepare\` script exists. The wrapper runs \`totem hook install\` on every \`pnpm install\`, drift-repairing the managed Claude/Gemini hooks — no manual re-install needed.
@@ -181,6 +181,18 @@ const { spawnSync } = require('child_process');
 // no-clobber when gh is missing) makes blind firing safe. ENOENT = the sidecar is not
 // adopted in this repo (the common non-cohort case) — zero noise; any other spawn
 // failure keeps a non-fatal stderr breadcrumb.
+// A SECOND verb rides this same block: \`totem-status refresh-obligation-store\`
+// (mmnto-ai/totem-status#127 slice-two residual, sibling of mmnto-ai/totem#2556)
+// writes the durable obligation store beside the GH snapshot, so it gets the same
+// session-start moment. Same primary-checkout gate, same detached+unref spawn, same
+// inherited log fd, same ENOENT-silent arm — and each firing stamps its own \`verb=\`
+// field, so the log records WHICH verbs fired and in what order. That does NOT
+// restore the #2570 per-child reap discriminator: both stamps are written
+// back-to-back before either child writes, and child output carries no verb tag
+// and arrives in nondeterministic order, so a silent tail attributes only to the
+// LAST verb stamped. Reopen when the sidecar tags its own output. Blind firing
+// stays safe here too: that verb is in-process single-flight only, so it races the
+// daemon exactly the way its manual invocation already does.
 // PRIMARY checkout only (.git must be a DIRECTORY): in a linked worktree .git is a
 // pointer FILE, and a detached child inheriting the worktree cwd holds a Windows
 // directory lock that breaks worktree removal; the primary's hooks + the daemon
@@ -205,10 +217,14 @@ try {
     // exit-0-or-nothing contract, a reaped or dying child leaves NO trace
     // (Windows detached is not job-object breakaway — a hook-harness
     // tree-kill takes the child mid-run). Each firing stamps a workspace-root
-    // log and hands the child the same fd, so the verb's own success line
-    // lands after the stamp; a stamp with nothing after it means the child
-    // never finished. Log failures degrade to the previous blind firing —
-    // the stamp must never block or break the spawn.
+    // log and hands the children the same fd, so their output lands after the
+    // stamps. Measured caveat now that TWO verbs share one fd: both stamps are
+    // written back-to-back before either child writes, and the children's
+    // output is unlabelled and interleaves nondeterministically — so a silent
+    // tail no longer discriminates per child; it attributes only to the LAST
+    // verb stamped. The stamps still record which verbs fired, and in what
+    // order. Log failures degrade to the previous blind firing — the stamp
+    // must never block or break the spawn.
     const { openSync, closeSync, appendFileSync, existsSync, writeFileSync } = require('fs');
     // REPO-LOCAL log, inside .git (falsification round: the primary-checkout
     // gate just proved .git is a directory; never tracked, dies with the
@@ -231,7 +247,7 @@ try {
       } catch {
         // no log yet — nothing to cap
       }
-      appendFileSync(logPath, '[' + new Date().toISOString() + '] gemini spawn cwd=' + scrub(process.cwd()) + ' path-has-go-bin=' + /go[\\\\/]bin/i.test(process.env.PATH || '') + ' cwd-shadow-exe=' + existsSync(nodePath.join(process.cwd(), 'totem-status.exe')) + '\\n');
+      appendFileSync(logPath, '[' + new Date().toISOString() + '] gemini spawn cwd=' + scrub(process.cwd()) + ' path-has-go-bin=' + /go[\\\\/]bin/i.test(process.env.PATH || '') + ' cwd-shadow-exe=' + existsSync(nodePath.join(process.cwd(), 'totem-status.exe')) + ' verb=refresh-gh\\n');
       logFd = openSync(logPath, 'a');
       stdio = ['ignore', logFd, logFd];
     } catch {
@@ -243,7 +259,7 @@ try {
     });
     refresh.on('error', (err) => {
       try {
-        appendFileSync(logPath, '[' + new Date().toISOString() + '] gemini spawn-error code=' + ((err && err.code) || 'unknown') + '\\n');
+        appendFileSync(logPath, '[' + new Date().toISOString() + '] gemini spawn-error code=' + ((err && err.code) || 'unknown') + ' verb=refresh-gh\\n');
       } catch {
         // log write failed — fall through to the stderr breadcrumb
       }
@@ -251,7 +267,31 @@ try {
       process.stderr.write('[SessionStart] totem-status refresh-gh spawn failed (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
     });
     refresh.unref();
-    // The child holds its own copy of the fd from spawn time; release the parent's.
+    // Second verb, same gate and same log fd (see the banner above). Written out
+    // rather than looped so the spawn, the stamp, and the breadcrumb each carry a
+    // literal verb — a reader of the generated hook (or of the log) never has to
+    // resolve a variable to know which refresh fired.
+    try {
+      appendFileSync(logPath, '[' + new Date().toISOString() + '] gemini spawn cwd=' + scrub(process.cwd()) + ' path-has-go-bin=' + /go[\\\\/]bin/i.test(process.env.PATH || '') + ' cwd-shadow-exe=' + existsSync(nodePath.join(process.cwd(), 'totem-status.exe')) + ' verb=refresh-obligation-store\\n');
+    } catch {
+      // log unavailable — this verb still fires blind, exactly as the first does
+    }
+    const refreshStore = spawn('totem-status', ['refresh-obligation-store'], {
+      detached: true,
+      stdio,
+    });
+    refreshStore.on('error', (err) => {
+      try {
+        appendFileSync(logPath, '[' + new Date().toISOString() + '] gemini spawn-error code=' + ((err && err.code) || 'unknown') + ' verb=refresh-obligation-store\\n');
+      } catch {
+        // log write failed — fall through to the stderr breadcrumb
+      }
+      if (err && err.code === 'ENOENT') return;
+      process.stderr.write('[SessionStart] totem-status refresh-obligation-store spawn failed (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
+    });
+    refreshStore.unref();
+    // Each child holds its own copy of the fd from spawn time; release the parent's
+    // once BOTH are away (an early close would hand the second spawn an EBADF).
     if (logFd !== null) {
       try {
         closeSync(logFd);
@@ -261,7 +301,10 @@ try {
     }
   }
 } catch (err) {
-  process.stderr.write('[SessionStart] totem-status refresh-gh unavailable (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
+  // Block-level breadcrumb: this catch covers the whole gated block, so neither
+  // verb fired — it names the SIDECAR, not one verb. The per-spawn breadcrumbs
+  // inside still name their own verb.
+  process.stderr.write('[SessionStart] totem-status sidecar refresh unavailable (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
 }
 
 // ─── A.3.a: mint session ID + log session_start event ──────────
@@ -1030,6 +1073,18 @@ try {
 // is missing) makes blind firing safe. ENOENT = the sidecar is not adopted in
 // this repo (the common non-cohort case) — zero noise; any other spawn failure
 // keeps a non-fatal stderr breadcrumb.
+// A SECOND verb rides this same block: \`totem-status refresh-obligation-store\`
+// (mmnto-ai/totem-status#127 slice-two residual, sibling of mmnto-ai/totem#2556)
+// writes the durable obligation store beside the GH snapshot, so it gets the same
+// session-start moment. Same primary-checkout gate, same detached+unref spawn, same
+// inherited log fd, same ENOENT-silent arm — and each firing stamps its own \`verb=\`
+// field, so the log records WHICH verbs fired and in what order. That does NOT
+// restore the #2570 per-child reap discriminator: both stamps are written
+// back-to-back before either child writes, and child output carries no verb tag
+// and arrives in nondeterministic order, so a silent tail attributes only to the
+// LAST verb stamped. Reopen when the sidecar tags its own output. Blind firing
+// stays safe here too: that verb is in-process single-flight only, so it races the
+// daemon exactly the way its manual invocation already does.
 // PRIMARY checkout only (.git must be a DIRECTORY): in a linked worktree .git is a
 // pointer FILE, and a detached child inheriting the worktree cwd holds a Windows
 // directory lock that breaks worktree removal; the primary's hooks + the daemon
@@ -1054,10 +1109,14 @@ try {
     // exit-0-or-nothing contract, a reaped or dying child leaves NO trace
     // (Windows detached is not job-object breakaway — a hook-harness
     // tree-kill takes the child mid-run). Each firing stamps a workspace-root
-    // log and hands the child the same fd, so the verb's own success line
-    // lands after the stamp; a stamp with nothing after it means the child
-    // never finished. Log failures degrade to the previous blind firing —
-    // the stamp must never block or break the spawn.
+    // log and hands the children the same fd, so their output lands after the
+    // stamps. Measured caveat now that TWO verbs share one fd: both stamps are
+    // written back-to-back before either child writes, and the children's
+    // output is unlabelled and interleaves nondeterministically — so a silent
+    // tail no longer discriminates per child; it attributes only to the LAST
+    // verb stamped. The stamps still record which verbs fired, and in what
+    // order. Log failures degrade to the previous blind firing — the stamp
+    // must never block or break the spawn.
     const { openSync, closeSync, appendFileSync, existsSync, writeFileSync } = require('fs');
     // REPO-LOCAL log, inside .git (falsification round: the primary-checkout
     // gate just proved .git is a directory; never tracked, dies with the
@@ -1080,7 +1139,7 @@ try {
       } catch {
         // no log yet — nothing to cap
       }
-      appendFileSync(logPath, '[' + new Date().toISOString() + '] claude spawn cwd=' + scrub(process.cwd()) + ' path-has-go-bin=' + /go[\\\\/]bin/i.test(process.env.PATH || '') + ' cwd-shadow-exe=' + existsSync(nodePath.join(process.cwd(), 'totem-status.exe')) + '\\n');
+      appendFileSync(logPath, '[' + new Date().toISOString() + '] claude spawn cwd=' + scrub(process.cwd()) + ' path-has-go-bin=' + /go[\\\\/]bin/i.test(process.env.PATH || '') + ' cwd-shadow-exe=' + existsSync(nodePath.join(process.cwd(), 'totem-status.exe')) + ' verb=refresh-gh\\n');
       logFd = openSync(logPath, 'a');
       stdio = ['ignore', logFd, logFd];
     } catch {
@@ -1092,7 +1151,7 @@ try {
     });
     refresh.on('error', (err) => {
       try {
-        appendFileSync(logPath, '[' + new Date().toISOString() + '] claude spawn-error code=' + ((err && err.code) || 'unknown') + '\\n');
+        appendFileSync(logPath, '[' + new Date().toISOString() + '] claude spawn-error code=' + ((err && err.code) || 'unknown') + ' verb=refresh-gh\\n');
       } catch {
         // log write failed — fall through to the stderr breadcrumb
       }
@@ -1100,7 +1159,31 @@ try {
       process.stderr.write('[SessionStart] totem-status refresh-gh spawn failed (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
     });
     refresh.unref();
-    // The child holds its own copy of the fd from spawn time; release the parent's.
+    // Second verb, same gate and same log fd (see the banner above). Written out
+    // rather than looped so the spawn, the stamp, and the breadcrumb each carry a
+    // literal verb — a reader of the generated hook (or of the log) never has to
+    // resolve a variable to know which refresh fired.
+    try {
+      appendFileSync(logPath, '[' + new Date().toISOString() + '] claude spawn cwd=' + scrub(process.cwd()) + ' path-has-go-bin=' + /go[\\\\/]bin/i.test(process.env.PATH || '') + ' cwd-shadow-exe=' + existsSync(nodePath.join(process.cwd(), 'totem-status.exe')) + ' verb=refresh-obligation-store\\n');
+    } catch {
+      // log unavailable — this verb still fires blind, exactly as the first does
+    }
+    const refreshStore = spawn('totem-status', ['refresh-obligation-store'], {
+      detached: true,
+      stdio,
+    });
+    refreshStore.on('error', (err) => {
+      try {
+        appendFileSync(logPath, '[' + new Date().toISOString() + '] claude spawn-error code=' + ((err && err.code) || 'unknown') + ' verb=refresh-obligation-store\\n');
+      } catch {
+        // log write failed — fall through to the stderr breadcrumb
+      }
+      if (err && err.code === 'ENOENT') return;
+      process.stderr.write('[SessionStart] totem-status refresh-obligation-store spawn failed (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
+    });
+    refreshStore.unref();
+    // Each child holds its own copy of the fd from spawn time; release the parent's
+    // once BOTH are away (an early close would hand the second spawn an EBADF).
     if (logFd !== null) {
       try {
         closeSync(logFd);
@@ -1110,7 +1193,10 @@ try {
     }
   }
 } catch (err) {
-  process.stderr.write('[SessionStart] totem-status refresh-gh unavailable (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
+  // Block-level breadcrumb: this catch covers the whole gated block, so neither
+  // verb fired — it names the SIDECAR, not one verb. The per-spawn breadcrumbs
+  // inside still name their own verb.
+  process.stderr.write('[SessionStart] totem-status sidecar refresh unavailable (non-fatal): ' + (err instanceof Error ? err.message : String(err)) + '\\n');
 }
 
 // ─── totem describe briefing (existing behavior) ────────────────
@@ -1250,7 +1336,9 @@ export const CLAUDE_SESSION_START_ENTRY = {
 // ONE parameterized PreToolUse wrapper that generalizes the shipped
 // `review-gate.sh` content-hash pattern into a reusable form. It reads the
 // PreToolUse stdin envelope, shells to `totem gate check --event <name>
-// --payload <json>`, parses the emitted `GateVerdict`, and maps
+// --payload -` with the projected JSON on the child's stdin (never argv: a
+// Bash command can run to tens of kilobytes and win32 caps a command line at
+// 32,767 characters), parses the emitted `GateVerdict`, and maps
 // `disposition` → host exit code (ADR-109 §2). One wrapper, N gates: each
 // installed PreToolUse entry points at this same script with a different
 // `--event` arg baked into the `command` string, so new gates need no new
@@ -1299,10 +1387,14 @@ export const CLAUDE_GATE_WRAPPER = `// [totem] auto-generated — Claude Code ac
 //
 // Exit-code contract (LOAD-BEARING — ADR-109 §2; branch ONLY on disposition):
 //   0 = allow | warn | --pilot deny | NOT-APPLICABLE fail-soft
-//       (unparseable/non-object envelope, no-declared-subsystem pass-through)
+//       (unparseable/non-object envelope; freeze-check with no declared
+//        subsystem; transport-shield on a tool other than Bash/PowerShell or
+//        with no non-empty string command)
 //   2 = deny (--strict, Claude block convention)
 //       | APPLICABLE-gate-not-evaluable fail-closed (missing CLI, non-zero
 //         \`gate check\`, unparseable verdict, or unknown disposition)
+//       | an --event this wrapper has no payload projection for (a baked event
+//         it cannot project is an applicable gate it cannot evaluate)
 'use strict';
 
 const { spawnSync } = require('child_process');
@@ -1358,38 +1450,78 @@ process.stdin.on('end', () => {
   const input =
     typeof parsed.tool_input === 'object' && parsed.tool_input !== null ? parsed.tool_input : {};
 
-  // ─── THE EMPTY-SUBSYSTEM GUARDRAIL ────────────────────────────────────
-  // freeze-check's predicate is on a DECLARED subsystem. A normal Edit/Write
-  // carries tool_input.file_path (a path), NOT a subsystem. With no declared
-  // subsystem, NO GATE APPLIES → pass through (exit 0). Do NOT shell out — a
-  // blanket fail-closed here would block every ordinary edit.
-  const declaredSubsystem =
-    typeof input.subsystem === 'string' && input.subsystem.trim() !== ''
-      ? input.subsystem.trim()
-      : '';
-  if (declaredSubsystem === '') {
-    process.exit(0);
-  }
+  // ─── PER-EVENT PAYLOAD PROJECTION ─────────────────────────────────────
+  // Each gate reads a DIFFERENT slice of the PreToolUse envelope, so the
+  // projection branches on the baked --event. Every branch owns its own
+  // NOT-APPLICABLE test — the point past which a gate genuinely applies and
+  // any evaluation failure must fail CLOSED.
+  //
+  //   event            | applies when                     | payload
+  //   -----------------|----------------------------------|---------------------------
+  //   freeze-check     | tool_input.subsystem is a         | { subsystem }
+  //                    | non-empty string                  |
+  //   transport-shield | tool_name is Bash or PowerShell   | { tool, command, platform }
+  //                    | AND tool_input.command is a       |
+  //                    | non-empty string                  |
+  //   (anything else)  | — no projection → fail closed     | —
+  let payload = '';
 
-  // A gate genuinely applies. Build the --payload from the declared fields.
-  // NOTE: this payload projection is freeze-check-shaped (subsystem-only). The
-  // wrapper is --event-parameterized, but the payload it builds is currently
-  // freeze-check-specific; a future gate needing a different payload field must
-  // extend this projection (e.g. branch on \`event\`).
-  const payload = JSON.stringify({ subsystem: declaredSubsystem });
+  if (event === 'freeze-check') {
+    // THE EMPTY-SUBSYSTEM GUARDRAIL: freeze-check's predicate is on a DECLARED
+    // subsystem. A normal Edit/Write carries tool_input.file_path (a path), NOT
+    // a subsystem. With no declared subsystem, NO GATE APPLIES → pass through
+    // (exit 0). Do NOT shell out — a blanket fail-closed here would block every
+    // ordinary edit.
+    const declaredSubsystem =
+      typeof input.subsystem === 'string' && input.subsystem.trim() !== ''
+        ? input.subsystem.trim()
+        : '';
+    if (declaredSubsystem === '') {
+      process.exit(0);
+    }
+    payload = JSON.stringify({ subsystem: declaredSubsystem });
+  } else if (event === 'transport-shield') {
+    // transport-shield's predicate is on a SHELL COMMAND. Anything that is not
+    // a Bash/PowerShell invocation carrying a command string is NOT an
+    // applicable gate → pass through (exit 0), mirroring the guardrail above.
+    // The installed matcher is the CLI's own, so a foreign tool_name here means
+    // a hand-edited settings entry, not a shape to judge.
+    const tool = parsed.tool_name;
+    if (tool !== 'Bash' && tool !== 'PowerShell') {
+      process.exit(0);
+    }
+    if (typeof input.command !== 'string' || input.command.trim() === '') {
+      process.exit(0);
+    }
+    payload = JSON.stringify({
+      tool: tool,
+      command: input.command,
+      platform: process.platform,
+    });
+  } else {
+    // A baked --event this wrapper cannot project is an APPLICABLE gate it
+    // cannot evaluate → fail closed (ADR-109). Reinstalling refreshes the
+    // wrapper (\`totem gate install\` drift-repairs the bounded region).
+    process.stderr.write(
+      '[totem gate-wrapper] no payload projection for event "' + event + '"; failing closed.\\n',
+    );
+    process.exit(2);
+  }
 
   // Resolve the LOCAL Totem CLI (the global \`totem\` binary may be stale and
   // missing deps — the known repo gotcha). Invoke node on the installed dist
   // entry.
   //
-  // FAIL-CLOSED on a missing CLI: we are PAST the empty-subsystem guardrail, so
-  // a gate genuinely APPLIES here. freeze-check has NO commit-time hard floor
-  // (unlike PreWriteShield, whose fail-soft is backed by \`totem-lint\` at
-  // commit), so an APPLICABLE gate that cannot be evaluated for ANY reason
-  // (missing CLI OR corrupt freeze.json) must fail closed — not silently allow
-  // (guardrail rule + Tenet 4 fail-closed). Fail-SOFT (exit 0) is reserved for
-  // genuinely NOT-APPLICABLE inputs (unparseable/non-object envelope, no
-  // declared subsystem), all of which already returned above.
+  // FAIL-CLOSED on a missing CLI: we are PAST the per-event applicability
+  // guardrail (freeze-check: a declared subsystem; transport-shield: a Bash or
+  // PowerShell command), so a gate genuinely APPLIES here. Neither gate has a
+  // commit-time hard floor (unlike PreWriteShield, whose fail-soft is backed by
+  // \`totem-lint\` at commit), so an APPLICABLE gate that cannot be evaluated
+  // for ANY reason (missing CLI OR a broken source) must fail closed — not
+  // silently allow (guardrail rule + Tenet 4 fail-closed). Fail-SOFT (exit 0)
+  // is reserved for genuinely NOT-APPLICABLE inputs (unparseable/non-object
+  // envelope, no declared subsystem, no shell command), all of which already
+  // returned above.
   const cliPath = join(process.cwd(), 'node_modules', '@mmnto', 'cli', 'dist', 'index.js');
   if (!existsSync(cliPath)) {
     process.stderr.write(
@@ -1401,18 +1533,24 @@ process.stdin.on('end', () => {
     process.exit(2);
   }
 
+  // The payload rides on the child's STDIN (\`--payload -\`), never argv: a Bash
+  // command can run to tens of kilobytes and win32 caps a command line at
+  // 32,767 characters — an argv payload past it fails the spawn with
+  // ENAMETOOLONG and would land in the fail-closed arm below with nothing
+  // broken (mmnto-ai/totem#2799, pass 3).
   const result = spawnSync(
     process.execPath,
-    [cliPath, 'gate', 'check', '--event', event, '--payload', payload],
-    { encoding: 'utf-8', timeout: 30000 },
+    [cliPath, 'gate', 'check', '--event', event, '--payload', '-'],
+    { encoding: 'utf-8', timeout: 30000, input: payload },
   );
 
   // ─── FAIL-CLOSED ──────────────────────────────────────────────────────
-  // A gate genuinely applies (a declared subsystem was present) and the
-  // evaluation itself failed (non-zero exit: corrupt freeze.json, spawn
-  // error, etc.). Never silently allow when an applicable gate's source is
-  // broken → exit 2. (No-declared-subsystem already returned exit 0 above,
-  // so this only blocks when a subsystem was actually declared.)
+  // A gate genuinely applies (the per-event projection above found its input:
+  // a declared subsystem, or a Bash/PowerShell command) and the evaluation
+  // itself failed (non-zero exit: corrupt freeze.json, an invalid payload,
+  // spawn error, etc.). Never silently allow when an applicable gate's source
+  // is broken → exit 2. (Not-applicable envelopes already returned exit 0
+  // above, so this only blocks when the gate's input was actually present.)
   if (result.error || typeof result.status !== 'number' || result.status !== 0) {
     process.stderr.write(
       '[totem gate-wrapper] gate "' +
@@ -1464,21 +1602,28 @@ process.stdin.on('end', () => {
 ${TOTEM_FILE_END}
 `;
 
-// The PreToolUse entry constant for the freeze-check gate. The \`--event\`
-// is baked into the command string per-entry (one wrapper, N gates = N
-// entries pointing at the same script with different --event args).
-// Matches the \`Write|Edit\` matcher so the wrapper sees every write — the
-// empty-subsystem guardrail (in the wrapper) is what keeps ordinary edits
-// passing through. Installed into committed \`.claude/settings.json\`
-// (team-level governance — gate opt-in is repo policy, Tenet 12).
+// The PreToolUse entry constant for the freeze-check gate — the EXEMPLAR of the
+// installed shape, not a template every gate is stamped from. The \`--event\` is
+// baked into the command string per-entry (one wrapper, N gates = N entries
+// pointing at the same script with different --event args).
+//
+// SOURCE OF TRUTH for the MATCHER is the core gate registry
+// (mmnto-ai/totem#2799): \`knownGates()\` carries each gate's own matcher, the
+// caller resolves it, and \`gateEntry()\` writes THAT — freeze-check under
+// \`Write|Edit\` (so the wrapper sees every write; the empty-subsystem guardrail
+// is what keeps ordinary edits passing through), transport-shield under
+// \`Bash|PowerShell\`. This constant stays the \`Write|Edit\` freeze-check
+// exemplar and is never consulted for another gate's matcher.
 //
 // SOURCE OF TRUTH for the ACTUAL installed command is
 // gate-install.ts \`gateCommand(event, tier)\` — it builds the per-gate,
 // per-tier string at install time. This constant supplies ONLY the canonical
-// \`matcher\` and hook \`type\` (the fields \`gateEntry()\` reads); its \`command\`
-// here mirrors the DEFAULT install (freeze-check at the default \`--strict\`
-// tier) so a reader sees exactly what a default \`totem gate install\` bakes,
-// not a tier-less never-installed string.
+// hook \`type\` (the one field \`gateEntry()\` still reads); its \`matcher\` and
+// \`command\` here mirror the DEFAULT freeze-check install (at the default
+// \`--strict\` tier) so a reader sees exactly what a default
+// \`totem gate install freeze-check\` bakes, not a tier-less never-installed
+// string. Installed into committed \`.claude/settings.json\` (team-level
+// governance — gate opt-in is repo policy, Tenet 12).
 export const CLAUDE_GATE_WRAPPER_ENTRY = {
   matcher: 'Write|Edit',
   hooks: [
@@ -1854,7 +1999,7 @@ Session-start bring-up. **Read-only** — no mutations, no dispatches, no board 
 
 1. **Consume the injected orientation.** On Claude Code seats a SessionStart hook may inject a journal + carryforward, inbound mail, branch/ticket-matched context, and a bounded session-orientation slice (parked/freeze state, open PRs, board↔issue coherence drift, and an open-issue-count pointer) — the hook serves the seat it is CONFIGURED for, not a derived identity, so confirm the injected journal is YOURS: a visiting session receives the HOST seat's, and your carryforward derives from \`.totem/orchestration/<your-seat>/journal/\` (step 3), never from a foreign journal. On a hook-seat MISMATCH (the injected journal or mail banner names another seat), consume NONE of the injected material — treat the session as hook-less: derive it all via \`totem orient\` plus your own seat-anchored poll (step 2). Do not re-run what the hook injected. Everything else the bring-up needs (the full board in-flight set, corpus freshness, doctrine currency) is derived on demand via \`totem orient\`. On a hook-less seat (other vendors, cold starts), derive it all: \`totem orient\`.
 
-2. **Poll mail since last signoff — seat-anchored.** Poll AS YOUR SEAT: per-shell \`TOTEM_SELF_AGENT=<your-seat>\` (the mmnto-ai/totem#2629 scope ruling — never user/machine scope; prefer the inline form \`TOTEM_SELF_AGENT=<seat> totem mail\` where shell state does not persist between tool calls) or \`totem mail --as <your-seat>\`. **S0 identity check:** the banner's \`Self agents:\` line must name exactly your seat. Since @mmnto/cli 1.117.0 an identity-less multi-seat poll gates itself (broadcast-only serve, directed mail withheld as a count, exit 2 — the mmnto-ai/totem#2204 deterministic floor), so the residual S0 catches is the WRONG-single-identity class: a mis-scoped or inherited env naming a foreign seat resolves single-seat, ungated, and serves that seat's directed mail. A banner naming a FOREIGN seat = STOP: act on nothing served, propagate nothing from it, fix the identity, re-poll. A GATED poll's LISTING is broadcast-only by construction — but warning lines can still name an unclassifiable or unresolvable file (an ECL basename is recipient + compressed subject — the CLI's named limit), so propagate nothing from a gated poll's warnings either: fix the identity and re-poll for your directed mail. Unread = inbound − handled: consumption is tracked by \`processed/\` marks (\`feedback_check_outbox_before_replying\`), so the CLI path needs no cutoff stamp. Read every hit before proceeding — new mail can reprioritize everything below. (Fallback — a seat that must stamp-poll instead derives the cutoff from the newest journal's CONTENT date, the filename stamp or frontmatter, **never file mtime**, which git resets on clone/worktree and silently reports "inbox clean" over waiting mail; mmnto-ai/totem-strategy#813.)
+2. **Poll mail since last signoff — seat-anchored.** Poll AS YOUR SEAT: per-shell \`TOTEM_SELF_AGENT=<your-seat>\` (the mmnto-ai/totem#2629 scope ruling — never user/machine scope; prefer the inline form \`TOTEM_SELF_AGENT=<seat> totem mail\` where shell state does not persist between tool calls) or \`totem mail --as <your-seat>\`. **S0 identity check:** the banner's \`Self agents:\` line must name exactly your seat. Since @mmnto/cli 1.117.0 an identity-less multi-seat poll gates itself (broadcast-only serve, directed mail withheld as a count, exit 2 — the mmnto-ai/totem#2204 deterministic floor), so the residual S0 catches is the WRONG-single-identity class: a mis-scoped or inherited env naming a foreign seat resolves single-seat, ungated, and serves that seat's directed mail. A banner naming a FOREIGN seat = STOP: act on nothing served, propagate nothing from it, fix the identity, re-poll. A GATED poll's LISTING is broadcast-only by construction — but warning lines can still name an unclassifiable or unresolvable file (an ECL basename is recipient + compressed subject — the CLI's named limit), so propagate nothing from a gated poll's warnings either: fix the identity and re-poll for your directed mail. An \`Error:\` line is the same surface: since the mmnto-ai/totem#2685 fix a poll whose OWN outbox (one this repo hosts for a resolved seat) carries a dispatch with an unresolvable \`to:\` exits 4 (SENDER FAULT) — the verdict IS derived, read it, but the \`to:\` is yours to fix first (one recipient per dispatch, or broadcast; a comma list is never a recipient), and propagate nothing from the fault line; exit 2 stays NOT-DERIVED and wins when both hold. Unread = inbound − handled: consumption is tracked by \`processed/\` marks (\`feedback_check_outbox_before_replying\`), so the CLI path needs no cutoff stamp. Read every hit before proceeding — new mail can reprioritize everything below. (Fallback — a seat that must stamp-poll instead derives the cutoff from the newest journal's CONTENT date, the filename stamp or frontmatter, **never file mtime**, which git resets on clone/worktree and silently reports "inbox clean" over waiting mail; mmnto-ai/totem-strategy#813.)
 
 3. **Re-derive the carryforward gates — don't trust the journal's framing** (Tenet 20 read-side twin). For each carryforward item in YOUR SEAT's latest journal (\`.totem/orchestration/<your-seat>/journal/\` — on a multi-seat repo another seat's newer journal is not your carryforward), freshly derive its gate state (the PR it waits on, the issue, the date, the release train) via \`gh\` / \`git\` reads. Cross-repo gates resolve through the frozen cohort roster — \`totem\` / \`strategy\` / \`status\` / \`lc\` → \`mmnto-ai/{totem, totem-strategy, totem-status, liquid-city}\` (mmnto-ai/totem-strategy#611 gates any change). An item whose gate fired leads the next-steps list; an item still gated is reported as waiting, not worked.
 
@@ -1937,7 +2082,7 @@ Disposing the round is ONE consolidated comment (single-comment ownership per bo
 totem review --covariate
 \`\`\`
 
-It resolves the current branch lineage exactly as the review fan does and prints the canonical \`local-lane:\` line from the core-owned renderers — the LATEST verdict artifact's line (\`.totem/artifacts/verdicts/\`) when the current diff is admitted, or the exact-identity admission record's \`not-applicable\` form (\`.totem/artifacts/admissions/\`, format v1.1, mmnto-ai/totem#2473) when the current diff is a deterministic skip — never trust a pasted or hand-copied value. If it reports neither a verdict nor an admission record for the current state, there is no line to carry (note that in the body and continue).
+It resolves the current branch lineage exactly as the review fan does and prints the canonical \`local-lane:\` line from the core-owned renderers — the LATEST verdict artifact's line (\`.totem/artifacts/verdicts/\`) when the current diff is admitted, or the exact-identity admission record's \`not-applicable\` form (\`.totem/artifacts/admissions/\`, format v1.1, mmnto-ai/totem#2473) when the current diff is a deterministic skip — never trust a pasted or hand-copied value. Under format v1.2 (mmnto-ai/totem#2698) every shape carries the appended \`leg: <sha8> blocking=<n> material=<n> folded=<n>\` field (or \`leg: none\`), and a lineage with no artifact of either family but a leg deposit for HEAD prints the \`local-lane: none\` head shape — carry whatever the verb prints, verbatim. If it reports no line at all, there is none to carry (note that in the body and continue).
 
 2. **Assemble the single body.** One comment: @-tag EVERY bot addressed in the round — exactly ONE tag each (e.g. \`@gemini-code-assist\`, \`@coderabbitai\`, \`@greptileai\`) so each bot registers the disposition, and tags must be present when the comment is POSTED, never edited in (GCA's listener fires on comment-created only). One notification per bot per round: a bot with nothing addressed gets no tag, and a bot already @-tagged in this round's batch comment (the GCA defer/nit batch above) is NOT re-tagged here. ghcq (\`github-code-quality[bot]\`) has no known listener — it is never tagged; its items are dispositioned in the body for the audit trail only (mmnto-ai/totem#2626). Never combine a tag with ANY bot's review trigger — triggers are standalone comments, one trigger and no prose (a trigger embedded in a content-rich comment chat-routes the bot). Then the per-item dispositions (fixed / deferred / nit / extracted) followed by the non-empty \`local-lane:\` line from step 1, verbatim. The local \`review-loop\` holds this line but never posts it, so \`/review-reply\` is the SOLE path that carries it to GitHub.
 
@@ -1977,14 +2122,15 @@ This is NOT the external-bot triage skill. \`/review-reply\` handles bot comment
 
 \`review-loop\` NEVER creates or posts a PR comment. The local loop runs BEFORE any external bot pass, and the round-disposition comment is ONE consolidated comment owned by the operator-invoked \`/review-reply\` workflow. At settle the CLI already prints the covariate line — hold and report it locally, in exactly this format:
 
-<!-- covariate line format v1.1 — do not alter without a spec amendment (v1.1 adds the additive admission form: mmnto-ai/totem#2473 design § Implementation Design, operator-approved 2026-08-14) -->
+<!-- covariate line format v1.2 — do not alter without a spec amendment (v1.1 added the additive admission form; v1.2 appends the leg field to both shapes and adds the \`local-lane: none\` head for a deposit-only lineage: mmnto-ai/totem#2698 design § Implementation Design, the .totem/specs/2473.md v1.2 clause) -->
 
 \`\`\`text
-local-lane: <verdictHash8> round=<n> settled=<true|false> lanes=<completed>/<attempted>
-local-lane: not-applicable (<reason>) recorded=<recordHash8> at=<createdAt>
+local-lane: <verdictHash8> round=<n> settled=<true|false> lanes=<completed>/<attempted> leg: <sha8> blocking=<n> material=<n> folded=<n>
+local-lane: not-applicable (<reason>) recorded=<recordHash8> at=<createdAt> leg: <sha8> blocking=<n> material=<n> folded=<n>
+local-lane: none leg: <sha8> blocking=<n> material=<n> folded=<n>
 \`\`\`
 
-\`<verdictHash8>\` is the first 8 hex characters of the verdict artifact hash the CLI reports. The second shape is the ADMISSION form (format v1.1, mmnto-ai/totem#2473): rendered when the current diff resolves to a deterministic not-applicable admission — \`<recordHash8>\` addresses the admission record in \`.totem/artifacts/admissions/\`, and a consumer discriminates the two forms on the literal second token \`not-applicable\`. This line is a versioned contract consumed by a measurement pilot — do not change either shape without a spec amendment. The CLI renders both from their canonical artifacts via single core-owned renderers, so the line is re-derivable and never hand-authored — on demand, the read-only \`totem review --covariate\` (zero-LLM) resolves the current state and prints the verdict's line (admitted diff) or the admission record's line (deterministic skip). Inclusion of any pending \`local-lane:\` line in the single consolidated round-disposition comment belongs to \`/review-reply\` (which obtains it by running \`totem review --covariate\`), not to this loop — never post it to GitHub yourself.
+\`<verdictHash8>\` is the first 8 hex characters of the verdict artifact hash the CLI reports. The second shape is the ADMISSION form (format v1.1, mmnto-ai/totem#2473): rendered when the current diff resolves to a deterministic not-applicable admission — \`<recordHash8>\` addresses the admission record in \`.totem/artifacts/admissions/\`, and it is discriminated on the literal second token \`not-applicable\`. The third shape is the DEPOSIT-ONLY head: rendered when no verdict and no admission record exists for the lineage but a leg deposit resolves for HEAD, so a diff is never presented with no evidence line at all. \`leg: none\` replaces the field on the FIRST TWO shapes when no deposit resolves for HEAD; the third shape never carries it, because a deposit resolving is the only reason that shape renders. Consumers discriminate on the second token (\`<hash8>\` · \`not-applicable\` · \`none\`); \`<sha8>\` is the first 8 hex of the deposit's \`diffSha\`; a folded finding counts in both its severity bucket and \`folded\`. This line is a versioned contract consumed by a measurement pilot — do not change any shape without a spec amendment. The CLI renders every shape from its canonical artifacts via single core-owned renderers, so the line is re-derivable and never hand-authored — on demand, the read-only \`totem review --covariate\` (zero-LLM) resolves the current state and prints the verdict's line (admitted diff), the admission record's line (deterministic skip), or the deposit-only head (neither artifact exists for the lineage, but a leg read HEAD). Inclusion of any pending \`local-lane:\` line in the single consolidated round-disposition comment belongs to \`/review-reply\` (which obtains it by running \`totem review --covariate\`), not to this loop — never post it to GitHub yourself.
 
 ${SKILL_MARKER_END}
 `;

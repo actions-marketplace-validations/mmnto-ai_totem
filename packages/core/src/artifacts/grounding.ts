@@ -12,12 +12,14 @@
  * provenance silently).
  *
  * Assembly is caller-side (the deterministic layer) — providers stay dumb
- * pipes. The bundle is what `grounding.hash` attests, so it must be a pure
- * function of the logical item set: items are canonically sorted here because
- * retrieval order is score-dependent and `calculateDeterministicHash` is
- * order-significant for arrays.
+ * pipes. The bundle is what `grounding.hash` attests: the DELIVERED items with
+ * their measured relevance (mmnto-ai/totem#2700). Items are canonically sorted
+ * here BECAUSE the hash is order-significant for arrays and retrieval order is
+ * score-dependent — the sort is what makes two runs over the same delivered
+ * set hash alike.
  */
 
+import { isRelevanceInRange } from '../store/relevance.js';
 import { calculateDeterministicHash } from './hash.js';
 import {
   type GroundingBundle,
@@ -39,6 +41,15 @@ export interface GroundingSourceItem {
     filePath: string;
     /** Linked-index name for cross-repo hits; absent = the run's own repo (strategy review F1 on mmnto-ai/totem#2101). */
     sourceRepo?: string | undefined;
+    /**
+     * The vector-leg relevance from `relevanceFromDistance(VECTOR_DISTANCE_METRIC,
+     * _distance)`; on unit-norm vectors under `l2` it lies in [0.2, 1]; the schema
+     * bounds it to [0, 1] and the bundle omits a value outside it
+     * (mmnto-ai/totem#2700, metric-bound in mmnto-ai/totem#2738). Absent when the
+     * hit had no vector leg (FTS-only) — absence is the honest disclosure, never
+     * a zero.
+     */
+    relevance?: number | undefined;
   };
 }
 
@@ -68,6 +79,29 @@ function compareItems(a: GroundingItem, b: GroundingItem): number {
  * twice). All items are classed `similarity-only`: this is the first-cut
  * wrapper around the existing retrieval, and the ONLY class this builder can
  * emit by construction.
+ *
+ * A hit's vector-leg `relevance` is carried onto its item ONLY when it is a
+ * finite number IN [0, 1] (mmnto-ai/totem#2700; the range arm added by the
+ * mmnto-ai/totem#2738 falsification round, F2) — an FTS-only hit carries none,
+ * and the absence is the disclosure. The value rides the item through the
+ * canonical sort, so no index correspondence with the input array is ever
+ * needed.
+ *
+ * The range check is HERE rather than left to the schema because the schema
+ * bound (`relevance: z.number().min(0).max(1)`) THROWS at the artifact write,
+ * which would turn the search layer's "warn, never throw" contract into a hard
+ * failure one layer down: an out-of-range relevance would have killed the run
+ * that the search deliberately returned unchanged. The search layer has
+ * already warned once about the breach by the time a value reaches here, so
+ * the honest record is the item WITHOUT a relevance — the same absence an
+ * FTS-only hit carries, and never a clamped number that would launder a fault
+ * into a plausible-looking measurement.
+ *
+ * The record loses the distinction on purpose; the JUDGMENT keeps it. The
+ * CLI's `evaluateGroundingFloor` applies this same predicate to the raw hit
+ * and counts an FTS-only absence as floor-exempt (one saves a run) but a
+ * faulted value as neither signal nor exemption — a fault never saves a run
+ * (mmnto-ai/totem#2761 bot round, CodeRabbit + Greptile P1).
  */
 export function buildGroundingBundle(items: GroundingSourceItem[]): GroundingBundle {
   const mapped: GroundingItem[] = items.map(({ sourceType, result }) => ({
@@ -76,6 +110,9 @@ export function buildGroundingBundle(items: GroundingSourceItem[]): GroundingBun
     sourceType,
     filePath: result.filePath,
     ...(result.sourceRepo !== undefined ? { sourceRepo: result.sourceRepo } : {}),
+    ...(typeof result.relevance === 'number' && isRelevanceInRange(result.relevance)
+      ? { relevance: result.relevance }
+      : {}),
   }));
   mapped.sort(compareItems);
   return { items: mapped };

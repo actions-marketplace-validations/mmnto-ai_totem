@@ -9,11 +9,11 @@ import {
   getSystemPrompt,
   loadConfig,
   loadEnv,
-  partitionLessons,
   requireEmbedding,
   resolveConfigPath,
   runOrchestrator,
   sanitize,
+  searchLessons,
   wrapXml,
   writeOutput,
 } from '../utils.js';
@@ -41,6 +41,13 @@ import {
 
 const INCREMENTAL_MAX_LINES = 15;
 
+/**
+ * How many already-indexed lessons `learnFromVerdict` pulls as dedup context.
+ * Names the value that was inline before mmnto-ai/totem#2735 re-routed that
+ * search through {@link searchLessons}; the cap itself is unchanged.
+ */
+const MAX_DEDUP_LESSONS = 10;
+
 // Re-export constants & prompts so existing consumers are not broken
 export {
   MAX_DIFF_CHARS,
@@ -57,17 +64,23 @@ interface RetrievedContext {
   lessons: SearchResult[];
 }
 
-async function retrieveContext(query: string, store: LanceStore): Promise<RetrievedContext> {
+/** Exported as the test seam for the lesson-delivery invariant (mmnto-ai/totem#2735). */
+export async function retrieveContext(query: string, store: LanceStore): Promise<RetrievedContext> {
   const search = (typeFilter: ContentType, maxResults: number) =>
     store.search({ query, typeFilter, maxResults });
 
-  const [allSpecs, sessions, code] = await Promise.all([
+  // Lessons are their own pool, asked for by type — never partitioned out of
+  // the spec pool (mmnto-ai/totem#2735). The spec request keeps its pre-fix
+  // width: on the hybrid path that width is the RRF fusion window.
+  const [allSpecs, lessons, sessions, code] = await Promise.all([
     search('spec', SPEC_SEARCH_POOL),
+    searchLessons(store, query, MAX_LESSONS),
     search('session_log', MAX_SESSION_RESULTS),
     search('code', MAX_CODE_RESULTS),
   ]);
 
-  const { lessons, specs } = partitionLessons(allSpecs, MAX_LESSONS, MAX_SPEC_RESULTS);
+  // The partition's own slice, kept verbatim.
+  const specs = allSpecs.slice(0, MAX_SPEC_RESULTS);
 
   return { specs, sessions, code, lessons };
 }
@@ -931,11 +944,11 @@ export async function learnFromVerdict(
         absolutePathRoot: cwd,
       });
       await store.connect();
-      const existing = await store.search({
-        query: 'lesson trap pattern decision',
-        typeFilter: 'spec',
-        maxResults: 10,
-      });
+      const existing = await searchLessons(
+        store,
+        'lesson trap pattern decision',
+        MAX_DEDUP_LESSONS,
+      );
       const lessonSection = formatResults(existing, 'EXISTING LESSONS (do NOT duplicate)');
       if (lessonSection) {
         sections.push('\n=== DEDUP CONTEXT ===');
@@ -1048,6 +1061,7 @@ export async function captureObservationRules(
   const fs = await import('node:fs');
   const path = await import('node:path');
   const {
+    attestRecordsHash,
     deduplicateObservations,
     generateObservationRule,
     generateOutputHash,
@@ -1105,6 +1119,8 @@ export async function captureObservationRules(
     try {
       const manifest = readCompileManifest(manifestPath);
       manifest.output_hash = generateOutputHash(rulesPath);
+      // Prop 310 § Design 1: every manifest writer attests the record class.
+      manifest.records_hash = attestRecordsHash(resolvedTotemDir, cwd);
       writeCompileManifest(manifestPath, manifest);
       // totem-context: intentional — the compile manifest may not exist yet (first run before compile); a missing manifest is not an error, verify-manifest resyncs later.
     } catch (err) {
@@ -2002,6 +2018,29 @@ async function emitNotApplicableDisposition(params: {
 
 // ─── Main command ───────────────────────────────────
 
+/**
+ * The coverage inputs for a COVARIATE site (mmnto-ai/totem#2698 fold 3,
+ * corrected in fold 4).
+ *
+ * One derivation, owned by `legs.ts` — the same unfiltered branch scope and the
+ * same `classifyLegsOwed` the gate uses — so the leg field can never name a
+ * deposit the gate would reject as covering none of the owed paths. It takes
+ * HEAD's scope and NOT the review's: the field answers "was this HEAD read",
+ * which cannot depend on whether the operator reviewed a staged slice. Quiet,
+ * because this runs inside a `[Review]` run. When HEAD has no branch base the
+ * result carries a REASON, which the caller prints as one `Sensor:` line and
+ * which resolves the field to `none`.
+ */
+async function legCoverageForCovariate(
+  config: TotemConfig,
+  cwd: string,
+): Promise<import('./legs.js').LegsCoverageResolution> {
+  const { deriveLegsCoverageForHead, legsOwedGlobs } = await import('./legs.js');
+  return deriveLegsCoverageForHead(cwd, await legsOwedGlobs(config), {
+    suppressScopeNarration: true,
+  });
+}
+
 export async function shieldCommand(options: ShieldOptions): Promise<void> {
   const path = await import('node:path');
   const { TotemConfigError, TotemError } = await import('@mmnto/totem');
@@ -2093,7 +2132,7 @@ export async function shieldCommand(options: ShieldOptions): Promise<void> {
   // Skipped under --covariate: that verb is read-only by contract (rev-5 item 4).
   if (!options.covariate) {
     const { upgradePrePushHookIfNeeded } = await import('./install-hooks.js');
-    if (upgradePrePushHookIfNeeded(cwd)) {
+    if (await upgradePrePushHookIfNeeded(cwd)) {
       log.dim(DISPLAY_TAG, 'Upgraded pre-push hook with review auto-refresh');
     }
   }
@@ -2142,8 +2181,26 @@ export async function shieldCommand(options: ShieldOptions): Promise<void> {
         (msg) => log.warn(DISPLAY_TAG, `Sensor: ${msg}`),
       );
       if (found !== undefined) {
+        // Format v1.2 (mmnto-ai/totem#2698): the SAME leg-field resolution the
+        // verdict form uses (one helper, two sites), composed BESIDE
+        // `renderAdmissionLine` so the v1.1 admission text is byte-unchanged.
+        const { resolveLegFieldForHead } = await import('./review-fan.js');
+        const coverage = await legCoverageForCovariate(config, cwd);
+        if (coverage.reason !== undefined) log.warn(DISPLAY_TAG, `Sensor: ${coverage.reason}`);
+        const leg = await resolveLegFieldForHead(
+          path.join(configRoot, config.totemDir),
+          cwd,
+          undefined,
+          coverage,
+        );
+        for (const entry of leg.corrupt) {
+          log.warn(
+            DISPLAY_TAG,
+            `Sensor: ignoring corrupt leg deposit ${entry.file}: ${entry.reason}`,
+          );
+        }
         // STDOUT, not the stderr log: the line IS the transport payload.
-        console.log(renderAdmissionLine(found));
+        console.log(`${renderAdmissionLine(found)} ${leg.field}`);
       } else {
         // LOUD no-current-record sensor — never a silent fallback to an older
         // verdict on the lineage (codex on mmnto-ai/totem#2473).
@@ -2151,10 +2208,38 @@ export async function shieldCommand(options: ShieldOptions): Promise<void> {
           DISPLAY_TAG,
           `Covariate: the current state is not-applicable (${admission.reason}) but no admission record exists for this exact observation — run \`totem review\` to record it (sensor; exit 0).`,
         );
+        // Format v1.2's DEPOSIT-ONLY head (mmnto-ai/totem#2698 fold 2): the
+        // sensor above names the record that is MISSING, which is not a reason
+        // to withhold the evidence that EXISTS. If a leg read this head, the
+        // `local-lane: none …` shape says exactly that — the
+        // mmnto-ai/totem#2694 exhibit is a diff presented with no evidence line
+        // at all, and an absent admission record is one of the two ways to
+        // reach it (the verdict arm in `printCovariateLine` is the other, and
+        // both discriminate on the SAME `winner === undefined`).
+        const { resolveLegFieldForHead } = await import('./review-fan.js');
+        const coverage = await legCoverageForCovariate(config, cwd);
+        if (coverage.reason !== undefined) log.warn(DISPLAY_TAG, `Sensor: ${coverage.reason}`);
+        const leg = await resolveLegFieldForHead(
+          path.join(configRoot, config.totemDir),
+          cwd,
+          undefined,
+          coverage,
+        );
+        for (const entry of leg.corrupt) {
+          log.warn(
+            DISPLAY_TAG,
+            `Sensor: ignoring corrupt leg deposit ${entry.file}: ${entry.reason}`,
+          );
+        }
+        if (leg.winner !== undefined) {
+          // STDOUT, not the stderr log: the line IS the transport payload.
+          console.log(`local-lane: none ${leg.field}`);
+        }
       }
       return;
     }
     const { printCovariateLine } = await import('./review-fan.js');
+    const { legsOwedGlobs } = await import('./legs.js');
     await printCovariateLine({
       // An empty/absent resolution never reaches here (it resolves through the
       // admission arm above); the null arm is type-narrowing, not a live path.
@@ -2169,6 +2254,7 @@ export async function shieldCommand(options: ShieldOptions): Promise<void> {
             },
       totemDirAbs: path.join(configRoot, config.totemDir),
       cwd,
+      globs: await legsOwedGlobs(config),
     });
     return;
   }

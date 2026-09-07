@@ -1,0 +1,309 @@
+# Linux arm of the spine-adopt spike's day-14 "build matrix Windows+Linux"
+# deliverable (spec `.totem/specs/spine-spike.md` § Enrichment rows 3).
+#
+# Windows is measured on the operator's machine; this workflow is the Linux half.
+#
+# PATH-scoped, not branch-scoped (spec `.totem/specs/seed20-apparatus.md` § G9): the
+# spike has outlived the single `wt/spine-spike` branch it was cut on — the R14
+# seed-20 apparatus lands on `r14/seed20-target-apparatus` — so the trigger follows
+# the SPIKE DIRECTORY on any branch instead of one branch name. A push that touches
+# nothing under `spikes/spine-adopt/**` still does not run it, so `main` and the
+# repo's CI are perturbed no more than before. (This file is in its own path filter
+# too, so an edit to the workflow exercises itself.)
+#
+# TWO LEGS, one matrix (mmnto-ai/totem-strategy#1154 § 5 K7, ruled 2026-08-30):
+#   - `specimens` — the original arm: shipped runtime re-derived on Linux, the
+#     OPA differential, the SMT floor + binding probe, the wazero probe, the
+#     K-controls; uploads `spine-spike-linux-artifacts`. Since the run of record
+#     landed at the top-level artifact tree, its INV 2 committed referent is the
+#     re-homed baseline `spikes/spine-adopt/artifacts/specimens/chains/` (A12,
+#     mmnto-ai/totem#2704 — the E24 slice).
+#   - `seed20` — the R14 seed-20 seam on Linux, in the apparatus's own order
+#     (control-only build FIRST so the seed manifest measures `repinned` from arm B,
+#     then `all` → `differential` → the Go arm → `controls`); uploads
+#     `spine-spike-linux-seed20-artifacts`. Its `artifacts/chains/**` are what the
+#     owner copies to `artifacts/k7-rebuild/chains/` at the run of record, so K7
+#     (`src/controls.mts`) corroborates T6 on the SAME chains across hosts — the
+#     specimens leg's chains overlap a seed run on one package only. K7 compares
+#     `regoSha256` / `wasmSha256` per chain, which are content digests independent
+#     of the commit, so any Linux run of the identical apparatus source + frozen
+#     seed qualifies; the run of record cites the run id it copied from. No
+#     apparatus code moves; the apparatus pin (`57f9af5a`) is unchanged.
+#
+# Tool provisioning reads the URL + sha256 straight out of
+# `spikes/spine-adopt/toolchain.lock` so the lock stays the single source of
+# truth ("mutated only by an explicit re-pin commit"); nothing is pinned twice.
+name: Spine Spike (Linux)
+
+on:
+  push:
+    paths:
+      - spikes/spine-adopt/**
+      - .github/workflows/spine-spike-linux.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: spine-adopt harnesses on ubuntu-latest (${{ matrix.record_set }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        record_set: [specimens, seed20]
+    env:
+      TOOLS_DIR: ${{ github.workspace }}/spikes/spine-adopt/tools
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5.0.0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+
+      # PINNED, not `@stable`. The `toolchain` input overrides the action's ref,
+      # so this installs exactly 1.96.1 — the same compiler the Windows arm was
+      # measured on. A floating `stable` lets two runs of the SAME commit build
+      # with different compilers, which makes the recorded build-matrix rows
+      # incomparable. Recorded in `spikes/spine-adopt/toolchain.lock` [rust];
+      # re-pin there and here together.
+      # The ACTION is SHA-pinned to its `v1` tag (the only tag dtolnay/rust-toolchain
+      # publishes — a floating major, which dependabot tracks); at this SHA `toolchain`
+      # is a REQUIRED input with no default, satisfied by the explicit 1.96.1 below.
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: '1.96.1'
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: spikes/spine-adopt/wazero-probe/go.mod
+          cache-dependency-path: spikes/spine-adopt/wazero-probe/go.sum
+
+      - run: pnpm install --frozen-lockfile
+
+      # The harness file-URL-imports `packages/core/dist/index.js` (spec
+      # § Oracle arms, P5 ruling), so the dist must exist before any TS arm runs.
+      - run: pnpm -r build
+
+      # ── Pinned Linux toolchain, verified against toolchain.lock ─────────────
+      # Extracted into the spike's own (gitignored) tools/ dir, which is also
+      # where the harnesses' platform DEFAULT paths point — so the SPIKE_*_BIN
+      # values set below and the no-env defaults resolve to the same binaries.
+      - name: Provision pinned Linux tools (sha256-verified from toolchain.lock)
+        working-directory: spikes/spine-adopt
+        run: |
+          set -euo pipefail
+          mkdir -p tools
+          cd tools
+
+          # Read `key = "value"` out of a named TOML section of the lock.
+          lockval() {
+            awk -v sect="[$1]" -v key="$2" '
+              $0 == sect { inside = 1; next }
+              /^\[/      { inside = 0 }
+              inside && $1 == key { gsub(/"/, "", $3); print $3; exit }
+            ' ../toolchain.lock
+          }
+
+          fetch() { # <section> <output-filename>
+            local url sha
+            url="$(lockval "$1" url)"
+            sha="$(lockval "$1" sha256)"
+            if [ -z "$url" ] || [ -z "$sha" ]; then
+              echo "toolchain.lock: missing url/sha256 for [$1]" >&2
+              exit 1
+            fi
+            echo "[$1] $url"
+            curl -fsSL --retry 3 -o "$2" "$url"
+            echo "${sha}  $2" | sha256sum -c -
+          }
+
+          fetch opa.linux   opa_linux_amd64_static
+          fetch z3.linux    z3-5.1.0-x64-glibc-2.39.zip
+          fetch cvc5.linux  cvc5-Linux-x86_64-static.zip
+
+          chmod +x opa_linux_amd64_static
+          unzip -q z3-5.1.0-x64-glibc-2.39.zip
+          unzip -q cvc5-Linux-x86_64-static.zip
+          chmod +x z3-5.1.0-x64-glibc-2.39/bin/z3 cvc5-Linux-x86_64-static/bin/cvc5
+
+          ./opa_linux_amd64_static version
+          ./z3-5.1.0-x64-glibc-2.39/bin/z3 --version
+          ./cvc5-Linux-x86_64-static/bin/cvc5 --version | head -1
+
+      # ═══════════════════════════════════════════════════════════════════════
+      # specimens leg — the original arm, step for step
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # ── (a) OPA Rego→Wasm verdict differential ─────────────────────────────
+      # `all` FIRST (census → verify-records → facts → shipped-verdicts) so the
+      # shipped runtime, fact bundles, and reference verdicts are all re-derived
+      # ON LINUX — the matrix row measures the cross-platform runtime (incl. the
+      # line-ending axis in FactBundle.fileText), not just the OPA arms replayed
+      # against Windows-generated fixtures. Then `differential` = lower →
+      # build-wasm → certify → host:opa → host:regorus → compare (host arms are
+      # `cargo run`, hence the rust toolchain above).
+      #
+      # CERTIFY IS WIRED AT THE SCRIPT LEVEL, not as a step here (spec § Actuator
+      # slice 6: "the certify step joins the Linux workflow between build-wasm and
+      # the host arms, so both platforms exercise it"). Putting it inside
+      # `differential` puts it in exactly that position on BOTH platforms from one
+      # edit, so Windows and Linux cannot drift into running different pipelines —
+      # which a second, workflow-only step is free to do. `npm run certify` drives
+      # all three hosts, including the Go/wazero arm, which is why setup-go above
+      # must stay ahead of this step.
+      - name: Spike 1 — shipped runtime re-derived on Linux
+        if: matrix.record_set == 'specimens'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+        run: npm run all
+      - name: Spike 1 — OPA differential
+        if: matrix.record_set == 'specimens'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+        run: npm run differential
+
+      # ── (b) SMT obligations, CLI floor ─────────────────────────────────────
+      # This is the deliverable floor and MUST pass; the native binding is a
+      # separate, explicitly non-fatal step below.
+      - name: Spike 2 — SMT obligations (pinned CLI arm)
+        if: matrix.record_set == 'specimens'
+        working-directory: spikes/spine-adopt/smt
+        env:
+          SPIKE_Z3_BIN: ${{ env.TOOLS_DIR }}/z3-5.1.0-x64-glibc-2.39/bin/z3
+          SPIKE_CVC5_BIN: ${{ env.TOOLS_DIR }}/cvc5-Linux-x86_64-static/bin/cvc5
+        run: cargo run
+
+      # NON-FATAL by design: whether z3-sys links against the pinned Linux
+      # release is itself the binding-maturity finding the spike is measuring
+      # (spec § Failure modes, "z3-sys/cvc5 build fails" => recorded build-matrix
+      # row, not a spike failure). The CLI floor above already passed.
+      - name: Spike 2 — z3 binding arm (non-fatal build-matrix probe)
+        if: matrix.record_set == 'specimens'
+        id: binding
+        continue-on-error: true
+        working-directory: spikes/spine-adopt/smt
+        env:
+          SPIKE_Z3_BIN: ${{ env.TOOLS_DIR }}/z3-5.1.0-x64-glibc-2.39/bin/z3
+          SPIKE_CVC5_BIN: ${{ env.TOOLS_DIR }}/cvc5-Linux-x86_64-static/bin/cvc5
+          SPIKE_Z3_ROOT: ${{ env.TOOLS_DIR }}/z3-5.1.0-x64-glibc-2.39
+          Z3_SYS_Z3_HEADER: ${{ env.TOOLS_DIR }}/z3-5.1.0-x64-glibc-2.39/include/z3.h
+          LD_LIBRARY_PATH: ${{ env.TOOLS_DIR }}/z3-5.1.0-x64-glibc-2.39/bin
+        run: |
+          set -o pipefail
+          mkdir -p artifacts
+          cargo run --features binding-z3 2>&1 | tee artifacts/binding-z3-linux.log
+
+      - name: Record the binding arm's outcome as an artifact row
+        if: always() && matrix.record_set == 'specimens'
+        working-directory: spikes/spine-adopt/smt
+        run: |
+          mkdir -p artifacts
+          printf '%s\n' \
+            "platform=linux/amd64 (ubuntu-latest)" \
+            "step=cargo run --features binding-z3" \
+            "outcome=${{ steps.binding.outcome }}" \
+            "z3_pin=toolchain.lock [z3.linux] 5.1.0 (x64-glibc-2.39)" \
+            > artifacts/binding-z3-linux.outcome.txt
+          cat artifacts/binding-z3-linux.outcome.txt
+
+      # ── (c) wazero component-model / core-Wasm probe ───────────────────────
+      # Runs AFTER the differential: it reads that run's lowering-rejects.json,
+      # opa-verdicts.json and the rego/*/policy.wasm artifacts.
+      - name: Enrichment — wazero probe
+        if: matrix.record_set == 'specimens'
+        working-directory: spikes/spine-adopt/wazero-probe
+        run: |
+          go test ./...
+          go run .
+
+      # ── (d) the K-controls ─────────────────────────────────────────────────
+      # LAST, and only here: `src/controls.mts` summarises controls that live
+      # inline in the differential's artifacts AND in the Go probe's, so this is
+      # the only position at which every source it reads exists (spec
+      # `.totem/specs/seed20-apparatus-slice2.md` § S7/§ S10). Running it on the
+      # Linux arm means `controls.json` is deposited on BOTH platforms from one
+      # edit, the way `certify` already is.
+      - name: Enrichment — K-controls
+        if: matrix.record_set == 'specimens'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+        run: npm run controls
+
+      # ═══════════════════════════════════════════════════════════════════════
+      # seed20 leg — the R14 seed-20 seam, in the apparatus's own order (spec
+      # `.totem/specs/seed20-apparatus-slice2.md` § S5 / § Verification; the
+      # controls-at-the-pin sequence of mmnto-ai/totem#2702). Its chains are
+      # K7's input at the run of record.
+      # ═══════════════════════════════════════════════════════════════════════
+
+      # Control-only build FIRST (K3 arm B): one specimen record under
+      # `SPIKE_CONTROL_RECORD`, output under `artifacts/k3-control/` (the default
+      # subdir for the control set), so the seed manifest below measures
+      # `k3Capture.repinned` FROM this build rather than reporting it unmeasured.
+      # `SPIKE_RECORD_SET` is deliberately unset here: the control set is selected
+      # by the control-record flag alone.
+      - name: Seed-20 — control-only build FIRST (K3 arm B)
+        if: matrix.record_set == 'seed20'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+          SPIKE_CONTROL_RECORD: records/c-supp-astgrep-compound-failopen-catch.rule.yaml
+        run: npm run manifest && npm run lower && npm run build-wasm && npm run certify
+
+      - name: Seed-20 — shipped runtime re-derived on Linux
+        if: matrix.record_set == 'seed20'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+          SPIKE_RECORD_SET: seed20
+        run: npm run all
+
+      - name: Seed-20 — OPA differential
+        if: matrix.record_set == 'seed20'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+          SPIKE_RECORD_SET: seed20
+        run: npm run differential
+
+      - name: Seed-20 — wazero probe
+        if: matrix.record_set == 'seed20'
+        working-directory: spikes/spine-adopt/wazero-probe
+        env:
+          SPIKE_RECORD_SET: seed20
+        run: |
+          go test ./...
+          go run .
+
+      - name: Seed-20 — K-controls
+        if: matrix.record_set == 'seed20'
+        working-directory: spikes/spine-adopt
+        env:
+          SPIKE_OPA_BIN: ${{ env.TOOLS_DIR }}/opa_linux_amd64_static
+          SPIKE_RECORD_SET: seed20
+        run: npm run controls
+
+      # One upload per leg, under distinct names: `spine-spike-linux-artifacts`
+      # (specimens, the name every prior run used) and
+      # `spine-spike-linux-seed20-artifacts` (the K7 source).
+      - name: Upload spike artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.record_set == 'seed20' && 'spine-spike-linux-seed20-artifacts' || 'spine-spike-linux-artifacts' }}
+          if-no-files-found: error
+          path: |
+            spikes/spine-adopt/artifacts/**
+            spikes/spine-adopt/**/artifacts/**
