@@ -686,6 +686,52 @@ program
     }
   });
 
+// ─── `totem resolve-threads` — resolve dispositioned bot threads (mmnto-ai/totem#2841) ───
+// Dry-run by DEFAULT (R1); `--apply` is the only mutating path. Custom exit-code
+// contract (the index wrapper sets process.exitCode, same as `mail` / `pr merge`):
+// 0 = plan printed or applied clean; 1 = a read that did not complete (nothing
+// resolved) or gh absent; 2 = an unmatched --ids entry, a mutation that failed,
+// or a selected thread skipped for want of disposition evidence under --apply.
+program
+  .command('resolve-threads <pr-number>')
+  .description(
+    'Resolve the bot review threads a round has dispositioned (dry-run by default; --apply mutates)',
+  )
+  .option('--apply', 'Run the resolveReviewThread mutation (default: print the plan only)')
+  .option('--ids <ids>', 'Comma-separated REST root comment ids to narrow the batch')
+  .option('--json', 'Emit the plan rows as one JSON document')
+  .action(async (prNumber: string, _opts: unknown, cmd: Command) => {
+    // No `requireGhCli()` here, unlike the sibling actions: this verb's `--json`
+    // contract promises a `{ error, rows, exitCode }` document on every
+    // failure, and an action-level exit before the command ran left a script
+    // nothing to parse when gh was missing. The command probes gh through its
+    // own seam and fails in-contract (the PR's review round, greptile).
+    try {
+      const { resolveThreadsCommand } = await import('./commands/resolve-threads.js');
+      // The program-level `--json` (top of file) swallows the flag when it
+      // appears after the subcommand (commander parent/child option collision,
+      // mmnto-ai/totem#2097) — `optsWithGlobals` merges both scopes so
+      // `totem resolve-threads 42 --json` and `totem --json resolve-threads 42`
+      // agree. Typed destructure, as `mail` does.
+      const { apply, ids, json } = cmd.optsWithGlobals<{
+        apply?: boolean;
+        ids?: string;
+        json?: boolean;
+      }>();
+      const { exitCode } = await resolveThreadsCommand(prNumber, {
+        apply: apply === true,
+        ...(ids === undefined ? {} : { ids }),
+        json: json === true,
+      });
+      if (exitCode !== 0) process.exitCode = exitCode;
+      // totem-context: handleError is the CLI error boundary (returns `never` — prints + process.exit), identical to every sibling command action in this file; nothing is swallowed.
+    } catch (err) {
+      handleError(err);
+      // totem-context: handleError returns `never` (process.exit), so the throw is unreachable but required to satisfy the Tenet 4 fail-loud rule that bans bare-catch silent-degrade. Mirrors the mail / pr merge pattern.
+      throw err;
+    }
+  });
+
 // ─── `totem pr merge` — auto-close-safe squash merge actuator (mmnto-ai/totem#1762) ───
 // The sanctioned paved-road merge path (no command interception — OPTION 1
 // ruling, 2026-07-22). Custom fail-closed exit-code contract (the index
@@ -913,6 +959,10 @@ const mailCmd = program
     '--all-seats',
     'Serve the full multi-seat union (repo dashboard view) — bypasses the identity gate by name',
   )
+  .option(
+    '--derive-seat',
+    'Print the seat this session inherited (`seat=<id> source=env`) and poll nothing — refuses (exit 2) unless TOTEM_SELF_AGENT names exactly one seat this repo hosts, where hosts means config.json host_agents, else the seat dirs, else the cohort map keyed on the origin repository. Unlike `--as`, the env never widens the hosted set: `--as` is your declaration, this flag corroborates one. Contradictory with --as and --all-seats. Under --json: one object on stdout in both arms, `{ ok: true, seat, source, line }` or `{ ok: false, refusal }`, same exit codes',
+  )
   .addHelpText(
     'after',
     [
@@ -925,8 +975,10 @@ const mailCmd = program
       '(directed mail is withheld as a count, exit 2) until identity is explicit:',
       'per-shell TOTEM_SELF_AGENT, `--as <seat>`, or `--all-seats` by name.',
       '',
-      'Exit codes: 0 = verdict derived. 2 = NOT DERIVED (no self agent, or an',
-      'identity-gated poll) — fix identity and re-poll. 4 = SENDER FAULT',
+      'Exit codes: 0 = verdict derived. 2 = NOT DERIVED (no self agent, an',
+      'identity-gated poll, or a flag contradiction — `--derive-seat` passed with',
+      '`--as <seat>` or `--all-seats`, which declare the seat it asks for) — fix',
+      'identity or the flags and re-run. 4 = SENDER FAULT',
       '(mmnto-ai/totem#2685): the verdict IS derived, but an outbox this repo hosts',
       'for a resolved seat carries a dispatch whose `to:` matches no roster agent —',
       'undeliverable to every seat-scoped poll. Rendered as an Error line (and a',
@@ -934,12 +986,19 @@ const mailCmd = program
       'per dispatch, or broadcast) and re-poll. An Error line names a dispatch',
       "basename, like a gated poll's warnings — propagate nothing from it.",
       '',
+      '`--derive-seat` answers the prior question — which seat is this session? —',
+      'and polls nothing: one stdout line `seat=<id> source=env` (exit 0), or a',
+      'stderr refusal naming the supplied value and every seat this repo hosts',
+      '(exit 2). It never adopts a seat you did not declare. With --json the',
+      'line and the refusal become one stdout object — `{ ok: true, seat,',
+      'source, line }` or `{ ok: false, refusal }` — with the same exit codes.',
+      '',
     ].join('\n'),
   )
   .action(
     async (_opts: { json?: boolean; recursive?: boolean; workspace?: string }, cmd: Command) => {
       try {
-        const { mailCommand } = await import('./commands/mail.js');
+        const { deriveSeatCommand, mailCommand } = await import('./commands/mail.js');
         // The program-level `--json` (top of file) swallows the flag when it
         // appears after the subcommand (commander parent/child option collision,
         // mmnto-ai/totem#2097): the value lands on program.opts() and the action
@@ -952,13 +1011,31 @@ const mailCmd = program
           workspace,
           as: asSeat,
           allSeats,
+          deriveSeat,
         } = cmd.optsWithGlobals<{
           json?: boolean;
           recursive?: boolean;
           workspace?: string;
           as?: string;
           allSeats?: boolean;
+          deriveSeat?: boolean;
         }>();
+        // `--derive-seat` (mmnto-ai/totem#2801) short-circuits BEFORE any poll:
+        // it answers which seat this session is, and a probe that polled would
+        // defeat the ordering signon step 0 exists to establish. Same
+        // exitCode-not-exit contract as the poll below; the contradiction arms
+        // (`--as`, `--all-seats`) are refused inside the command so the lib
+        // owns the whole rule.
+        if (deriveSeat === true) {
+          const { exitCode } = await deriveSeatCommand({
+            json,
+            asSeat,
+            allSeats,
+            deriveSeat: true,
+          });
+          if (exitCode !== 0) process.exitCode = exitCode;
+          return;
+        }
         // Custom exit-code contract (mmnto-ai/totem#2312): pollMail never throws,
         // so the wrapper returns the code and we set process.exitCode (never
         // process.exit mid-flow — same pattern as the ecl-gc action). Exit 2 when
@@ -1963,11 +2040,15 @@ gateCmd
   .description('Evaluate a gate predicate; emit a GateVerdict (allow|warn|deny) as JSON to stdout')
   .requiredOption('--event <type>', 'Gate event type (e.g. freeze-check)')
   .requiredOption('--payload <json>', 'Gate-specific JSON payload, or - to read it from stdin')
+  .option(
+    '--tier <tier>',
+    'Enforcement tier for the gate\'s UNEVALUABLE class: "strict" (default — a read that failed to derive denies) or "pilot" (it warns). Never softens a predicate that actually failed, and gates that fail closed at every tier (freeze-check) ignore it.',
+  )
   .addHelpText(
     'after',
-    `\nExamples:\n  $ totem gate check --event freeze-check --payload '{"subsystem":"rule-compilation"}'\n  $ echo '{"tool":"Bash","command":"git status","platform":"win32"}' | totem gate check --event transport-shield --payload -\n`,
+    `\nExamples:\n  $ totem gate check --event freeze-check --payload '{"subsystem":"rule-compilation"}'\n  $ echo '{"tool":"Bash","command":"git status","platform":"win32"}' | totem gate check --event transport-shield --payload -\n  $ totem gate check --event merge-ready --tier pilot --payload '{"repo":"mmnto-ai/totem","pr":2800}'\n`,
   )
-  .action(async (opts: { event: string; payload: string }) => {
+  .action(async (opts: { event: string; payload: string; tier?: string }) => {
     try {
       const { gateCheckCommand } = await import('./commands/gate.js');
       await gateCheckCommand(opts);
