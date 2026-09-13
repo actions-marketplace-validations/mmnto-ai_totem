@@ -17,6 +17,7 @@ import {
   ejectCommand,
   LEGACY_REFLEX_FILES,
   resolveEjectHooksContext,
+  scrubAgentsFloor,
   scrubPostCheckoutHook,
   scrubPostMergeHook,
   scrubReflexFiles,
@@ -24,6 +25,9 @@ import {
 } from './eject.js';
 import { AI_TOOLS } from './init-detect.js';
 import {
+  AGENTS_FLOOR_BLOCK,
+  AGENTS_FLOOR_END,
+  AGENTS_FLOOR_START,
   AI_PROMPT_BLOCK,
   DISTRIBUTED_CLAUDE_SKILLS,
   REFLEX_END,
@@ -321,6 +325,422 @@ describe('ejectCommand', () => {
       expect(fs.readFileSync(path.join(cwd, ...rel.split('/')), 'utf-8'), rel).toBe('# Head\n');
     }
   });
+
+  // ─── The managed AGENTS.md floor span (mmnto-ai/totem-strategy#619) ──
+
+  it('scrubs the AGENTS.md floor span, keeps the repository content around it, and leaves one blank line at the seam', async () => {
+    // The scaffold's own shape: a blank line above the span, the end marker's
+    // line terminator, a blank line below. The seam normalizes exactly as the
+    // reflex scrub's does — one blank line where the span sat, never two.
+    const above = '# Mine\n\nMy intro.\n\n';
+    const below = '\n## My rules\n\n- keep this\n';
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), above + AGENTS_FLOOR_BLOCK + '\n' + below);
+
+    await ejectCommand({ force: true });
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      '# Mine\n\nMy intro.\n\n## My rules\n\n- keep this\n',
+    );
+  });
+
+  it('scrubs the floor span at byte 0 without growing a leading blank line', async () => {
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), AGENTS_FLOOR_BLOCK + '\n\n## Mine\n');
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe('## Mine\n');
+    expect(summary.scrubbed).toEqual(['AGENTS.md']);
+  });
+
+  // ─── Pairing and line endings (the fold of the pre-merge leg's F2/F3/F4) ──
+
+  it('an orphan start marker above the span never widens the removal — the user text between stays, and the orphan is named as residue', async () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nMY OWN TEXT\n${AGENTS_FLOOR_START}\nx\n${AGENTS_FLOOR_END}\n\n## Keep\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_START}\nMY OWN TEXT\n\n## Keep\n`,
+    );
+    expect(summary.scrubbed).toEqual([
+      'AGENTS.md (stray floor markers remain — remove them now: a start marker followed by an end marker is a managed span by definition, and a later eject or init would treat the text between them as one)',
+    ]);
+  });
+
+  it('removes every complete span, not just the first', async () => {
+    const content = `# Mine\n\n${AGENTS_FLOOR_BLOCK}\n\nMID\n\n${AGENTS_FLOOR_BLOCK}\n\n## Keep\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    const out = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8');
+    expect(out).toBe('# Mine\n\nMID\n\n## Keep\n');
+    expect(out).not.toContain(AGENTS_FLOOR_START);
+    expect(summary.scrubbed).toEqual(['AGENTS.md']);
+  });
+
+  it('an orphan end marker above a complete span is skipped, the span below it removed', async () => {
+    const content = `# Mine\n${AGENTS_FLOOR_END}\nstill mine\n\n${AGENTS_FLOOR_BLOCK}\n\n## Keep\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_END}\nstill mine\n\n## Keep\n`,
+    );
+    expect(summary.scrubbed).toEqual([
+      'AGENTS.md (stray floor markers remain — remove them now: a start marker followed by an end marker is a managed span by definition, and a later eject or init would treat the text between them as one)',
+    ]);
+  });
+
+  it('a CRLF file keeps CRLF at the seam — no bare LF is introduced and no user byte changes', async () => {
+    const lf = `# Mine\n\nintro\n\n${AGENTS_FLOOR_BLOCK}\n\n## Rules\n`;
+    const crlf = lf.replace(/\n/g, '\r\n');
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), crlf);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    const out = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8');
+    expect(out).toBe('# Mine\r\n\r\nintro\r\n\r\n## Rules\r\n');
+    expect(out.replace(/\r\n/g, '')).not.toContain('\n');
+    expect(summary.scrubbed).toEqual(['AGENTS.md']);
+  });
+
+  // ─── The re-armed leg's shapes (G1, G5, G10) ────────────────────────
+
+  it('two orphans around a span never re-pair on a later pass — both user texts stay, residue named', async () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nMY OWN TEXT\n${AGENTS_FLOOR_START}\nx\n${AGENTS_FLOOR_END}\n\nKEEP ME\n${AGENTS_FLOOR_END}\ntail\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_START}\nMY OWN TEXT\n\nKEEP ME\n${AGENTS_FLOOR_END}\ntail\n`,
+    );
+    expect(summary.scrubbed).toEqual([
+      'AGENTS.md (stray floor markers remain — remove them now: a start marker followed by an end marker is a managed span by definition, and a later eject or init would treat the text between them as one)',
+    ]);
+  });
+
+  it('a nested shape removes only the inner pair — the outer orphans and the text they bracket stay', async () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nA\n${AGENTS_FLOOR_START}\nB\n${AGENTS_FLOOR_END}\nC\n${AGENTS_FLOOR_END}\ntail\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_START}\nA\nC\n${AGENTS_FLOOR_END}\ntail\n`,
+    );
+    expect(summary.scrubbed).toEqual([
+      'AGENTS.md (stray floor markers remain — remove them now: a start marker followed by an end marker is a managed span by definition, and a later eject or init would treat the text between them as one)',
+    ]);
+  });
+
+  it('markers quoted inside a fenced code block are prose: no block, file byte-untouched', async () => {
+    const content = `# Mine\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\n${AGENTS_FLOOR_END}\n\`\`\`\n\nmore mine\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped).toEqual(['AGENTS.md (no Totem block)']);
+  });
+
+  it('a span that is the only CRLF in an LF file leaves a pure-LF seam', async () => {
+    const crlfBlock = AGENTS_FLOOR_BLOCK.replace(/\n/g, '\r\n');
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), `# Mine\n\nintro\n\n${crlfBlock}\n\n## Rules\n`);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    const out = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8');
+    expect(out).toBe('# Mine\n\nintro\n\n## Rules\n');
+    expect(out).not.toContain('\r');
+    expect(summary.scrubbed).toEqual(['AGENTS.md']);
+  });
+
+  // ─── The third leg's shapes (H2, H3, H4) ────────────────────────────
+
+  it.each([
+    [
+      'a stray unterminated fence above a real span',
+      `# Mine\n\n\`\`\`sh\necho hi\n\n${AGENTS_FLOOR_BLOCK}\n\ntail\n`,
+    ],
+    [
+      'markers quoted in a fence that the wrong character tries to close',
+      `# Mine\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\nMY EXAMPLE\n${AGENTS_FLOOR_END}\n~~~\n\nafter\n`,
+    ],
+  ])(
+    '%s is ambiguous: nothing below the fence is touched and the fence line is named',
+    async (_name, content) => {
+      fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+      const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+      await scrubAgentsFloor(cwd, summary);
+
+      expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+      expect(summary.skipped).toHaveLength(1);
+      expect(summary.skipped[0]).toContain('or an HTML comment opened at line 3');
+      expect(summary.scrubbed).toEqual([]);
+    },
+  );
+
+  it('a real span above an unclosed fence is removed and the fence below is still named', async () => {
+    fs.writeFileSync(
+      path.join(cwd, 'AGENTS.md'),
+      `# Mine\n\n${AGENTS_FLOOR_BLOCK}\n\n\`\`\`\n${AGENTS_FLOOR_START}\nquoted\n`,
+    );
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      `# Mine\n\n\`\`\`\n${AGENTS_FLOOR_START}\nquoted\n`,
+    );
+    expect(summary.scrubbed).toHaveLength(1);
+    expect(summary.scrubbed[0]).toContain('or an HTML comment opened at line');
+  });
+
+  it.each([1, 2, 3])(
+    'marker lines indented %s space(s) still count, and the indent leaves with the span',
+    async (n) => {
+      const pad = ' '.repeat(n);
+      fs.writeFileSync(
+        path.join(cwd, 'AGENTS.md'),
+        `# Mine\n\n${pad}${AGENTS_FLOOR_START}\nfloor\n${pad}${AGENTS_FLOOR_END}\n\ntail\n`,
+      );
+      const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+      await scrubAgentsFloor(cwd, summary);
+
+      expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe('# Mine\n\ntail\n');
+      expect(summary.scrubbed).toEqual(['AGENTS.md']);
+    },
+  );
+
+  it('trailing blanks on the end-marker line leave with the span — one clean blank line at the seam', async () => {
+    fs.writeFileSync(
+      path.join(cwd, 'AGENTS.md'),
+      `# Mine\n\n${AGENTS_FLOOR_START}  \nfloor\n${AGENTS_FLOOR_END}\t\n\ntail\n`,
+    );
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe('# Mine\n\ntail\n');
+  });
+
+  it('a byte-order-marked file that is nothing but the span is removed outright', async () => {
+    const bom = String.fromCharCode(0xfeff);
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), `${bom}${AGENTS_FLOOR_BLOCK}\n`);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.existsSync(path.join(cwd, 'AGENTS.md'))).toBe(false);
+    expect(summary.removed).toEqual(['AGENTS.md']);
+  });
+
+  // ─── The fifth leg's shapes (K1 tab fences, K3 fresh line numbers, K7 wording) ──
+
+  it('a tab-indented fence line is indented code, not a fence: a closed quotation below it stays prose', async () => {
+    const content = `# Mine\n\n\t\`\`\`\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\nMY EXAMPLE LINE\n${AGENTS_FLOOR_END}\n\`\`\`\n\nafter\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped).toEqual(['AGENTS.md (no Totem block)']);
+  });
+
+  it('the fence line named after a scrub is the line in the file left on disk, and the note reads on its own', async () => {
+    fs.writeFileSync(
+      path.join(cwd, 'AGENTS.md'),
+      `# Mine\n\n${AGENTS_FLOOR_BLOCK}\n\n\`\`\`\n${AGENTS_FLOOR_START}\nquoted\n`,
+    );
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    const written = fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8');
+    const fenceLineOnDisk = written.split('\n').findIndex((l) => l === '```') + 1;
+    expect(summary.scrubbed).toEqual([
+      `AGENTS.md (scrubbed; an unclosed code fence or an HTML comment opened at line ${fenceLineOnDisk} makes the floor markers inside or below it ambiguous; nothing from that line on was touched — close it, then re-run \`totem eject\`)`,
+    ]);
+  });
+
+  it('the ambiguity skip reads on its own', async () => {
+    fs.writeFileSync(
+      path.join(cwd, 'AGENTS.md'),
+      `# Mine\n\n\`\`\`sh\necho hi\n\n${AGENTS_FLOOR_BLOCK}\n`,
+    );
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(summary.skipped[0]).toMatch(
+      /^AGENTS\.md \(not scrubbed: an unclosed code fence or an HTML comment opened at line 3 /,
+    );
+  });
+
+  // ─── The bot round (greptile P1 fence shape, CodeRabbit closer rule) ─
+
+  it('a closing fence never carries an info string: a ```sh line leaves the quotation open, so it is ambiguous', async () => {
+    const content = `# Mine\n\n\`\`\`\n${AGENTS_FLOOR_START}\nQUOTED\n${AGENTS_FLOOR_END}\n\`\`\`sh\necho\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped[0]).toContain('or an HTML comment opened at line 3');
+  });
+
+  it('a fence-looking line inside an HTML comment is raw HTML: the closed quotation below it stays prose', async () => {
+    const content = `# Mine\n\n<!--\n\`\`\`\n-->\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\nMY EXAMPLE\n${AGENTS_FLOOR_END}\n\`\`\`\n\nafter\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped).toEqual(['AGENTS.md (no Totem block)']);
+  });
+
+  it('a comment opener inside a fenced block is the fence content: the fence still closes and the real span below is removed', async () => {
+    fs.writeFileSync(
+      path.join(cwd, 'AGENTS.md'),
+      `# Mine\n\n\`\`\`html\n<!-- example opener\n\`\`\`\n\n${AGENTS_FLOOR_BLOCK}\n\nafter\n`,
+    );
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      '# Mine\n\n```html\n<!-- example opener\n```\n\nafter\n',
+    );
+    expect(summary.scrubbed).toEqual(['AGENTS.md']);
+  });
+
+  it('a multi-line comment that reaches a marker swallows it: ambiguous, named, nothing touched', async () => {
+    const content = `# Mine\n\n<!-- TODO revisit\n\n\`\`\`\n${AGENTS_FLOOR_START}\nQUOTED EXAMPLE\n${AGENTS_FLOOR_END}\n\`\`\`\n\nafter\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped).toHaveLength(1);
+    expect(summary.skipped[0]).toContain('HTML comment opened at line 3');
+  });
+
+  it('wrapping the span in an HTML comment is named, never silently removed or silently ignored', async () => {
+    const content = `# Mine\n\n<!--\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n-->\n\nafter\n`;
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped).toHaveLength(1);
+    expect(summary.skipped[0]).toContain('HTML comment opened at line 3');
+  });
+
+  it('the residue-only skip carries the contract', async () => {
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), `# Mine\n${AGENTS_FLOOR_START}\nmine\n`);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(summary.skipped).toHaveLength(1);
+    expect(summary.skipped[0]).toContain('a managed span by definition');
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_START}\nmine\n`,
+    );
+  });
+
+  it.each([
+    [
+      'markers quoted in inline code spans mid-sentence',
+      `# Mine\n\nAdd \`${AGENTS_FLOOR_START}\` and \`${AGENTS_FLOOR_END}\` to adopt.\n\nmore\n`,
+    ],
+    [
+      'markers in an indented code block',
+      `# Mine\n\n    ${AGENTS_FLOOR_START}\n    ${AGENTS_FLOOR_END}\n\nmore\n`,
+    ],
+    [
+      'a marker that shares its line with prose',
+      `# Mine\nkeep ${AGENTS_FLOOR_START}\ntext\n${AGENTS_FLOOR_END} more\n`,
+    ],
+  ])('%s are prose: no block, file byte-untouched', async (_name, content) => {
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+    expect(summary.skipped).toEqual(['AGENTS.md (no Totem block)']);
+  });
+
+  it('a file that is nothing but a CRLF span is removed outright', async () => {
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), AGENTS_FLOOR_BLOCK.replace(/\n/g, '\r\n'));
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.existsSync(path.join(cwd, 'AGENTS.md'))).toBe(false);
+    expect(summary.removed).toEqual(['AGENTS.md']);
+  });
+
+  it('removes an AGENTS.md that is nothing but the floor span', async () => {
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), AGENTS_FLOOR_BLOCK + '\n');
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.existsSync(path.join(cwd, 'AGENTS.md'))).toBe(false);
+    expect(summary.removed).toEqual(['AGENTS.md']);
+    expect(summary.scrubbed).toEqual([]);
+  });
+
+  it('leaves a repository-authored AGENTS.md (no markers) byte-untouched and reports no block', async () => {
+    const mine = '# Mine\n\nAll user content.\n';
+    fs.writeFileSync(path.join(cwd, 'AGENTS.md'), mine);
+    const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+    await scrubAgentsFloor(cwd, summary);
+
+    expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(mine);
+    expect(summary.skipped).toEqual(['AGENTS.md (no Totem block)']);
+  });
+
+  it.each([
+    ['an orphan start marker', `# Mine\n${AGENTS_FLOOR_START}\ntext\n`],
+    ['an orphan end marker', `# Mine\ntext\n${AGENTS_FLOOR_END}\n`],
+    ['inverted markers', `# Mine\n${AGENTS_FLOOR_END}\ntext\n${AGENTS_FLOOR_START}\n`],
+  ])(
+    'never attributes %s — the file stays byte-untouched and is reported as residue',
+    async (_name, content) => {
+      fs.writeFileSync(path.join(cwd, 'AGENTS.md'), content);
+      const summary: EjectSummary = { removed: [], scrubbed: [], skipped: [] };
+
+      await scrubAgentsFloor(cwd, summary);
+
+      expect(fs.readFileSync(path.join(cwd, 'AGENTS.md'), 'utf-8')).toBe(content);
+      expect(summary.skipped).toHaveLength(1);
+      expect(summary.skipped[0]).toContain('stray floor markers');
+    },
+  );
 
   it('deletes .lancedb, .totem, and totem.config.ts', async () => {
     fs.mkdirSync(path.join(cwd, '.lancedb'), { recursive: true });

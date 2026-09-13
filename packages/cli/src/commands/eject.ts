@@ -37,6 +37,8 @@ const TOTEM_CHECKOUT_END = '[totem] end post-checkout';
 // Comment-shape-agnostic: hooks open `// [totem] auto-generated …`, markdown
 // skills `<!-- [totem] auto-generated … -->` — the first-line gate matches both.
 const TOTEM_FILE_MARKER = '[totem] auto-generated';
+/** The code point of the byte-order mark a UTF-8 editor may leave at byte 0. */
+const BOM_CODE_POINT = 0xfeff;
 
 /** The Totem directory when the repo configures none. */
 export const DEFAULT_TOTEM_DIR = '.totem';
@@ -695,6 +697,145 @@ export const LEGACY_REFLEX_FILES = ['CLAUDE.md', '.gemini/gemini.md', '.cursorru
 const LEGACY_ALT_HEADING = '## Totem Memory Reflexes';
 
 /**
+ * Remove the managed AGENTS.md floor span `totem init` scaffolds
+ * (mmnto-ai/totem-strategy#619). Removes every complete span the forward scan
+ * finds — each paired END-anchored like the reflex scrub's
+ * (mmnto-ai/totem#2602): the first end marker with the last start marker before
+ * it, the scan resuming at the seam after each removal, so an orphan start
+ * marker above a span never widens the removal and never re-pairs with an
+ * orphan end marker below it in this run. The repository's own content on
+ * either side is kept, the seam normalized as the reflex scrub normalizes its
+ * own — one blank line where the span sat, in the line terminator the bytes
+ * outside the span use. A file that is nothing but the span (and whitespace) is
+ * removed outright — it was the scaffold and nothing more. Stray markers are
+ * never attributed and never scrubbed; they are named beside the scrubbed line
+ * (with the warning that a start marker followed by an end marker is a span by
+ * definition, so the text they now bracket would be read as one next time), or
+ * as the skip reason when nothing else was there to scrub.
+ *
+ * Exported for the summary-contract tests beside `scrubReflexFiles`.
+ */
+export async function scrubAgentsFloor(cwd: string, summary: EjectSummary): Promise<void> {
+  const {
+    AGENTS_FLOOR_END,
+    AGENTS_FLOOR_REL,
+    AGENTS_FLOOR_START,
+    agentsFloorAmbiguousFenceLine,
+    agentsFloorMarkerPositions,
+    eolOutsideSpan,
+    locateAgentsFloorSpan,
+  } = await import('./init-templates.js');
+  const filePath = path.join(cwd, AGENTS_FLOOR_REL);
+  const realMarkers = (text: string): number =>
+    agentsFloorMarkerPositions(text, AGENTS_FLOOR_START).length +
+    agentsFloorMarkerPositions(text, AGENTS_FLOOR_END).length;
+  // The contract every stray-marker line carries: a start marker followed by
+  // an end marker IS a managed span by definition.
+  const contract =
+    'a start marker followed by an end marker is a managed span by definition, and a later eject or init would treat the text between them as one';
+  try {
+    if (!fs.existsSync(filePath)) return;
+    const rawContent = fs.readFileSync(filePath);
+    const content = rawContent.toString('utf-8');
+    // Markers below an unclosed fence opener are ambiguous (a quotation never
+    // closed, or a real span under a stray fence line): nothing below it is
+    // touched, and the fence is named so the maintainer can close it. The note
+    // is computed on the text left on disk, so its line is right after a scrub
+    // above the fence moved it.
+    const fenceNoteFor = (text: string): string => {
+      const line = agentsFloorAmbiguousFenceLine(text);
+      return line === null
+        ? ''
+        : `an unclosed code fence or an HTML comment opened at line ${line} makes the floor markers inside or below it ambiguous; nothing from that line on was touched — close it, then re-run \`totem eject\``;
+    };
+    // A marker quoted inside a closed fenced code block is prose, not a block.
+    if (realMarkers(content) === 0) {
+      const note = fenceNoteFor(content);
+      summary.skipped.push(
+        note === ''
+          ? `${AGENTS_FLOOR_REL} (no Totem block)`
+          : `${AGENTS_FLOOR_REL} (not scrubbed: ${note})`,
+      );
+      return;
+    }
+    // Same guard as scrubReflexFiles: a file that does not round-trip through
+    // UTF-8 cannot be rewritten without substituting U+FFFD into kept content.
+    if (Buffer.compare(Buffer.from(content, 'utf-8'), rawContent) !== 0) {
+      summary.skipped.push(
+        `${AGENTS_FLOOR_REL} (non-UTF-8 content — not scrubbed; remove the Totem block manually)`,
+      );
+      return;
+    }
+    let out = content;
+    let removedSpans = 0;
+    // The cursor only ever moves forward: after a span is removed the scan
+    // resumes at the seam, so an orphan start marker the pairing left behind
+    // above the seam can never re-pair with an orphan end marker below it on a
+    // later pass (the two-orphan shape the re-armed leg found).
+    let cursor = 0;
+    for (;;) {
+      const span = locateAgentsFloorSpan(out, cursor);
+      if (span === null) break;
+      // The line terminator is read from the bytes OUTSIDE the span being
+      // removed: a span that is the file's only CRLF source must not decide
+      // the seam of an otherwise-LF file.
+      const eol = eolOutsideSpan(out, span);
+      // Single-owner seams, mirroring the reflex scrub: the prefix keeps at
+      // most one trailing terminator (the blank line above the span was the
+      // scaffold's), and the end marker's own terminator leaves with the span,
+      // so one blank line remains where the span sat — never two, never zero.
+      // A tolerated byte-order mark on line 1 is not a prefix the seam owns.
+      const rawBefore = out.slice(0, span.start);
+      const lead = rawBefore.charCodeAt(0) === BOM_CODE_POINT ? rawBefore.slice(0, 1) : '';
+      let core = rawBefore.slice(lead.length).replace(/(?:\r?\n)*$/, eol);
+      if (core === eol) core = '';
+      let after = out.slice(span.end);
+      if (/^[ \t\r\n]*$/.test(after)) {
+        after = '';
+      } else if (after.startsWith('\r\n')) {
+        after = after.slice(2);
+      } else if (after.startsWith('\n')) {
+        after = after.slice(1);
+      }
+      // A span at byte 0 must not leave a leading blank line behind it.
+      if (core === '') after = after.replace(/^(?:\r?\n)+/, '');
+      const before = lead + core;
+      out = before + after;
+      cursor = before.length;
+      removedSpans++;
+    }
+    const residue = realMarkers(out) > 0;
+    if (removedSpans === 0) {
+      const note = fenceNoteFor(out);
+      summary.skipped.push(
+        `${AGENTS_FLOOR_REL} (stray floor markers, no complete span — not scrubbed; remove them: ${contract}${note === '' ? '' : `; ${note}`})`,
+      );
+      return;
+    }
+    if (/^[ \t\r\n]*$/.test(out.charCodeAt(0) === BOM_CODE_POINT ? out.slice(1) : out)) {
+      fs.unlinkSync(filePath);
+      summary.removed.push(AGENTS_FLOOR_REL);
+      return;
+    }
+    writeFileAtomicSync(filePath, out);
+    const note = fenceNoteFor(out);
+    if (residue) {
+      summary.scrubbed.push(
+        `${AGENTS_FLOOR_REL} (stray floor markers remain — remove them now: ${contract}${note === '' ? '' : `; ${note}`})`,
+      );
+    } else {
+      summary.scrubbed.push(
+        note === '' ? AGENTS_FLOOR_REL : `${AGENTS_FLOOR_REL} (scrubbed; ${note})`,
+      );
+    }
+    // totem-context: intentional cleanup — per-file best-effort like scrubReflexFiles; a locked or unreadable AGENTS.md degrades to a reported skip, never an abort that strands the remaining eject steps
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    summary.skipped.push(`${AGENTS_FLOOR_REL} (${message})`);
+  }
+}
+
+/**
  * Remove the AI Integration block appended by `totem init` to reflex files.
  *
  * Exported for the summary-contract tests (mmnto-ai/totem#2602).
@@ -1153,6 +1294,10 @@ export async function ejectCommand(options: EjectOptions): Promise<void> {
 
   // 5. Scrub distributed Claude session-utility skills (Phase C slice 3)
   await scrubClaudeSkills(cwd, summary);
+
+  // 5b. Scrub the managed AGENTS.md floor span (mmnto-ai/totem-strategy#619);
+  // the repository's own content around it stays byte-exact.
+  await scrubAgentsFloor(cwd, summary);
 
   // 6. Scrub AI reflex blocks from markdown files. An EJECT_FAILED throw here
   // (the Tenet-4 backstop — and ONLY it, round 2 F1) is DEFERRED past step 7

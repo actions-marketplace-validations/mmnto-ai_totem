@@ -2942,6 +2942,317 @@ export const DISTRIBUTED_CLAUDE_SKILLS = [
   { name: 'review-loop', content: REVIEW_LOOP_SKILL_CONTENT },
 ] as const;
 
+// ─── The public AGENTS.md floor (mmnto-ai/totem-strategy#619 design v1 § 1) ──
+// The product-valid instruction set any consumer gets from `totem init`: a
+// marker-bounded managed span (`AGENTS_FLOOR_BLOCK`) that later inits refresh in
+// place, inside a file whose every other byte is the repository's own. The span
+// is written for ANY consumer, so it names no private repository, no deployment,
+// no operator, no doctrine tag and no agent vendor list — the sterility test in
+// `agents-floor-sterility.test.ts` holds it to that, and holds this repository's
+// committed AGENTS.md to carrying the span byte-identically (the "sterile floor
+// IS the init scaffold" product test the issue names).
+
+export const AGENTS_FLOOR_REL = 'AGENTS.md';
+export const AGENTS_FLOOR_START = '<!-- totem:agents-floor:start -->';
+export const AGENTS_FLOOR_END = '<!-- totem:agents-floor:end -->';
+
+/**
+ * The managed span, start marker through end marker, with NO trailing newline:
+ * a refresh replaces exactly the bytes from the start marker through the end
+ * marker, so everything around the span (the line terminator after it included)
+ * is untouched and a second refresh is a byte no-op.
+ */
+export const AGENTS_FLOOR_BLOCK = `${AGENTS_FLOOR_START}
+<!-- Managed by \`totem init\`: the span between these markers is refreshed in place; everything outside it is yours. -->
+
+## Session start
+
+1. Run \`totem status\` for health.
+2. **Never guess architecture.** Before modifying a core system, run \`totem search <system>\`.
+3. Before writing code, call \`search_knowledge\` describing what you are changing.
+4. Do not push speculative fixes: run \`totem lint\` locally and front-load every check before the first push.
+5. Cold start (no session hook injected orientation): derive it with \`totem orient\`, after \`/signon\`'s seat and assignment-mail steps where that skill is installed.
+
+## Working rules
+
+- Before pushing: your formatter, then \`totem lint\` (the enforcement floor), then \`totem review\` where configured (advisory lanes, never a merge gate).
+- After a PR merges: \`totem lesson extract <pr> --yes\`.
+- **Never bypass a quality gate without a ticket.** No \`--no-verify\`, \`totem-ignore\`, \`eslint-disable\`, \`@ts-ignore\`, skipped tests, or ignore patterns added to pacify CI; a suppression carries a ticket reference.
+- After roughly 15 turns of code changes: run \`totem status\`, re-query the knowledge index for the system you are modifying, and state your architectural assumption.
+- **Controller, not implementer.** Delegate build-and-test cycles to background agents; keep this thread for decisions.
+
+## Review bots
+
+If this repository uses review bots: review triggers are the maintainer's to post, never an agent's. Reply to findings through \`/review-reply\`, one dispositions comment per round, and never cite a commit before it is pushed.
+
+## Installed skills
+
+Where \`totem init\` installs the \`/signon\`, \`/signoff\`, \`/review-reply\` and \`/review-loop\` skills, every later \`totem init\` refreshes each one's managed span and keeps what you add below its end marker.
+
+${AGENTS_FLOOR_END}`;
+
+/** The line terminator a file uses: CRLF when it carries any, else LF. */
+export function detectEol(content: string): '\r\n' | '\n' {
+  return content.includes('\r\n') ? '\r\n' : '\n';
+}
+
+/** The canonical span rendered in a file's own line terminator. */
+export function agentsFloorBlockFor(eol: '\r\n' | '\n'): string {
+  return eol === '\n' ? AGENTS_FLOOR_BLOCK : AGENTS_FLOOR_BLOCK.replace(/\n/g, '\r\n');
+}
+
+/**
+ * The fence scan: byte ranges of CLOSED fenced code blocks (``` or ~~~ fences,
+ * CommonMark's two shapes, opened at most three SPACES in — a tab-indented
+ * fence line is indented code, not a fence; a closer must use the same
+ * character and be at least as long), `end` exclusive, plus the position of an
+ * opener no closer answered (`null` when the fences balance). A floor marker
+ * quoted inside a closed fence is prose about the marker, never the marker —
+ * the adoption hint tells a maintainer to add the two lines, which is exactly
+ * what invites quoting them. Below an UNCLOSED opener the text is undecidable
+ * by a scan: a quotation the author never closed, or a real span under a stray
+ * fence line — one reading deletes a quotation, the other hides a span (two
+ * legs' mirror findings). Neither tool guesses: markers there are AMBIGUOUS,
+ * never paired, and both tools name the fence so the maintainer can close it.
+ *
+ * Three CommonMark rules the scan honours so a quoted example is read the way
+ * a renderer reads it: a closing fence carries no info string (a ```sh line
+ * never closes an open block — it is text inside it); a multi-line HTML
+ * comment (a line-initial `<!--` whose line carries no `-->`, through the
+ * first line that does) is raw HTML, so a fence-looking line inside it is not
+ * a fence and a floor marker inside it is not a marker; and a `<!--` inside an
+ * open fence is the fence's content. Markers a comment swallows, and markers
+ * below an unclosed fence or comment opener, are ambiguous: excluded from
+ * pairing and named by `agentsFloorAmbiguousFenceLine`, never silently prose.
+ *
+ * Disclosed limit: this is a line scan for two block kinds, not a markdown
+ * parser. A fence-looking line inside any OTHER raw HTML block (a `<div>` …
+ * `</div>` wrapper, say) is still counted here, and an odd number of such
+ * lines shifts the pairing of every fence below them. The wiki tells
+ * maintainers to keep fence-looking lines out of raw HTML in AGENTS.md.
+ */
+function scanFences(content: string): {
+  /** Closed fenced code blocks, opener line start through closer line end. */
+  ranges: Array<{ start: number; end: number }>;
+  /** Closed multi-line HTML comment blocks, opener line start through the line carrying `-->`. */
+  comments: Array<{ start: number; end: number }>;
+  /** A fence opener no closer answered, else `null`. */
+  unclosedAt: number | null;
+  /** A multi-line comment opener no `-->` answered, else `null`. */
+  unclosedCommentAt: number | null;
+} {
+  // One sequential pass over the lines, the way a block parser reads them: a
+  // fence opener owns every line until its closer (a `<!--` inside it is
+  // content), a multi-line comment opener owns every line until the first
+  // `-->` (a fence-looking line inside it is content). Neither pass can be
+  // computed from the other's output, which is why this is not two regexes.
+  const ranges: Array<{ start: number; end: number }> = [];
+  const comments: Array<{ start: number; end: number }> = [];
+  let state:
+    | { kind: 'fence'; at: number; marker: string }
+    | { kind: 'comment'; at: number }
+    | null = null;
+  let lineStart = 0;
+  while (lineStart <= content.length) {
+    const nl = content.indexOf('\n', lineStart);
+    const lineEnd = nl === -1 ? content.length : nl + 1;
+    const line = content.slice(lineStart, nl === -1 ? content.length : nl).replace(/\r$/, '');
+    if (state === null) {
+      const opener = /^[ ]{0,3}(`{3,}|~{3,})/.exec(line);
+      if (opener !== null) {
+        state = { kind: 'fence', at: lineStart, marker: opener[1]! };
+      } else if (/^[ ]{0,3}<!--/.test(line) && !line.includes('-->')) {
+        state = { kind: 'comment', at: lineStart };
+      }
+    } else if (state.kind === 'fence') {
+      const closer = /^[ ]{0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+      if (
+        closer !== null &&
+        closer[1]![0] === state.marker[0] &&
+        closer[1]!.length >= state.marker.length
+      ) {
+        ranges.push({ start: state.at, end: lineEnd });
+        state = null;
+      }
+    } else if (line.includes('-->')) {
+      comments.push({ start: state.at, end: lineEnd });
+      state = null;
+    }
+    if (nl === -1) break;
+    lineStart = lineEnd;
+  }
+  return {
+    ranges,
+    comments,
+    unclosedAt: state !== null && state.kind === 'fence' ? state.at : null,
+    unclosedCommentAt: state !== null && state.kind === 'comment' ? state.at : null,
+  };
+}
+
+/** The code point of the byte-order mark a UTF-8 editor may leave at byte 0. */
+const BOM_CODE_POINT = 0xfeff;
+
+/**
+ * The whole-line predicate, stated once: `marker` at `at` in `content` is a
+ * whole line when its line carries at most three leading spaces (CommonMark's
+ * HTML-block indent; four make an indented code block, which is prose), the
+ * marker, and trailing blanks before LF, CRLF or the end of the file. A
+ * byte-order mark before a marker on line 1 is tolerated. A file whose lines
+ * end in a bare CR (old-Mac terminators) has no whole lines by this rule and is
+ * therefore never touched — a disclosed limit, not a guess.
+ */
+function isWholeLineMarker(content: string, at: number, marker: string): boolean {
+  const lineBegin = content.lastIndexOf('\n', at - 1) + 1;
+  const prefix = content.slice(lineBegin, at);
+  const afterBom = lineBegin === 0 && content.charCodeAt(0) === BOM_CODE_POINT;
+  const lineStart = /^[ ]{0,3}$/.test(afterBom ? prefix.slice(1) : prefix);
+  const lineEnd = /^[ \t]*(?:\r?\n|$)/.test(content.slice(at + marker.length));
+  return lineStart && lineEnd;
+}
+
+/**
+ * Every position of `marker` in `content` that counts as a marker: a whole
+ * line (see `isWholeLineMarker`) that is neither inside a closed fenced code
+ * block nor below an unclosed fence opener (ambiguous, see `scanFences`). The
+ * scaffold writes markers at column 0 as whole lines and the adoption hint
+ * asks for whole lines, so a marker quoted in an inline code span, mentioned
+ * mid-sentence, or sitting in an indented code block is prose and never pairs.
+ */
+export function agentsFloorMarkerPositions(content: string, marker: string): number[] {
+  const { ranges, comments, unclosedAt, unclosedCommentAt } = scanFences(content);
+  const positions: number[] = [];
+  let at = content.indexOf(marker);
+  while (at !== -1) {
+    const fenced = ranges.some((r) => at >= r.start && at < r.end);
+    // A marker inside a multi-line comment block is that block's content (a
+    // renderer never sees it as markup); a marker below an unclosed fence or
+    // comment opener is ambiguous. Both are excluded, and both are named by
+    // `agentsFloorAmbiguousFenceLine` so the exclusion is never silent.
+    const commented =
+      comments.some((c) => at >= c.start && at < c.end) ||
+      (unclosedCommentAt !== null && at > unclosedCommentAt);
+    const ambiguous = unclosedAt !== null && at > unclosedAt;
+    if (isWholeLineMarker(content, at, marker) && !fenced && !commented && !ambiguous) {
+      positions.push(at);
+    }
+    at = content.indexOf(marker, at + marker.length);
+  }
+  return positions;
+}
+
+/**
+ * Where an unclosed fence opener, an unclosed HTML comment opener, or a
+ * closed multi-line HTML comment swallows floor markers: the 1-based line of
+ * the earliest such opener that has at least one whole-line marker (start or
+ * end) inside or below it, else `null`. Both tools name it instead of
+ * guessing — computed on the text they are about to leave on disk, so the line
+ * is right after a refresh or a scrub above it moved it.
+ */
+export function agentsFloorAmbiguousFenceLine(content: string): number | null {
+  const { comments, unclosedAt, unclosedCommentAt } = scanFences(content);
+  const hasMarkerIn = (from: number, to: number): boolean =>
+    [AGENTS_FLOOR_START, AGENTS_FLOOR_END].some((marker) => {
+      let at = content.indexOf(marker, from);
+      while (at !== -1 && at < to) {
+        if (isWholeLineMarker(content, at, marker)) return true;
+        at = content.indexOf(marker, at + marker.length);
+      }
+      return false;
+    });
+  const candidates: number[] = [];
+  if (unclosedAt !== null && hasMarkerIn(unclosedAt, content.length)) candidates.push(unclosedAt);
+  if (unclosedCommentAt !== null && hasMarkerIn(unclosedCommentAt, content.length)) {
+    candidates.push(unclosedCommentAt);
+  }
+  for (const c of comments) {
+    if (hasMarkerIn(c.start, c.end)) candidates.push(c.start);
+  }
+  if (candidates.length === 0) return null;
+  const earliest = Math.min(...candidates);
+  return content.slice(0, earliest).split('\n').length;
+}
+
+/**
+ * The line terminator to render a span in: the one the bytes OUTSIDE the span
+ * use (the span is about to be replaced, so its own endings must not decide
+ * the file's), falling back to the whole file's when nothing outside the span
+ * carries a terminator at all (a file that is nothing but the span keeps its
+ * own endings, so it stays a byte no-op). Disclosed limit: "outside" is the
+ * whole file minus THIS span, so in a file that mixes terminators between two
+ * spans the other span's endings weigh in — a file with two managed spans is
+ * already broken (init names it), and a file mixing CRLF and LF outside the
+ * span is converged toward whichever terminator it carries, not preserved
+ * byte-for-byte.
+ */
+export function eolOutsideSpan(
+  content: string,
+  span: { start: number; end: number },
+): '\r\n' | '\n' {
+  const outside = content.slice(0, span.start) + content.slice(span.end);
+  return outside.includes('\n') ? detectEol(outside) : detectEol(content);
+}
+
+/**
+ * Locate one complete managed span in `content`, searching from `from`: the
+ * FIRST end marker at or after `from`, paired END-anchored with the LAST start
+ * marker before it and at or after `from` — the reflex scrub's pairing
+ * (mmnto-ai/totem#2602), so an orphan start marker sitting above a complete
+ * span never widens it, the bytes between an orphan and the real span stay the
+ * repository's, and a caller that advances `from` past what it has already
+ * handled can never re-pair an orphan it left behind. Markers inside closed
+ * fenced code blocks are prose and never pair; markers below an unclosed fence
+ * opener are ambiguous and never pair either (the callers name the fence, see
+ * `agentsFloorAmbiguousFenceLine`). `null` when no complete pair exists at or
+ * after `from`. `end` is exclusive and includes the end-marker line's trailing
+ * blanks.
+ */
+export function locateAgentsFloorSpan(
+  content: string,
+  from = 0,
+): { start: number; end: number } | null {
+  const starts = agentsFloorMarkerPositions(content, AGENTS_FLOOR_START);
+  const ends = agentsFloorMarkerPositions(content, AGENTS_FLOOR_END);
+  for (const endIdx of ends) {
+    if (endIdx < from) continue;
+    // The last start marker before this end marker, and not before `from`.
+    let startIdx = -1;
+    for (const s of starts) {
+      if (s >= from && s < endIdx) startIdx = s;
+    }
+    if (startIdx !== -1) {
+      // The span is whole lines: it starts at the start-marker line's first
+      // column (a tolerated byte-order mark on line 1 stays outside it, and an
+      // indent of up to three spaces is normalized away by a refresh) and ends
+      // after the end-marker line's trailing blanks, so neither survives into
+      // the seam.
+      const lineBegin = content.lastIndexOf('\n', startIdx - 1) + 1;
+      const start = lineBegin === 0 && content.charCodeAt(0) === BOM_CODE_POINT ? 1 : lineBegin;
+      const trailing = /^[ \t]*/.exec(content.slice(endIdx + AGENTS_FLOOR_END.length))![0].length;
+      return { start, end: endIdx + AGENTS_FLOOR_END.length + trailing };
+    }
+    // An orphan end marker: keep scanning — a later complete pair is still a span.
+  }
+  return null;
+}
+
+/**
+ * The whole file `totem init` writes when a repository has no AGENTS.md yet:
+ * a title, the managed span, and a stub for the repository's own rules. Only
+ * the span is managed after this first write.
+ */
+export function renderAgentsFloorScaffold(projectName: string): string {
+  return `# ${projectName}: Agent Instructions
+
+Canonical instructions for AI coding agents working in this repository. Any agent that reads \`AGENTS.md\` starts here.
+
+${AGENTS_FLOOR_BLOCK}
+
+## Repository conventions
+
+Add this repository's own rules here: environment, branching, code style, publishing. Everything outside the markers above is yours; \`totem init\` never rewrites it.
+`;
+}
+
 // ─── Config generation ──────────────────────────────────
 
 export async function generateConfig(
