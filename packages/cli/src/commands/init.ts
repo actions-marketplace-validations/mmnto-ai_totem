@@ -4,6 +4,10 @@ import * as path from 'node:path';
 import { z } from 'zod';
 
 import type { IngestTarget } from '@mmnto/totem';
+// Subpath import, NOT the core barrel: fs-atomic pulls only node builtins, so
+// the no-eager-core-load shape holds (the same seam eject.ts uses for the
+// same file — a user-owned AGENTS.md is written by temp-file-and-rename only).
+import { writeFileAtomicSync } from '@mmnto/totem/fs-atomic';
 
 // Type-only (fully erased): the `--gates=` path still loads `gate-install.js`
 // lazily inside the handler, so ADR-072 §3's no-eager-core-load shape holds.
@@ -23,6 +27,12 @@ import {
   type HookInstallerResult,
 } from './init-detect.js';
 import {
+  AGENTS_FLOOR_END,
+  AGENTS_FLOOR_REL,
+  AGENTS_FLOOR_START,
+  agentsFloorAmbiguousFenceLine,
+  agentsFloorBlockFor,
+  agentsFloorMarkerPositions,
   AI_PROMPT_BLOCK,
   CLAUDE_PRETOOLUSE_ENTRY,
   CLAUDE_PREWRITESHIELD,
@@ -30,6 +40,7 @@ import {
   CLAUDE_SESSION_START,
   CLAUDE_SESSION_START_ENTRY,
   DISTRIBUTED_CLAUDE_SKILLS,
+  eolOutsideSpan,
   GEMINI_BEFORE_TOOL,
   GEMINI_BEFORE_TOOL_REL,
   GEMINI_SESSION_START,
@@ -37,6 +48,7 @@ import {
   GEMINI_SKILL,
   isBoundedOwnedFile,
   LEGACY_SENTINEL,
+  locateAgentsFloorSpan,
   markerOpensFile,
   PREPARE_SCRIPT_COMMAND,
   PREPARE_SCRIPT_REL,
@@ -45,6 +57,7 @@ import {
   REFLEX_START,
   REFLEX_VERSION,
   REFLEX_VERSION_RE,
+  renderAgentsFloorScaffold,
   SKILL_MARKER_END,
   SKILL_MARKER_START,
   TOTEM_FILE_END,
@@ -698,6 +711,159 @@ export function scaffoldClaudeSkill(
     fs.writeFileSync(filePath, merged, 'utf-8');
     return { action: 'refreshed' };
     // totem-context: intentional cleanup — preserve user's skill file on any IO failure rather than aborting init mid-flight; mirrors scaffoldFile's failure posture
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { action: 'preserved', err: `[Totem Error] ${message}` };
+  }
+}
+
+/**
+ * The project name the AGENTS.md scaffold's title carries: the package name
+ * with any npm scope stripped, else the directory basename, else `Project`.
+ * Read-only; a missing or unparseable package.json falls back to the basename.
+ * The value lands on a markdown heading line, so whitespace (a newline in a
+ * hand-edited name included) collapses to one space and an empty result falls
+ * through — a title is never empty and never mints a second heading.
+ */
+export function deriveProjectName(cwd: string): string {
+  const pkgPath = path.join(cwd, 'package.json');
+  try {
+    if (fs.existsSync(pkgPath)) {
+      const parsed: unknown = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+      if (parsed !== null && typeof parsed === 'object') {
+        const name = (parsed as { name?: unknown }).name;
+        if (typeof name === 'string') {
+          const bare = name
+            .trim()
+            .replace(/^@[^/]+\//, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+          if (bare !== '') return bare;
+        }
+      }
+    }
+    // totem-context: fail-soft backstop=deriveProjectName-basename — a title string, never load-bearing; the directory basename is the honest fallback for any read or parse failure
+  } catch {
+    /* fall through to the basename */
+  }
+  const base = path.basename(cwd).replace(/\s+/g, ' ').trim();
+  return base === '' ? 'Project' : base;
+}
+
+/**
+ * Scaffold or refresh the public AGENTS.md floor (mmnto-ai/totem-strategy#619
+ * design v1 § 1 — the sterile floor IS the init scaffold).
+ *
+ * - `created` — no AGENTS.md existed; the whole scaffold (title + managed
+ *   span + repository stub) was written.
+ * - `refreshed` — the file carried a complete span (the first end marker,
+ *   paired END-anchored with the last start marker before it — an orphan start
+ *   marker above the span never widens it) and the span differed from
+ *   canonical, rendered in the file's own line terminator; exactly the bytes
+ *   from that start marker through that end marker were replaced, everything
+ *   else untouched.
+ * - `unchanged` — a complete span, already canonical (byte no-op).
+ * - `preserved` — no complete span: the file is the repository's own (no
+ *   markers), or carries an unpaired marker that cannot be attributed. Never
+ *   rewritten. `err` carries the one-line hint the caller may disclose.
+ *
+ * A second complete span after the first is left as it is and named in `err`
+ * beside `refreshed` / `unchanged` — two managed spans is a broken file, and
+ * canonicalizing both would hide that.
+ */
+export function scaffoldAgentsFloor(
+  cwd: string,
+  projectName: string,
+): {
+  action: 'created' | 'refreshed' | 'unchanged' | 'preserved';
+  err?: string;
+  /** The 1-based line of an unclosed code fence with floor markers below it (ambiguous, untouched). */
+  fenceLine?: number;
+} {
+  const filePath = path.join(cwd, AGENTS_FLOOR_REL);
+  try {
+    if (!fs.existsSync(filePath)) {
+      writeFileAtomicSync(filePath, renderAgentsFloorScaffold(projectName));
+      return { action: 'created' };
+    }
+    // Same guard as the eject and reflex scrubs: a file that does not
+    // round-trip through UTF-8 cannot be rewritten without substituting U+FFFD
+    // into the bytes outside the span, which the contract promises to keep.
+    const rawExisting = fs.readFileSync(filePath);
+    const existing = rawExisting.toString('utf-8');
+    if (Buffer.compare(Buffer.from(existing, 'utf-8'), rawExisting) !== 0) {
+      return {
+        action: 'preserved',
+        err: `${AGENTS_FLOOR_REL} is not valid UTF-8 — left untouched (a refresh decodes and rewrites the whole file, and bytes it cannot decode would not survive); convert the file to UTF-8 and re-run \`totem init\`.`,
+      };
+    }
+    const span = locateAgentsFloorSpan(existing);
+    // The one hint every stray-marker path carries, because it is the contract:
+    // a start marker followed by an end marker IS a managed span by definition,
+    // so text between stray markers would be refreshed or ejected as one.
+    const contract =
+      'a start marker followed by an end marker is a managed span by definition, and text between stray markers would be refreshed or ejected as one';
+    // The fence hint is computed on the text left on disk, so the line it
+    // names is right even when a refresh above the fence moved it.
+    const fenceHintFor = (text: string): { line: number | null; hint: string | undefined } => {
+      const line = agentsFloorAmbiguousFenceLine(text);
+      return {
+        line,
+        hint:
+          line === null
+            ? undefined
+            : `${AGENTS_FLOOR_REL} has an unclosed code fence or an HTML comment (opened at line ${line}) with floor markers inside or below it, which makes them ambiguous — a quotation never closed, a comment that swallows a marker, or a real span under a stray opener. Nothing from that line on is touched: close the fence or the comment, then re-run \`totem init\` (if you remove the opener line instead, ${contract}).`,
+      };
+    };
+    const compose = (
+      action: 'refreshed' | 'unchanged' | 'preserved',
+      text: string,
+      ...hints: Array<string | undefined>
+    ): { action: typeof action; err?: string; fenceLine?: number } => {
+      const fence = fenceHintFor(text);
+      const all = [...hints, fence.hint].filter((h): h is string => h !== undefined);
+      const result: { action: typeof action; err?: string; fenceLine?: number } = { action };
+      if (all.length > 0) result.err = all.join(' ');
+      if (fence.line !== null) result.fenceLine = fence.line;
+      return result;
+    };
+    if (span === null) {
+      // A marker quoted inside a closed fenced code block is prose, not an
+      // unpaired marker; below an unclosed fence it is ambiguous, named by the
+      // fence hint. A stray marker ABOVE such a fence is still a stray marker
+      // and gets its own hint beside the fence's.
+      const hasMarker =
+        agentsFloorMarkerPositions(existing, AGENTS_FLOOR_START).length +
+          agentsFloorMarkerPositions(existing, AGENTS_FLOOR_END).length >
+        0;
+      const fence = fenceHintFor(existing);
+      return compose(
+        'preserved',
+        existing,
+        hasMarker
+          ? `${AGENTS_FLOOR_REL} carries an unpaired \`${AGENTS_FLOOR_START}\` / \`${AGENTS_FLOOR_END}\` marker — left untouched. Remove it (do not pair it around your own text): ${contract}. Then re-run \`totem init\`.`
+          : fence.line === null
+            ? `${AGENTS_FLOOR_REL} is yours (no \`${AGENTS_FLOOR_START}\` … \`${AGENTS_FLOOR_END}\` span) — left untouched; add the two marker lines (each on its own line, at most three spaces of indent, ending in LF or CRLF) where the managed floor should sit and re-run \`totem init\` to adopt it.`
+            : undefined,
+      );
+    }
+    const canonical = agentsFloorBlockFor(eolOutsideSpan(existing, span));
+    const merged = existing.slice(0, span.start) + canonical + existing.slice(span.end);
+    // Extra markers outside the span — a second complete span, or an unpaired
+    // start or end marker the pairing left alone — are named, never touched.
+    const extraMarkers =
+      agentsFloorMarkerPositions(merged, AGENTS_FLOOR_START).length +
+        agentsFloorMarkerPositions(merged, AGENTS_FLOOR_END).length >
+      2;
+    const extraHint = extraMarkers
+      ? `${AGENTS_FLOOR_REL} carries floor markers outside the managed span (a second span or an unpaired marker) — only the first span is managed. Remove the others now: ${contract}.`
+      : undefined;
+    if (merged === existing) {
+      return compose('unchanged', existing, extraHint);
+    }
+    writeFileAtomicSync(filePath, merged);
+    return compose('refreshed', merged, extraHint);
+    // totem-context: intentional cleanup — preserve the repository's AGENTS.md on any IO failure rather than aborting init mid-flight; mirrors scaffoldClaudeSkill's failure posture
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     return { action: 'preserved', err: `[Totem Error] ${message}` };
@@ -1585,6 +1751,36 @@ export default {
         baselineRuleCount = Array.isArray(existing?.rules) ? existing.rules.length : 0;
       } catch {
         // Parse failure — leave count as 0
+      }
+    }
+
+    // --- Every mode: the public AGENTS.md floor (mmnto-ai/totem-strategy#619) ---
+    // Vendor-neutral and tool-independent, so it runs in bare mode too and
+    // whether or not any AI tool was detected or selected. A repository's own
+    // AGENTS.md (no floor markers) is never rewritten (Prop 289); the no-op is
+    // disclosed once, dimly, so a consumer who wants the managed span knows how
+    // to adopt it.
+    const floor = scaffoldAgentsFloor(cwd, deriveProjectName(cwd));
+    if (floor.action === 'created') {
+      summary.push({ file: AGENTS_FLOOR_REL, action: 'Scaffolded the AGENTS.md floor' });
+    } else if (floor.action === 'refreshed') {
+      summary.push({ file: AGENTS_FLOOR_REL, action: 'Refreshed the managed AGENTS.md span' });
+    }
+    if (floor.fenceLine !== undefined) {
+      // A managed floor that has stopped refreshing must be as loud as a
+      // refresh: a summary row, not only the dim hint line.
+      summary.push({
+        file: AGENTS_FLOOR_REL,
+        action: `Floor markers inside or below an unclosed code fence or an HTML comment (line ${floor.fenceLine}) are ambiguous — nothing from that line on was touched; close it`,
+      });
+    }
+    if (floor.err) {
+      if (floor.err.startsWith('[Totem Error]')) {
+        log.error('Totem Error', `AGENTS.md floor scaffolding failed: ${floor.err}`); // totem-ignore — internal scaffold error, not LLM output
+      } else {
+        // The preserved-file hint, the unpaired-marker hint, or the second-span
+        // hint beside a refresh — each a no-op the user must be able to see.
+        log.dim('Totem', floor.err);
       }
     }
 

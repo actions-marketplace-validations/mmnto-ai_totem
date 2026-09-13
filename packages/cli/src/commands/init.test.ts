@@ -6,6 +6,19 @@ import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vitest';
 
 import type { IngestTarget } from '@mmnto/totem';
+
+// Failure-injection seam for the shared atomic writer, the same shape
+// eject.test.ts carries: passthrough to the REAL helper unless a test arms a
+// failure, so every fixture keeps exercising real temp-file-and-rename writes.
+const atomicControl: { failAll?: Error } = {};
+vi.mock('@mmnto/totem/fs-atomic', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@mmnto/totem/fs-atomic')>();
+  const writeFileAtomicSync = ((...args: Parameters<typeof actual.writeFileAtomicSync>) => {
+    if (atomicControl.failAll) throw atomicControl.failAll;
+    return actual.writeFileAtomicSync(...args);
+  }) as typeof actual.writeFileAtomicSync;
+  return { ...actual, writeFileAtomicSync };
+});
 import { AUTO_CLOSE_REGEX_SOURCE, LedgerEventSchema, resolveSelfAgents } from '@mmnto/totem';
 
 import {
@@ -16,6 +29,7 @@ import {
 import { cleanTmpDir } from '../test-utils.js';
 import {
   buildNpxCommand,
+  deriveProjectName,
   detectEmbeddingTier,
   detectReflexStatus,
   findUnownedHookSibling,
@@ -27,6 +41,7 @@ import {
   probeOllamaFloor,
   REFLEX_VERSION,
   resolveToolSelection,
+  scaffoldAgentsFloor,
   scaffoldClaudeHooks,
   scaffoldClaudeSessionStart,
   scaffoldClaudeSkill,
@@ -37,6 +52,9 @@ import {
 } from './init.js';
 import { detectProject } from './init-detect.js';
 import {
+  AGENTS_FLOOR_BLOCK,
+  AGENTS_FLOOR_END,
+  AGENTS_FLOOR_START,
   AI_PROMPT_BLOCK,
   BARE_REF_REGEX_SOURCE,
   CLAUDE_PREWRITESHIELD,
@@ -47,6 +65,7 @@ import {
   GEMINI_BEFORE_TOOL,
   GEMINI_SESSION_START,
   generateConfigForFormat,
+  renderAgentsFloorScaffold,
   REVIEW_LOOP_SKILL_CONTENT,
   REVIEW_REPLY_SKILL_CONTENT,
   SIGNOFF_SKILL_CONTENT,
@@ -4237,5 +4256,478 @@ describe('Distributed skill constants match source-of-truth (mmnto-ai/totem#1890
     expect(dryAt).toBeGreaterThanOrEqual(0);
     expect(applyAt).toBeGreaterThanOrEqual(0);
     expect(dryAt).toBeLessThan(applyAt);
+  });
+});
+
+// ─── The public AGENTS.md floor (mmnto-ai/totem-strategy#619) ─────────
+
+describe('deriveProjectName', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-floor-name-'));
+  });
+
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  it('strips the npm scope from package.json name', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"@acme/widgets"}');
+    expect(deriveProjectName(tmpDir)).toBe('widgets');
+  });
+
+  it('keeps an unscoped name as written', () => {
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"widgets"}');
+    expect(deriveProjectName(tmpDir)).toBe('widgets');
+  });
+
+  it('falls back to the directory basename without a package.json, or with an unparseable or nameless one', () => {
+    expect(deriveProjectName(tmpDir)).toBe(path.basename(tmpDir));
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{not json');
+    expect(deriveProjectName(tmpDir)).toBe(path.basename(tmpDir));
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"   "}');
+    expect(deriveProjectName(tmpDir)).toBe(path.basename(tmpDir));
+  });
+
+  it('never returns an empty title and never mints a second heading', () => {
+    // A scope with nothing after it strips to nothing — fall through to the basename.
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"@acme/"}');
+    expect(deriveProjectName(tmpDir)).toBe(path.basename(tmpDir));
+    // Whitespace, a newline included, collapses to one space on the heading line.
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"evil\\n# Injected  Heading"}');
+    expect(deriveProjectName(tmpDir)).toBe('evil # Injected Heading');
+    expect(renderAgentsFloorScaffold(deriveProjectName(tmpDir)).split('\n')[0]).toBe(
+      '# evil # Injected Heading: Agent Instructions',
+    );
+  });
+});
+
+describe('scaffoldAgentsFloor', () => {
+  let tmpDir: string;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'totem-floor-'));
+  });
+
+  afterEach(() => {
+    cleanTmpDir(tmpDir);
+  });
+
+  const agentsPath = () => path.join(tmpDir, 'AGENTS.md');
+
+  it('creates the whole scaffold when no AGENTS.md exists', () => {
+    expect(scaffoldAgentsFloor(tmpDir, 'widgets')).toEqual({ action: 'created' });
+    const written = fs.readFileSync(agentsPath(), 'utf-8');
+    expect(written).toBe(renderAgentsFloorScaffold('widgets'));
+    expect(written.startsWith('# widgets: Agent Instructions')).toBe(true);
+    expect(written).toContain(AGENTS_FLOOR_BLOCK);
+  });
+
+  it('is a byte no-op on its own scaffold (unchanged)', () => {
+    scaffoldAgentsFloor(tmpDir, 'widgets');
+    const before = fs.readFileSync(agentsPath(), 'utf-8');
+    expect(scaffoldAgentsFloor(tmpDir, 'widgets')).toEqual({ action: 'unchanged' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(before);
+  });
+
+  it('refreshes exactly the span between the markers and keeps every other byte', () => {
+    const above = '# Mine\n\nMy intro stays.\n\n';
+    const below = '\n\n## My rules\n\n- keep this\n';
+    const stale = `${AGENTS_FLOOR_START}\nold managed text\n${AGENTS_FLOOR_END}`;
+    fs.writeFileSync(agentsPath(), above + stale + below, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'ignored')).toEqual({ action: 'refreshed' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(above + AGENTS_FLOOR_BLOCK + below);
+    // A second pass is a no-op on the refreshed file.
+    expect(scaffoldAgentsFloor(tmpDir, 'ignored')).toEqual({ action: 'unchanged' });
+  });
+
+  it('preserves a repository-authored AGENTS.md that carries no markers, with the adoption hint', () => {
+    const mine = '# Mine\n\nAll of this is user content.\n';
+    fs.writeFileSync(agentsPath(), mine, 'utf-8');
+    const result = scaffoldAgentsFloor(tmpDir, 'widgets');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain(AGENTS_FLOOR_START);
+    expect(result.err).toContain('re-run `totem init`');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(mine);
+  });
+
+  it.each([
+    ['only a start marker', `# Mine\n${AGENTS_FLOOR_START}\ntext\n`],
+    ['only an end marker', `# Mine\ntext\n${AGENTS_FLOOR_END}\n`],
+    ['inverted markers', `# Mine\n${AGENTS_FLOOR_END}\ntext\n${AGENTS_FLOOR_START}\n`],
+  ])('preserves a file with %s byte-untouched', (_name, content) => {
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+    expect(scaffoldAgentsFloor(tmpDir, 'widgets').action).toBe('preserved');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it("the managed span carries no trailing newline, so the seam after the end marker is the file's own", () => {
+    expect(AGENTS_FLOOR_BLOCK.startsWith(AGENTS_FLOOR_START)).toBe(true);
+    expect(AGENTS_FLOOR_BLOCK.endsWith(AGENTS_FLOOR_END)).toBe(true);
+    expect(AGENTS_FLOOR_BLOCK.indexOf(AGENTS_FLOOR_START)).toBe(
+      AGENTS_FLOOR_BLOCK.lastIndexOf(AGENTS_FLOOR_START),
+    );
+    expect(AGENTS_FLOOR_BLOCK.indexOf(AGENTS_FLOOR_END)).toBe(
+      AGENTS_FLOOR_BLOCK.lastIndexOf(AGENTS_FLOOR_END),
+    );
+  });
+
+  // ─── Pairing and line endings (the fold of the pre-merge leg's F2/F4/F5/F16) ──
+
+  it('an orphan start marker above the span never widens the refresh — the bytes between stay', () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nMY OWN TEXT\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n\n## Keep\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x').action).toBe('refreshed');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_START}\nMY OWN TEXT\n${AGENTS_FLOOR_BLOCK}\n\n## Keep\n`,
+    );
+  });
+
+  it('a second complete span after the first is left alone and named in err', () => {
+    const content = `# Mine\n\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n\nMID\n\n${AGENTS_FLOOR_START}\nother\n${AGENTS_FLOOR_END}\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('refreshed');
+    expect(result.err).toContain('outside the managed span');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n\n${AGENTS_FLOOR_BLOCK}\n\nMID\n\n${AGENTS_FLOOR_START}\nother\n${AGENTS_FLOOR_END}\n`,
+    );
+  });
+
+  it('an orphan end marker above a complete span is skipped, not attributed', () => {
+    const content = `# Mine\n${AGENTS_FLOOR_END}\nstill mine\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x').action).toBe('refreshed');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_END}\nstill mine\n${AGENTS_FLOOR_BLOCK}\n`,
+    );
+  });
+
+  it('a CRLF file gets the span in CRLF, converges in one write, and stays byte-stable', () => {
+    const crlfScaffold = renderAgentsFloorScaffold('x').replace(/\n/g, '\r\n');
+    fs.writeFileSync(agentsPath(), crlfScaffold, 'utf-8');
+    // Already canonical in its own line terminator: nothing to do.
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'unchanged' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(crlfScaffold);
+
+    // A drifted CRLF span is refreshed WITHOUT introducing a bare LF anywhere.
+    fs.writeFileSync(agentsPath(), crlfScaffold.replace('Never guess', 'Never GUESS'), 'utf-8');
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    const refreshed = fs.readFileSync(agentsPath(), 'utf-8');
+    expect(refreshed).toBe(crlfScaffold);
+    expect(refreshed.replace(/\r\n/g, '')).not.toContain('\n');
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'unchanged' });
+  });
+
+  // ─── The re-armed leg's shapes (G1, G2, G5, G10) ────────────────────
+
+  it('a two-orphan file: the span is refreshed, both user texts stay, and the residue is named', () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nUSER A\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\nUSER C\n${AGENTS_FLOOR_END}\ntail\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('refreshed');
+    expect(result.err).toContain('outside the managed span');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n${AGENTS_FLOOR_START}\nUSER A\n${AGENTS_FLOOR_BLOCK}\nUSER C\n${AGENTS_FLOOR_END}\ntail\n`,
+    );
+  });
+
+  it('markers quoted inside a fenced code block are prose: the file is preserved with the adoption hint', () => {
+    const content = `# Mine\n\nAdopt it:\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\n${AGENTS_FLOOR_END}\n\`\`\`\n\nmore mine\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('is yours');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it('a real span below a fenced quotation is the one refreshed; the quotation is untouched', () => {
+    const quoted = `\`\`\`\n${AGENTS_FLOOR_START}\n${AGENTS_FLOOR_END}\n\`\`\`\n`;
+    const content = `# Mine\n\n${quoted}\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n\n${quoted}\n${AGENTS_FLOOR_BLOCK}\n`,
+    );
+  });
+
+  it('a span that is the only CRLF in an LF file is refreshed to LF — the terminator comes from the rest of the file', () => {
+    const crlfBlock = AGENTS_FLOOR_BLOCK.replace(/\n/g, '\r\n').replace(
+      'Never guess',
+      'Never GUESS',
+    );
+    fs.writeFileSync(agentsPath(), `# Mine\n\n${crlfBlock}\n\n## Rules\n`, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    const out = fs.readFileSync(agentsPath(), 'utf-8');
+    expect(out).toBe(`# Mine\n\n${AGENTS_FLOOR_BLOCK}\n\n## Rules\n`);
+    expect(out).not.toContain('\r');
+  });
+
+  // ─── The third leg's shapes (H1, H2, H3, H4) ────────────────────────
+
+  it.each([
+    [
+      'a stray unterminated fence above a real span',
+      `# Mine\n\n\`\`\`sh\necho hi\n\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\ntail\n`,
+      3,
+    ],
+    [
+      'markers quoted in a fence that the wrong character tries to close',
+      `# Mine\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\nMY EXAMPLE\n${AGENTS_FLOOR_END}\n~~~\n\nafter\n`,
+      3,
+    ],
+    [
+      'markers quoted in a fence whose closer is indented as code',
+      `# Mine\n\n\`\`\`\n${AGENTS_FLOOR_START}\n${AGENTS_FLOOR_END}\n    \`\`\`\n\nafter\n`,
+      3,
+    ],
+  ])(
+    '%s is ambiguous: nothing below the fence is touched and the fence line is named',
+    (_name, content, line) => {
+      fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+      const result = scaffoldAgentsFloor(tmpDir, 'x');
+      expect(result.action).toBe('preserved');
+      expect(result.err).toContain(`unclosed code fence`);
+      expect(result.err).toContain(`line ${line}`);
+      expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+    },
+  );
+
+  it('a real span above an unclosed fence is refreshed and the fence below is still named', () => {
+    const content = `# Mine\n\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n\n\`\`\`\n${AGENTS_FLOOR_START}\nquoted\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('refreshed');
+    expect(result.err).toContain('unclosed code fence');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n\n${AGENTS_FLOOR_BLOCK}\n\n\`\`\`\n${AGENTS_FLOOR_START}\nquoted\n`,
+    );
+  });
+
+  it.each([1, 2, 3])(
+    'marker lines indented %s space(s) still count (an HTML block, not code)',
+    (n) => {
+      const pad = ' '.repeat(n);
+      const content = `# Mine\n\n${pad}${AGENTS_FLOOR_START}\nstale\n${pad}${AGENTS_FLOOR_END}\ntail\n`;
+      fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+      expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+      expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+        `# Mine\n\n${AGENTS_FLOOR_BLOCK}\ntail\n`,
+      );
+    },
+  );
+
+  it('a byte-order mark before a marker on line 1 is tolerated', () => {
+    const bom = String.fromCharCode(0xfeff);
+    fs.writeFileSync(
+      agentsPath(),
+      `${bom}${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\ntail\n`,
+      'utf-8',
+    );
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(`${bom}${AGENTS_FLOOR_BLOCK}\ntail\n`);
+  });
+
+  it('the unpaired-marker hint says remove, never pair, and carries the contract', () => {
+    fs.writeFileSync(
+      agentsPath(),
+      `# Mine\n${AGENTS_FLOOR_START}\nUSER TEXT I CARE ABOUT\n`,
+      'utf-8',
+    );
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('Remove it');
+    expect(result.err).not.toContain('start above end');
+    expect(result.err).toContain('a managed span by definition');
+  });
+
+  // ─── The fifth leg's shapes (K1 tab fences, K2 joined hints, K3 fresh line numbers) ──
+
+  it('a tab-indented fence line is indented code, not a fence: a closed quotation below it stays prose', () => {
+    const content = `# Mine\n\n\t\`\`\`\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\nMY EXAMPLE LINE\n${AGENTS_FLOOR_END}\n\`\`\`\n\nafter\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('is yours');
+    expect(result.fenceLine).toBeUndefined();
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it('the fence line named after a refresh is the line in the file left on disk', () => {
+    const content = `# Mine\n\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n\n\`\`\`\n${AGENTS_FLOOR_START}\nquoted\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('refreshed');
+    const written = fs.readFileSync(agentsPath(), 'utf-8');
+    const fenceLineOnDisk = written.split('\n').findIndex((l) => l === '```') + 1;
+    expect(result.fenceLine).toBe(fenceLineOnDisk);
+    expect(result.err).toContain(`opened at line ${fenceLineOnDisk}`);
+  });
+
+  it('a stray marker above an unclosed fence gets both hints: the contract and the fence', () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nstray above\n\n\`\`\`\n${AGENTS_FLOOR_END}\nbelow\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('a managed span by definition');
+    expect(result.err).toContain('unclosed code fence');
+    expect(result.fenceLine).toBe(5);
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  // ─── The bot round (greptile P1 ×3, CodeRabbit closer rule) ─────────
+
+  it('a file that is not valid UTF-8 is never rewritten — preserved with the encoding hint, bytes untouched', () => {
+    const raw = Buffer.concat([
+      Buffer.from('# Mine ', 'utf-8'),
+      Buffer.from([0xff, 0xfe, 0x0a]),
+      Buffer.from(`${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n`, 'utf-8'),
+    ]);
+    fs.writeFileSync(agentsPath(), raw);
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('not valid UTF-8');
+    expect(Buffer.compare(fs.readFileSync(agentsPath()), raw)).toBe(0);
+  });
+
+  it('a write failure leaves the original bytes intact and reports preserved with the error — the atomic writer is the seam', () => {
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'created' });
+    const drifted = fs.readFileSync(agentsPath(), 'utf-8').replace('Never guess', 'Never GUESS');
+    fs.writeFileSync(agentsPath(), drifted);
+    atomicControl.failAll = new Error('EACCES: simulated');
+    try {
+      const result = scaffoldAgentsFloor(tmpDir, 'x');
+      expect(result.action).toBe('preserved');
+      expect(result.err).toContain('[Totem Error]');
+      expect(result.err).toContain('EACCES: simulated');
+      // Nothing was truncated: the drifted bytes are exactly as written, and
+      // no temp file was left beside them.
+      expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(drifted);
+      expect(fs.readdirSync(tmpDir)).toEqual(['AGENTS.md']);
+    } finally {
+      atomicControl.failAll = undefined;
+    }
+    // With the seam disarmed the same refresh goes through.
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).not.toContain('Never GUESS');
+  });
+
+  it('a closing fence never carries an info string: a ```sh line leaves the quotation open, so it is ambiguous', () => {
+    const content = `# Mine\n\n\`\`\`\n${AGENTS_FLOOR_START}\nQUOTED\n${AGENTS_FLOOR_END}\n\`\`\`sh\necho\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('unclosed code fence');
+    expect(result.fenceLine).toBe(3);
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it('a fence-looking line inside an HTML comment is raw HTML: the closed quotation below it stays prose', () => {
+    const content = `# Mine\n\n<!--\n\`\`\`\n-->\n\n\`\`\`markdown\n${AGENTS_FLOOR_START}\nMY EXAMPLE\n${AGENTS_FLOOR_END}\n\`\`\`\n\nafter\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('is yours');
+    expect(result.fenceLine).toBeUndefined();
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it('a comment opener inside a fenced block is the fence content: the fence still closes and the real span below is refreshed', () => {
+    const content = `# Mine\n\n\`\`\`html\n<!-- example opener\n\`\`\`\n\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n\nafter\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(
+      `# Mine\n\n\`\`\`html\n<!-- example opener\n\`\`\`\n\n${AGENTS_FLOOR_BLOCK}\n\nafter\n`,
+    );
+  });
+
+  it('a multi-line comment that reaches a marker swallows it: ambiguous, named, nothing touched', () => {
+    // The stray `<!--` runs to the first `-->`, which is the start marker's own.
+    const content = `# Mine\n\n<!-- TODO revisit\n\n\`\`\`\n${AGENTS_FLOOR_START}\nQUOTED EXAMPLE\n${AGENTS_FLOOR_END}\n\`\`\`\n\nafter\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('HTML comment');
+    expect(result.fenceLine).toBe(3);
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it('wrapping the span in an HTML comment is named, never silently managed or silently ignored', () => {
+    const content = `# Mine\n\n<!--\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\n-->\n\nafter\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.fenceLine).toBe(3);
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it.each([
+    [
+      'markers quoted in inline code spans mid-sentence',
+      `# Mine\n\nAdd \`${AGENTS_FLOOR_START}\` and \`${AGENTS_FLOOR_END}\` to adopt.\n\nmore\n`,
+    ],
+    [
+      'markers in an indented code block',
+      `# Mine\n\n    ${AGENTS_FLOOR_START}\n    ${AGENTS_FLOOR_END}\n\nmore\n`,
+    ],
+    [
+      'a marker that shares its line with prose',
+      `# Mine\nkeep ${AGENTS_FLOOR_START}\ntext\n${AGENTS_FLOOR_END} more\n`,
+    ],
+  ])('%s are prose: the file is preserved with the adoption hint', (_name, content) => {
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('preserved');
+    expect(result.err).toContain('is yours');
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(content);
+  });
+
+  it('a marker line with trailing blanks still counts, and the blanks leave with the span', () => {
+    const content = `# Mine\n\n${AGENTS_FLOOR_START}  \nstale\n${AGENTS_FLOOR_END}\t\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'refreshed' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(`# Mine\n\n${AGENTS_FLOOR_BLOCK}\n`);
+  });
+
+  it('a file that is nothing but a CRLF span keeps its own endings (byte no-op)', () => {
+    const crlf = AGENTS_FLOOR_BLOCK.replace(/\n/g, '\r\n');
+    fs.writeFileSync(agentsPath(), crlf, 'utf-8');
+
+    expect(scaffoldAgentsFloor(tmpDir, 'x')).toEqual({ action: 'unchanged' });
+    expect(fs.readFileSync(agentsPath(), 'utf-8')).toBe(crlf);
+  });
+
+  it('the stray-marker hint says why: a start followed by an end is a span by definition', () => {
+    const content = `# Mine\n${AGENTS_FLOOR_START}\nUSER A\n${AGENTS_FLOOR_START}\nstale\n${AGENTS_FLOOR_END}\nUSER C\n${AGENTS_FLOOR_END}\n`;
+    fs.writeFileSync(agentsPath(), content, 'utf-8');
+
+    const result = scaffoldAgentsFloor(tmpDir, 'x');
+    expect(result.action).toBe('refreshed');
+    expect(result.err).toContain('a managed span by definition');
   });
 });
