@@ -1,7 +1,7 @@
 {
   "kind": "synthetic",
-  "role": "an unresolved, non-outdated bot thread denies at predicate 2",
-  "synthesizedAt": "2026-09-08T03:55:11.894Z",
+  "role": "mmnto-ai/totem#2861 — a RESOLVED bot HIGH inline still on the HEAD commit is DISCHARGED by a non-bot IN-THREAD reply after the root, with no PR-level comment at all: predicate 4 passes, highInline 0, dischargedHigh 1",
+  "synthesizedAt": "2026-09-16T00:47:11.787Z",
   "ghVersion": "gh version 2.99.0 (2026-09-01)",
   "pages": [
     {
@@ -63,7 +63,7 @@
                 },
                 "nodes": [
                   {
-                    "isResolved": false,
+                    "isResolved": true,
                     "isOutdated": false,
                     "comments": {
                       "pageInfo": {
@@ -74,10 +74,25 @@
                           "databaseId": 1001,
                           "author": {
                             "__typename": "Bot",
-                            "login": "coderabbitai"
+                            "login": "greptile-apps"
                           },
-                          "body": "nit: consider renaming this local for symmetry with the caller.",
+                          "body": "<a href=\"#\"><img alt=\"P1\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9\" align=\"top\"></a> **Null catalog mislabels selection**\n\nThe null-catalog branch sets the archetype before the catalog is checked.",
                           "createdAt": "2026-09-08T03:00:00Z",
+                          "commit": {
+                            "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                          },
+                          "originalCommit": {
+                            "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                          }
+                        },
+                        {
+                          "databaseId": 2001,
+                          "author": {
+                            "__typename": "User",
+                            "login": "satur8d"
+                          },
+                          "body": "Fixed in the resolver, seven hundred lines below the anchor — the catalog branch no longer sets it.",
+                          "createdAt": "2026-09-08T03:20:00Z",
                           "commit": {
                             "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                           },
