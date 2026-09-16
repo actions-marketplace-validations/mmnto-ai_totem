@@ -1,7 +1,7 @@
 {
   "kind": "synthetic",
-  "role": "a resolved bot thread, an outdated bot thread and an unresolved HUMAN thread never deny",
-  "synthesizedAt": "2026-09-08T03:55:11.894Z",
+  "role": "mmnto-ai/totem#2861 — the PR-level evidence sits on the SECOND comments page: page 1 carries only a bot comment and hasNextPage, page 2 (fetched with commentsAfter=CURSOR-C1) carries the non-bot disposition naming root 1001 that discharges the resolved HIGH on the head",
+  "synthesizedAt": "2026-09-16T00:47:11.787Z",
   "ghVersion": "gh version 2.99.0 (2026-09-01)",
   "pages": [
     {
@@ -24,18 +24,12 @@
                       "statusCheckRollup": {
                         "state": "SUCCESS",
                         "contexts": {
-                          "totalCount": 2,
+                          "totalCount": 1,
                           "pageInfo": {
                             "hasNextPage": false,
                             "endCursor": null
                           },
                           "nodes": [
-                            {
-                              "__typename": "CheckRun",
-                              "name": "Verify (ubuntu-latest)",
-                              "status": "COMPLETED",
-                              "conclusion": "SUCCESS"
-                            },
                             {
                               "__typename": "CheckRun",
                               "name": "Totem Lint",
@@ -76,7 +70,7 @@
                             "__typename": "Bot",
                             "login": "coderabbitai"
                           },
-                          "body": "nit: consider renaming this local for symmetry with the caller.",
+                          "body": "_📐 Maintainability & Code Quality_ | _🟠 Major_ | _⚡ Quick win_\n\n**The rethrow drops `cause`.**",
                           "createdAt": "2026-09-08T03:00:00Z",
                           "commit": {
                             "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -87,35 +81,84 @@
                         }
                       ]
                     }
-                  },
+                  }
+                ]
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": true,
+                  "endCursor": "CURSOR-C1"
+                },
+                "nodes": [
                   {
-                    "isResolved": false,
-                    "isOutdated": true,
-                    "comments": {
-                      "pageInfo": {
-                        "hasNextPage": false
-                      },
-                      "nodes": [
-                        {
-                          "databaseId": 1002,
-                          "author": {
-                            "__typename": "Bot",
-                            "login": "greptile-apps"
+                    "author": {
+                      "__typename": "Bot",
+                      "login": "coderabbitai"
+                    },
+                    "body": "## Walkthrough\n\nOne finding, one major. See the inline threads.",
+                    "createdAt": "2026-09-08T03:05:00Z"
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "exitCode": 0,
+      "body": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "number": 4242,
+              "isDraft": false,
+              "mergeStateStatus": "CLEAN",
+              "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "headRefName": "feat/example",
+              "baseRefName": "main",
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "statusCheckRollup": {
+                        "state": "SUCCESS",
+                        "contexts": {
+                          "totalCount": 1,
+                          "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
                           },
-                          "body": "nit: consider renaming this local for symmetry with the caller.",
-                          "createdAt": "2026-09-08T03:00:00Z",
-                          "commit": {
-                            "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                          },
-                          "originalCommit": {
-                            "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                          }
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Totem Lint",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS"
+                            }
+                          ]
                         }
-                      ]
+                      }
                     }
-                  },
+                  }
+                ]
+              },
+              "reviews": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "reviewThreads": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": [
                   {
-                    "isResolved": false,
+                    "isResolved": true,
                     "isOutdated": false,
                     "comments": {
                       "pageInfo": {
@@ -123,12 +166,12 @@
                       },
                       "nodes": [
                         {
-                          "databaseId": 1003,
+                          "databaseId": 1001,
                           "author": {
-                            "__typename": "User",
-                            "login": "satur8d"
+                            "__typename": "Bot",
+                            "login": "coderabbitai"
                           },
-                          "body": "I would rather keep this as is.",
+                          "body": "_📐 Maintainability & Code Quality_ | _🟠 Major_ | _⚡ Quick win_\n\n**The rethrow drops `cause`.**",
                           "createdAt": "2026-09-08T03:00:00Z",
                           "commit": {
                             "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -147,7 +190,16 @@
                   "hasNextPage": false,
                   "endCursor": null
                 },
-                "nodes": []
+                "nodes": [
+                  {
+                    "author": {
+                      "__typename": "User",
+                      "login": "satur8d"
+                    },
+                    "body": "## Round 1 disposition\n\n| # | finding | disposition |\n| --- | --- | --- |\n| 1 | the HIGH | **declined** — reason on the thread |\n\ndisposition: 1001 fixed\n\nlocal-lane: none leg: none",
+                    "createdAt": "2026-09-08T03:30:00Z"
+                  }
+                ]
               }
             }
           }

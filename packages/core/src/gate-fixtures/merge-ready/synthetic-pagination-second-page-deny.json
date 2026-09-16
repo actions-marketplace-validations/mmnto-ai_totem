@@ -66,12 +66,18 @@
                     "isResolved": false,
                     "isOutdated": false,
                     "comments": {
+                      "pageInfo": {
+                        "hasNextPage": false
+                      },
                       "nodes": [
                         {
+                          "databaseId": 1001,
                           "author": {
+                            "__typename": "User",
                             "login": "satur8d"
                           },
                           "body": "looks fine",
+                          "createdAt": "2026-09-08T03:00:00Z",
                           "commit": {
                             "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                           },
@@ -83,6 +89,13 @@
                     }
                   }
                 ]
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
               }
             }
           }
@@ -151,12 +164,18 @@
                     "isResolved": false,
                     "isOutdated": false,
                     "comments": {
+                      "pageInfo": {
+                        "hasNextPage": false
+                      },
                       "nodes": [
                         {
+                          "databaseId": 1001,
                           "author": {
+                            "__typename": "Bot",
                             "login": "coderabbitai"
                           },
                           "body": "nit: consider renaming this local for symmetry with the caller.",
+                          "createdAt": "2026-09-08T03:00:00Z",
                           "commit": {
                             "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
                           },
@@ -168,6 +187,13 @@
                     }
                   }
                 ]
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
               }
             }
           }
