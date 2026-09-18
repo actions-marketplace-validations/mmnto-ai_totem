@@ -1,0 +1,124 @@
+{
+  "kind": "synthetic",
+  "role": "mmnto-ai/totem#2879 fourth leg F2 - two same-named Actions runs where one carries no readable workflow id (workflow.databaseId null, nullable in the schema): an Actions run without a workflow id is a producer that did not read, never every Actions workflow as one producer, so the check state is unreadable (unevaluable at both tiers)",
+  "synthesizedAt": "2026-09-18T20:06:31.051Z",
+  "ghVersion": "gh version 2.99.0 (2026-09-01)",
+  "pages": [
+    {
+      "exitCode": 0,
+      "body": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "number": 4242,
+              "isDraft": false,
+              "mergeStateStatus": "CLEAN",
+              "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "headRefName": "feat/example",
+              "baseRefName": "main",
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                          "totalCount": 3,
+                          "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                          },
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Verify (ubuntu-latest)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5001,
+                              "checkSuite": {
+                                "databaseId": 7001,
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "databaseId": 9001,
+                                    "name": "CI"
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Auto-close required check (D1)",
+                              "status": "COMPLETED",
+                              "conclusion": "CANCELLED",
+                              "databaseId": 5002,
+                              "checkSuite": {
+                                "databaseId": 7002,
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "databaseId": null,
+                                    "name": "Auto-close guard"
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Auto-close required check (D1)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5003,
+                              "checkSuite": {
+                                "databaseId": 7003,
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "databaseId": 9004,
+                                    "name": "Auto-close guard"
+                                  }
+                                }
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "reviews": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "reviewThreads": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

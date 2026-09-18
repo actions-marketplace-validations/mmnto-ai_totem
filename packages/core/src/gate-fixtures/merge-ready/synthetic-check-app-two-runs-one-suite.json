@@ -1,0 +1,114 @@
+{
+  "kind": "synthetic",
+  "role": "mmnto-ai/totem#2879 fourth leg F4 - a non-Actions app (one check suite per head, no workflow run) posts two same-named runs, an earlier FAILURE and a later SUCCESS, in its one suite: same producer, same suite - two checks of one suite share the name and the key cannot tell them apart, so the check state is unreadable (unevaluable at both tiers), never a collapse that hides the failure; the deny reason names the suite, not a workflow run",
+  "synthesizedAt": "2026-09-18T20:06:31.051Z",
+  "ghVersion": "gh version 2.99.0 (2026-09-01)",
+  "pages": [
+    {
+      "exitCode": 0,
+      "body": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "number": 4242,
+              "isDraft": false,
+              "mergeStateStatus": "CLEAN",
+              "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "headRefName": "feat/example",
+              "baseRefName": "main",
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                          "totalCount": 3,
+                          "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                          },
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Verify (ubuntu-latest)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5001,
+                              "checkSuite": {
+                                "databaseId": 7001,
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "databaseId": 9001,
+                                    "name": "CI"
+                                  }
+                                }
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "lint",
+                              "status": "COMPLETED",
+                              "conclusion": "FAILURE",
+                              "databaseId": 5002,
+                              "checkSuite": {
+                                "databaseId": 7002,
+                                "app": {
+                                  "slug": "some-ci-app"
+                                },
+                                "workflowRun": null
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "lint",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5003,
+                              "checkSuite": {
+                                "databaseId": 7002,
+                                "app": {
+                                  "slug": "some-ci-app"
+                                },
+                                "workflowRun": null
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "reviews": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "reviewThreads": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

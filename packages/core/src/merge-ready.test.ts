@@ -10,7 +10,7 @@
  * disposition path while its anchor survives on the head — the discharge
  * specimen, mmnto-ai/totem#2861) — plus the benign corpus, every bot inline
  * thread on mmnto-ai/totem#2820-2839, which measures the severity read's
- * ADR-109 false-positive budget. The other 54 are synthetic and labelled
+ * ADR-109 false-positive budget. The other 72 are synthetic and labelled
  * `synthetic-` in their names — one per invariant the captures cannot
  * exercise (all four PRs are merged, so GitHub answers `mergeStateStatus:
  * UNKNOWN` for each and no capture can carry a BEHIND / DIRTY / BLOCKED head,
@@ -172,8 +172,8 @@ describe('merge-ready — the fixture README matches the fixtures', () => {
     const synthetic = files.filter((f) => f.startsWith('synthetic-'));
     const captures = files.filter((f) => !f.startsWith('synthetic-'));
     expect(captures.sort()).toEqual(CAPTURES);
-    expect(synthetic.length).toBe(54);
-    expect(files.length).toBe(59);
+    expect(synthetic.length).toBe(72);
+    expect(files.length).toBe(77);
   });
 
   it('the README query sha is the sha of the exported query (round 4, F7)', () => {
@@ -200,7 +200,13 @@ describe('merge-ready — the checked-in captures', () => {
     expect(e.verdict.disposition).toBe('deny');
     expect(e.verdict.provenance.ref).toBe('unresolved-bot-threads');
     expect(e.verdict.provenance.source).toBe(MERGE_READY_SOURCE);
-    expect(e.detail.checks).toEqual({ total: 6, success: 6, pending: 0, failing: 0 });
+    expect(e.detail.checks).toEqual({
+      total: 6,
+      success: 6,
+      pending: 0,
+      failing: 0,
+      superseded: 0,
+    });
     expect(e.detail.threads.unresolvedBot).toBe(1);
     // The root comment is GCA's, spelled WITHOUT the `[bot]` suffix on the
     // GraphQL surface — the trap `bot-identity.ts` exists to hold.
@@ -321,7 +327,16 @@ describe('merge-ready — the checked-in captures', () => {
     expect(humanAfterRoot.some((c) => dispositionedRootIds(c.body).includes(rootId))).toBe(true);
 
     const e = evaluate('totem-2871.json', { tier: 'pilot' });
-    expect(e.detail.checks).toEqual({ total: 17, success: 17, pending: 0, failing: 0 });
+    // 17 runs under 16 names on the 2026-09-18 re-capture: one name ran twice
+    // (both SUCCESS) and is judged by its later run (mmnto-ai/totem#2879) — a
+    // live specimen of the collapse inside the discharge specimen.
+    expect(e.detail.checks).toEqual({
+      total: 16,
+      success: 16,
+      pending: 0,
+      failing: 0,
+      superseded: 1,
+    });
     expect(e.detail.threads.unresolvedBot).toBe(0);
     expect(e.detail.highInline).toBe(0);
     expect(e.detail.dischargedHigh).toBe(1);
@@ -357,7 +372,13 @@ describe('merge-ready — predicate 1 (checks)', () => {
     expect(e.verdict.disposition).toBe('deny');
     expect(e.verdict.provenance.ref).toBe('checks');
     expect(e.verdict.reason).toContain('Totem Lint');
-    expect(e.detail.checks).toEqual({ total: 2, success: 1, pending: 0, failing: 1 });
+    expect(e.detail.checks).toEqual({
+      total: 2,
+      success: 1,
+      pending: 0,
+      failing: 1,
+      superseded: 0,
+    });
   });
 
   it('a still-running check denies and names it', () => {
@@ -371,10 +392,313 @@ describe('merge-ready — predicate 1 (checks)', () => {
   it('R5 — zero checks passes predicate 1 as a FACT, with the count and ONE stderr line', () => {
     const e = evaluate('synthetic-zero-checks.json');
     expect(e.verdict.disposition).toBe('allow');
-    expect(e.detail.checks).toEqual({ total: 0, success: 0, pending: 0, failing: 0 });
+    expect(e.detail.checks).toEqual({
+      total: 0,
+      success: 0,
+      pending: 0,
+      failing: 0,
+      superseded: 0,
+    });
     const zeroLines = e.notices.filter((n) => n.includes('ZERO status checks'));
     expect(zeroLines).toHaveLength(1);
     expect(zeroLines[0]).toMatch(/branch protection/i);
+  });
+
+  // ─── Same-named runs are judged by the LATEST run (mmnto-ai/totem#2879) ──
+  //
+  // The rollup lists EVERY check run on the head, a concurrency group's
+  // cancelled duplicate beside the run that superseded it, and its order is
+  // not chronological (mmnto-ai/totem#2877's head listed the later D1 run
+  // first). The latest run is the greatest `databaseId`. Two fixtures list
+  // the greater id in opposite positions so that neither "first listed" nor
+  // "last listed" survives as a mutant.
+
+  it('2879 — a concurrency-cancelled run beside the LATER success of the same name passes predicate 1, listed order notwithstanding', () => {
+    // The later (success) run is listed FIRST; a last-listed-wins read would
+    // judge the cancelled one and deny.
+    const e = evaluate('synthetic-check-superseded-cancelled.json');
+    expect(e.verdict.disposition).toBe('allow');
+    expect(e.detail.checks).toEqual({
+      total: 2,
+      success: 2,
+      pending: 0,
+      failing: 0,
+      superseded: 1,
+    });
+    const lines = e.notices.filter((n) => n.includes('times on the head commit'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain(
+      'check "Auto-close required check (D1)" from "github-actions/CI" ran 2 times on the head commit — judged by its latest run 5003 (success)',
+    );
+    expect(lines[0]).toContain('1 superseded run(s) not counted (mmnto-ai/totem#2879)');
+  });
+
+  it('2879 — a success and then a LATER cancelled run of the same name DENIES naming the check: the earlier success does not stand in', () => {
+    // The greater id (cancelled) is listed SECOND; a first-listed-wins read
+    // would judge the success and allow.
+    const e = evaluate('synthetic-check-cancelled-after-success.json');
+    expect(e.verdict.disposition).toBe('deny');
+    expect(e.verdict.provenance.ref).toBe('checks');
+    expect(e.verdict.reason).toContain(
+      '1 of 2 status checks are failing (Auto-close required check (D1))',
+    );
+    expect(e.detail.checks).toEqual({
+      total: 2,
+      success: 1,
+      pending: 0,
+      failing: 1,
+      superseded: 1,
+    });
+  });
+
+  it('2879 — ONE cancelled run with no later run of its name still denies: the negative that must hold', () => {
+    const e = evaluate('synthetic-check-single-cancelled.json');
+    expect(e.verdict.disposition).toBe('deny');
+    expect(e.verdict.provenance.ref).toBe('checks');
+    expect(e.verdict.reason).toContain('Auto-close required check (D1)');
+    expect(e.detail.checks).toEqual({
+      total: 2,
+      success: 1,
+      pending: 0,
+      failing: 1,
+      superseded: 0,
+    });
+    expect(e.notices.join('\n')).not.toMatch(/times on the head commit/);
+  });
+
+  it('2879 — two runs of one name where one carries no readable databaseId is UNREADABLE at both tiers, never the first or the last one listed', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-duplicate-id-missing.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('no readable databaseId');
+      expect(e.verdict.reason, tier).toContain('Auto-close required check (D1)');
+      expect(e.detail.checks, tier).toEqual({
+        total: 0,
+        success: 0,
+        pending: 0,
+        failing: 0,
+        superseded: 0,
+      });
+    }
+  });
+
+  it('2879 — the query selects databaseId on CheckRun, so the judgment reads what gh answers', () => {
+    expect(MERGE_READY_QUERY).toContain(
+      '... on CheckRun { name status conclusion databaseId checkSuite { databaseId app { slug } workflowRun { workflow { databaseId name } } } }',
+    );
+  });
+
+  // ─── Bot round 1 (Greptile P1, P2): the producer is part of the key, and
+  // an id must be a SAFE integer ────────────────────────────────────────────
+
+  it('2879 — two INDEPENDENT checks that share a name never collapse: a later success from another workflow does not hide a failure (bot round 1, Greptile P1)', () => {
+    const e = evaluate('synthetic-check-same-name-two-producers.json');
+    expect(e.verdict.disposition).toBe('deny');
+    expect(e.verdict.provenance.ref).toBe('checks');
+    expect(e.verdict.reason).toContain('1 of 3 status checks are failing (test)');
+    expect(e.detail.checks).toEqual({
+      total: 3,
+      success: 2,
+      pending: 0,
+      failing: 1,
+      superseded: 0,
+    });
+    expect(e.notices.join('\n')).not.toMatch(/times on the head commit/);
+  });
+
+  it('2879 — two runs of one name where one carries no readable producer are UNREADABLE at both tiers: reruns cannot be told from independent checks (bot round 1, Greptile P1)', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-duplicate-producer-missing.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('no readable producer');
+      expect(e.verdict.reason, tier).toContain('Auto-close required check (D1)');
+    }
+  });
+
+  it('2879 — an id beyond the safe-integer range does not read: a rerun group carrying one is UNREADABLE, never ordered on a rounded number (bot round 1, Greptile P2)', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-duplicate-id-unsafe.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('no readable databaseId');
+      expect(e.verdict.reason, tier).toContain('from "github-actions/Auto-close guard"');
+    }
+  });
+
+  // ─── The re-armed leg's F1 and F6: the producer is the workflow's ID, and
+  // two same-named runs in one suite fail closed ─────────────────────────────
+
+  it('2879 — two workflow FILES sharing a display name are two producers: their same-named jobs are both judged and the failure denies (re-armed leg F1)', () => {
+    const e = evaluate('synthetic-check-same-name-two-workflow-files.json');
+    expect(e.verdict.disposition).toBe('deny');
+    expect(e.verdict.provenance.ref).toBe('checks');
+    expect(e.verdict.reason).toContain('1 of 3 status checks are failing (build)');
+    expect(e.detail.checks).toEqual({
+      total: 3,
+      success: 2,
+      pending: 0,
+      failing: 1,
+      superseded: 0,
+    });
+    expect(e.notices.join('\n')).not.toMatch(/times on the head commit/);
+  });
+
+  it('2879 — two same-named jobs of ONE workflow run share a check suite: independent checks the key cannot tell apart, UNREADABLE at both tiers (re-armed leg F1)', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-two-jobs-one-suite.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('sit in one check suite');
+      expect(e.verdict.reason, tier).toContain('check "test" from "github-actions/CI"');
+    }
+  });
+
+  it('2879 — a rerun group where one run has no readable check-suite id is UNREADABLE at both tiers (fourth leg F2)', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-rerun-suite-id-missing.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('no readable check-suite id');
+      expect(e.verdict.reason, tier).toContain(
+        'check "Auto-close required check (D1)" from "github-actions/Auto-close guard"',
+      );
+    }
+  });
+
+  it('2879 — an Actions run with no readable workflow id in a same-named group is a producer that did not read: UNREADABLE at both tiers, never one producer for every workflow (fourth leg F2, third leg F5)', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-actions-workflow-id-missing.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('no readable producer');
+      expect(e.verdict.reason, tier).toContain('the workflow id of an Actions run');
+      expect(e.verdict.reason, tier).toContain('Auto-close required check (D1)');
+    }
+  });
+
+  it('2879 — a non-Actions app that posts two same-named runs in its one suite is UNREADABLE at both tiers, and the reason names the suite, not a workflow run (fourth leg F4)', () => {
+    for (const tier of ['strict', 'pilot'] as const) {
+      const e = evaluate('synthetic-check-app-two-runs-one-suite.json', { tier });
+      expect(e.verdict.disposition, tier).toBe(tier === 'pilot' ? 'warn' : 'deny');
+      expect(e.verdict.provenance.ref, tier).toBe('unevaluable');
+      expect(e.verdict.reason, tier).toContain('check "lint" from "some-ci-app"');
+      expect(e.verdict.reason, tier).toContain('two runs of one app');
+    }
+  });
+
+  it('2879 — two same-named checks from different producers where one has no id are both judged: the id orders reruns and nothing else (re-armed leg F6)', () => {
+    const e = evaluate('synthetic-check-two-producers-one-null-id.json');
+    expect(e.verdict.disposition).toBe('allow');
+    expect(e.detail.checks).toEqual({
+      total: 3,
+      success: 3,
+      pending: 0,
+      failing: 0,
+      superseded: 0,
+    });
+    expect(e.notices.join('\n')).not.toMatch(/times on the head commit|could not derive/);
+  });
+
+  // ─── The fold of the leg's F1–F4, F7: arithmetic and tolerances, not only
+  // the two-run happy path ─────────────────────────────────────────────────
+
+  it('2879 — superseded counts RUNS, one disclosure line per name, and an earlier FAILED run is superseded like a cancelled one (leg F1, F2, F7)', () => {
+    // Three D1 runs (FAILURE, CANCELLED, SUCCESS) beside two Totem Lint runs:
+    // a mutant counting NAMES would say 2; the lines carry their whole names.
+    const e = evaluate('synthetic-check-three-runs-two-names.json');
+    expect(e.verdict.disposition).toBe('allow');
+    expect(e.detail.checks).toEqual({
+      total: 3,
+      success: 3,
+      pending: 0,
+      failing: 0,
+      superseded: 3,
+    });
+    const lines = e.notices.filter((n) => n.includes('times on the head commit'));
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toContain(
+      'check "Auto-close required check (D1)" from "github-actions/CI" ran 3 times on the head commit — judged by its latest run 5004 (success)',
+    );
+    expect(lines[0]).toContain('2 superseded run(s) not counted');
+    expect(lines[1]).toContain(
+      'check "Totem Lint" from "github-actions/CI" ran 2 times on the head commit — judged by its latest run 5006 (success)',
+    );
+    expect(lines[1]).toContain('1 superseded run(s) not counted');
+    for (const line of lines) expect(line).not.toContain('…');
+  });
+
+  it('2879 — a check that ran ONCE with no readable databaseId is judged on its conclusion, in BOTH directions: the id orders same-named runs and nothing else (leg F3, r2-F7)', () => {
+    // Two lone null-id runs: one SUCCESS, one FAILURE. The over-strict mutant
+    // (any unreadable id is unevaluable) would say "could not derive"; the
+    // lenient mutant (a lone null-id run reads as success) would allow.
+    const e = evaluate('synthetic-check-single-null-id.json');
+    expect(e.verdict.disposition).toBe('deny');
+    expect(e.verdict.provenance.ref).toBe('checks');
+    expect(e.verdict.reason).toContain(
+      '1 of 3 status checks are failing (Totem Doctor (--strict))',
+    );
+    expect(e.detail.checks).toEqual({
+      total: 3,
+      success: 2,
+      pending: 0,
+      failing: 1,
+      superseded: 0,
+    });
+    expect(e.notices.join('\n')).not.toMatch(/times on the head commit|could not derive/);
+  });
+
+  it('2879 — a check name longer than the evidence bound is disclosed WHOLE: the notice is sanitised, never sliced (r2-F1)', () => {
+    const e = evaluate('synthetic-check-long-name-superseded.json');
+    expect(e.verdict.disposition).toBe('allow');
+    expect(e.detail.checks).toEqual({
+      total: 2,
+      success: 2,
+      pending: 0,
+      failing: 0,
+      superseded: 1,
+    });
+    const lines = e.notices.filter((n) => n.includes('times on the head commit'));
+    expect(lines).toHaveLength(1);
+    const longName =
+      'spine-adopt harnesses on ubuntu-latest (specimens, seed20, matrix shard 7 of 12, reusable workflow harness/run-adopt.yml @ main, with the full fixture corpus and the extended timeout budget for cold-store starts)';
+    expect(longName.length).toBeGreaterThan(160);
+    expect(lines[0]).toContain(
+      `check ${JSON.stringify(longName)} from "github-actions/CI" ran 2 times on the head commit`,
+    );
+    expect(lines[0]).not.toContain('…');
+  });
+
+  it("2879 — two runs whose name did not read are two checks, never one that ran twice (r2-F4; the first leg's F10)", () => {
+    const e = evaluate('synthetic-check-unnamed-runs.json');
+    expect(e.verdict.disposition).toBe('allow');
+    expect(e.detail.checks).toEqual({
+      total: 3,
+      success: 3,
+      pending: 0,
+      failing: 0,
+      superseded: 0,
+    });
+    expect(e.notices.join('\n')).not.toMatch(/times on the head commit|could not derive/);
+  });
+
+  it('2879 — same-named runs on different pages of the checks connection are judged together, after the last page (leg F4)', () => {
+    const e = evaluate('synthetic-check-duplicate-across-pages.json');
+    expect(e.verdict.disposition).toBe('allow');
+    expect(e.detail.checks).toEqual({
+      total: 2,
+      success: 2,
+      pending: 0,
+      failing: 0,
+      superseded: 1,
+    });
+    const graphql = e.calls.filter((c) => c[0] === 'api');
+    expect(graphql).toHaveLength(2);
+    expect(graphql[1]).toContain('checksAfter=checks-page-1');
+    const lines = e.notices.filter((n) => n.includes('times on the head commit'));
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain('judged by its latest run 5003 (success)');
   });
 
   // ─── The rollup must BELONG to the head commit (fold F7) ────────────────
