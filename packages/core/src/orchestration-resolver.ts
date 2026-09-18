@@ -165,20 +165,46 @@ export function resolveOrchestrationPaths(repoRoot: string, agentId: string): Or
  *
  * Keyed by REPOSITORY name — the `origin` remote's repo segment where one can
  * be read, else the repo-root basename ({@link cohortSeatsForRepo}). Each value
- * is the list of agent-ids this repo natively hosts (zero, one, or two — the
- * Claude + Gemini pair where both variants ship). Empty array marks an
- * orphan-stream repo with no native agent (`totem-playground`).
+ * is the list of agent-ids this repo natively hosts (zero, or one per vendor
+ * column the skill table renders). Empty array marks an orphan-stream repo
+ * with no native agent (`totem-playground`).
+ *
+ * WHAT DECIDES MEMBERSHIP: this map mirrors the `signoff` skill's step-2a
+ * table BY CONSTRUCTION — one row per key, one entry per filled vendor cell —
+ * and `signoff-table-sync.test.ts` locks the two renderings as an EQUALITY
+ * (per repository, in the seat's own row and its own vendor column). So the
+ * map carries exactly the vendors the table has COLUMNS for: claude, gemini,
+ * kimi. The roster of record behind both is
+ * `mmnto-ai/totem-strategy:doctrine/cohort-roles.md` § 1.1 (the matrix) and
+ * § 1.4 (the seating dates) — a surface neither copy can read at runtime.
+ *
+ * The four Kimi seats joined here for mmnto-ai/totem#2875: the roster seated
+ * `totem-kimi`, `strategy-kimi` and `lc-kimi` on 2026-07-18 and `status-kimi`
+ * on 2026-07-29 (§ 1.4), the table named them (mmnto-ai/totem#2865), and
+ * until this entry a dispatch addressed `to: lc-kimi` was invisible to a
+ * `totem mail` poll on a checkout with no seat dir and no `TOTEM_SELF_AGENT`
+ * — the same fresh-clone failure the `status-claude` comment below records.
+ * `arhgap11` takes no Kimi seat (its table cell reads "not seated") and
+ * `totem-playground` stays empty.
+ *
+ * NOT here, deliberately: the roster also seats a `codex` and an `agy` lane in
+ * all four cohort repositories, and they register today through their seat
+ * dirs alone. They do NOT join in this change, because membership follows the
+ * table's COLUMNS and the table has no codex or agy column; they join the map
+ * in the same change that gives the table those columns — the roster-complete
+ * form mmnto-ai/totem#2865 observed was missing (its "Why it matters": the
+ * Codex and agy columns render nowhere), filed as mmnto-ai/totem#2883.
  */
 const COHORT_AGENT_MAP: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  totem: Object.freeze(['totem-claude', 'totem-gemini']),
-  'totem-strategy': Object.freeze(['strategy-claude', 'strategy-gemini']),
-  'liquid-city': Object.freeze(['lc-claude', 'lc-gemini']),
+  totem: Object.freeze(['totem-claude', 'totem-gemini', 'totem-kimi']),
+  'totem-strategy': Object.freeze(['strategy-claude', 'strategy-gemini', 'strategy-kimi']),
+  'liquid-city': Object.freeze(['lc-claude', 'lc-gemini', 'lc-kimi']),
   arhgap11: Object.freeze(['arhgap11-claude', 'arhgap11-gemini']),
   // status-claude seated per the cohort-roles §1.1 roster ruling
   // (mmnto-ai/totem-strategy#958, 2026-07-22) — without the map entry,
   // dispatches addressed `to: status-claude` are invisible to CLI polls on
   // checkouts where the gitignored seat dir is absent.
-  'totem-status': Object.freeze(['status-claude', 'status-gemini']),
+  'totem-status': Object.freeze(['status-claude', 'status-gemini', 'status-kimi']),
   'totem-playground': Object.freeze([]),
 });
 
@@ -271,6 +297,18 @@ export function readSeatDirs(repoRoot: string): string[] {
  * `broadcast` is a valid recipient too, but it is a routing literal, not an
  * agent, so callers handle it separately.
  */
+/**
+ * The repositories `COHORT_AGENT_MAP` carries an entry for, sorted — every
+ * key, a zero-seat entry (`totem-playground`) included. `knownCohortAgents()`
+ * flattens the map to its seat values, so an entry with no seats is invisible
+ * through it; the signoff table-to-map lock reads this to hold the map's ROWS
+ * to the table's rows as well as its seats (bot round 1 on
+ * mmnto-ai/totem#2882, Greptile P2).
+ */
+export function cohortAgentMapRepositories(): string[] {
+  return Object.keys(COHORT_AGENT_MAP).sort();
+}
+
 export function knownCohortAgents(workspace?: string): string[] {
   const fromMap = Object.values(COHORT_AGENT_MAP).flat();
   if (workspace === undefined) {
