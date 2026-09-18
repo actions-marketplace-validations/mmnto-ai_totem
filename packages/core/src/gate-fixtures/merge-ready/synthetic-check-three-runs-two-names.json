@@ -1,0 +1,181 @@
+{
+  "kind": "synthetic",
+  "role": "mmnto-ai/totem#2879 - two names ran more than once on one head, one of them THREE times with a FAILURE first: superseded counts RUNS (3), not names (2); one disclosure line per name; an earlier failed run is superseded like a cancelled one",
+  "synthesizedAt": "2026-09-18T17:31:48.249Z",
+  "ghVersion": "gh version 2.99.0 (2026-09-01)",
+  "pages": [
+    {
+      "exitCode": 0,
+      "body": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "number": 4242,
+              "isDraft": false,
+              "mergeStateStatus": "CLEAN",
+              "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "headRefName": "feat/example",
+              "baseRefName": "main",
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                          "totalCount": 6,
+                          "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                          },
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Verify (ubuntu-latest)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5001,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7001
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Auto-close required check (D1)",
+                              "status": "COMPLETED",
+                              "conclusion": "FAILURE",
+                              "databaseId": 5002,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7002
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Auto-close required check (D1)",
+                              "status": "COMPLETED",
+                              "conclusion": "CANCELLED",
+                              "databaseId": 5003,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7003
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Auto-close required check (D1)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5004,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7004
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Totem Lint",
+                              "status": "COMPLETED",
+                              "conclusion": "CANCELLED",
+                              "databaseId": 5005,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7005
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Totem Lint",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5006,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7006
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "reviews": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "reviewThreads": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

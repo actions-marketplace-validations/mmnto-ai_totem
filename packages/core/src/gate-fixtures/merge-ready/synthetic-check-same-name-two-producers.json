@@ -1,0 +1,124 @@
+{
+  "kind": "synthetic",
+  "role": "mmnto-ai/totem#2879 bot round 1 (Greptile P1) - two INDEPENDENT checks named \"test\", one from workflow A (FAILURE, lower id) and one from workflow B (SUCCESS, greater id): different producers never collapse, the failure stays a failing check and predicate 1 denies naming it; a name-only collapse would have hidden it",
+  "synthesizedAt": "2026-09-18T19:18:14.561Z",
+  "ghVersion": "gh version 2.99.0 (2026-09-01)",
+  "pages": [
+    {
+      "exitCode": 0,
+      "body": {
+        "data": {
+          "repository": {
+            "pullRequest": {
+              "number": 4242,
+              "isDraft": false,
+              "mergeStateStatus": "CLEAN",
+              "headRefOid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "headRefName": "feat/example",
+              "baseRefName": "main",
+              "commits": {
+                "nodes": [
+                  {
+                    "commit": {
+                      "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                      "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                          "totalCount": 3,
+                          "pageInfo": {
+                            "hasNextPage": false,
+                            "endCursor": null
+                          },
+                          "nodes": [
+                            {
+                              "__typename": "CheckRun",
+                              "name": "Verify (ubuntu-latest)",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5001,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "CI",
+                                    "databaseId": 9001
+                                  }
+                                },
+                                "databaseId": 7001
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "test",
+                              "status": "COMPLETED",
+                              "conclusion": "FAILURE",
+                              "databaseId": 5002,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "Workflow A",
+                                    "databaseId": 9002
+                                  }
+                                },
+                                "databaseId": 7002
+                              }
+                            },
+                            {
+                              "__typename": "CheckRun",
+                              "name": "test",
+                              "status": "COMPLETED",
+                              "conclusion": "SUCCESS",
+                              "databaseId": 5003,
+                              "checkSuite": {
+                                "app": {
+                                  "slug": "github-actions"
+                                },
+                                "workflowRun": {
+                                  "workflow": {
+                                    "name": "Workflow B",
+                                    "databaseId": 9003
+                                  }
+                                },
+                                "databaseId": 7003
+                              }
+                            }
+                          ]
+                        }
+                      }
+                    }
+                  }
+                ]
+              },
+              "reviews": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "reviewThreads": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              },
+              "comments": {
+                "pageInfo": {
+                  "hasNextPage": false,
+                  "endCursor": null
+                },
+                "nodes": []
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

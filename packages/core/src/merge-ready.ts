@@ -107,7 +107,16 @@ export type MergeReadyProvenanceDetail = {
   pr: number | null;
   /** The PR head sha as GitHub answered it, or null when the read never got that far. */
   headSha: string | null;
-  checks: { total: number; success: number; pending: number; failing: number };
+  /**
+   * Predicate 1's count, per CHECK after the latest-run judgment
+   * (mmnto-ai/totem#2879): a check is a name under one producer (the app,
+   * and the workflow for Actions), so `total` counts checks the way
+   * `gh pr checks` lists them — one row per name, one per producer when two
+   * producers share a name; `superseded` counts the check runs a later run of
+   * the same check replaced (a concurrency group's cancelled duplicates),
+   * which are read and disclosed but never judged.
+   */
+  checks: { total: number; success: number; pending: number; failing: number; superseded: number };
   threads: { unresolvedBot: number; pagesRead: number; complete: boolean };
   changesRequestedBy: string[];
   /** HIGH/Major bot inlines on the head commit that still APPLY after the discharge read — predicate 4's count. */
@@ -200,7 +209,7 @@ const MERGE_READY_FRAGMENT = `fragment MergeReadyPr on PullRequest {
             pageInfo { hasNextPage endCursor }
             nodes {
               __typename
-              ... on CheckRun { name status conclusion }
+              ... on CheckRun { name status conclusion databaseId checkSuite { databaseId app { slug } workflowRun { workflow { databaseId name } } } }
               ... on StatusContext { context state }
             }
           }
@@ -356,10 +365,70 @@ function asString(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+/**
+ * A non-negative SAFE integer as the API typed it; anything else is null,
+ * never coerced. Safe, not merely integral: an id beyond 2^53 would have been
+ * rounded by JSON.parse, and two distinct ids rounded to one number would be
+ * ordered wrongly (bot round 1 on mmnto-ai/totem#2879, Greptile P2) — the
+ * review-comment id reader already refuses the same way.
+ */
+function asNonNegativeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
 /** One classified status check. */
 interface CheckEntry {
   name: string;
   kind: 'success' | 'pending' | 'failing';
+  /** Which rollup node type answered it: a CheckRun (Actions, apps) or a legacy StatusContext. */
+  typename: 'CheckRun' | 'StatusContext';
+  /**
+   * Whether the node's name (or context) READ as a string. False means
+   * `name` carries a placeholder and this entry must never be grouped with
+   * another: two malformed nodes share no identity (leg F10 on
+   * mmnto-ai/totem#2879). Keyed on the read, not on the placeholder text, so
+   * a check that is really named like the placeholder still collapses.
+   */
+  named: boolean;
+  /**
+   * The run's PRODUCER as an identity key: the check suite's app slug joined
+   * with the WORKFLOW's database id when the app is Actions
+   * (`github-actions/12345`), the app slug alone for another app. Two runs of
+   * one name collapse to the latest ONLY when they share a producer — reruns
+   * of one job across two workflow runs — never when two apps, or two
+   * workflows, happen to name a job alike, because then a later success would
+   * hide an independent failure (bot round 1 on mmnto-ai/totem#2879, Greptile
+   * P1). The workflow's ID, not its display name, so two workflow FILES that
+   * share a `name:` stay apart (the re-armed leg's F1). Null when the app slug
+   * did not read, or when the app is Actions and the workflow id did not read
+   * (fail closed, never "every Actions workflow is one producer"); a
+   * same-named group with a null producer is unreadable, never collapsed by
+   * name alone. A non-Actions app that did answer a workflow id would be keyed
+   * with it too (finer, never coarser); none does on live data. Null on a
+   * StatusContext.
+   */
+  producer: string | null;
+  /** The producer for humans: app slug plus the workflow's display NAME (`github-actions/Auto-close guard`). */
+  producerLabel: string | null;
+  /**
+   * The CHECK SUITE's database id. A rerun of a job across two workflow runs
+   * sits in two suites; two distinct jobs of ONE workflow run that share a
+   * display name sit in ONE suite — so within a producer, two same-named runs
+   * that share a suite are independent checks the key cannot tell apart, and
+   * the group is unreadable rather than collapsed (the re-armed leg's F1). A
+   * job re-run inside one workflow run mints a new check run in the SAME
+   * suite, and the rollup lists only the latest attempt, so a re-run never
+   * appears twice here. Null when it did not read; null on a StatusContext.
+   */
+  suiteId: number | null;
+  /**
+   * The CheckRun's `databaseId` — GitHub's check-run id, a single increasing
+   * sequence, so among same-named runs of one producer on one head the
+   * greatest id IS the latest run (mmnto-ai/totem#2879). Null on a
+   * StatusContext, and on a CheckRun whose id did not read as a non-negative
+   * safe integer.
+   */
+  runId: number | null;
 }
 
 /** One review, reduced to what predicate 3 reads. */
@@ -509,6 +578,15 @@ type PageRead = { ok: true; page: PrPage } | { ok: false; detail: string };
  */
 const SUCCESS_CONCLUSIONS = new Set(['SUCCESS', 'NEUTRAL', 'SKIPPED']);
 const SUCCESS_CONTEXT_STATES = new Set(['SUCCESS']);
+/**
+ * The name a CheckRun gets when GitHub's answer carried none. `CheckRun.name`
+ * is NON_NULL in the schema, so this is reachable only from a malformed or
+ * mocked payload — and two such nodes must never be read as one check ran
+ * twice (leg F10 on mmnto-ai/totem#2879): the latest-run collapse skips it.
+ */
+const UNNAMED_CHECK = '(unnamed check)';
+/** The app slug GitHub Actions posts check runs under; its runs carry a workflow, and one without a readable workflow id is a producer that did not read. */
+const ACTIONS_APP = 'github-actions';
 const PENDING_CONTEXT_STATES = new Set(['PENDING', 'EXPECTED']);
 
 /**
@@ -556,25 +634,66 @@ function readChecks(rollup: Record<string, unknown> | null): {
       return { entries, hasNext: false, cursor: null, detail: 'a check node was not an object' };
     const typename = asString(n.__typename);
     if (typename === 'CheckRun') {
-      const name = asString(n.name) ?? '(unnamed check)';
+      const readName = asString(n.name);
+      const name = readName ?? UNNAMED_CHECK;
+      const named = readName !== null;
       const status = asString(n.status) ?? '';
       const conclusion = asString(n.conclusion);
+      const runId = asNonNegativeInteger(n.databaseId);
+      const suite = asObject(n.checkSuite);
+      const suiteId = asNonNegativeInteger(suite?.databaseId);
+      const appSlug = asString(asObject(suite?.app)?.slug);
+      const workflow = asObject(asObject(suite?.workflowRun)?.workflow);
+      const workflowId = asNonNegativeInteger(workflow?.databaseId);
+      const workflowName = asString(workflow?.name);
+      // Actions without a readable workflow id is NOT "one producer for every
+      // workflow" — it is a producer that did not read (fail closed).
+      const producer =
+        appSlug === null
+          ? null
+          : workflowId !== null
+            ? `${appSlug}/${String(workflowId)}`
+            : appSlug === ACTIONS_APP
+              ? null
+              : appSlug;
+      const producerLabel =
+        appSlug === null ? null : workflowName === null ? appSlug : `${appSlug}/${workflowName}`;
+      const shared = {
+        name,
+        typename: 'CheckRun' as const,
+        named,
+        producer,
+        producerLabel,
+        suiteId,
+        runId,
+      };
       if (status !== 'COMPLETED') {
-        entries.push({ name, kind: 'pending' });
+        entries.push({ ...shared, kind: 'pending' });
       } else if (conclusion !== null && SUCCESS_CONCLUSIONS.has(conclusion)) {
-        entries.push({ name, kind: 'success' });
+        entries.push({ ...shared, kind: 'success' });
       } else {
-        entries.push({ name, kind: 'failing' });
+        entries.push({ ...shared, kind: 'failing' });
       }
     } else if (typename === 'StatusContext') {
-      const name = asString(n.context) ?? '(unnamed context)';
+      const readName = asString(n.context);
+      const name = readName ?? '(unnamed context)';
+      const named = readName !== null;
       const state = asString(n.state) ?? '';
+      const shared = {
+        name,
+        typename: 'StatusContext' as const,
+        named,
+        producer: null,
+        producerLabel: null,
+        suiteId: null,
+        runId: null,
+      };
       if (SUCCESS_CONTEXT_STATES.has(state)) {
-        entries.push({ name, kind: 'success' });
+        entries.push({ ...shared, kind: 'success' });
       } else if (PENDING_CONTEXT_STATES.has(state)) {
-        entries.push({ name, kind: 'pending' });
+        entries.push({ ...shared, kind: 'pending' });
       } else {
-        entries.push({ name, kind: 'failing' });
+        entries.push({ ...shared, kind: 'failing' });
       }
     } else {
       return {
@@ -1118,14 +1237,23 @@ export function hasHighSeverityMarker(body: string): boolean {
 
 // ─── Evidence helpers ───────────────────────────────────────────────────────
 
-/** Bound and sanitize a fragment for a reason / provenance: no control characters, bounded length. */
-function bounded(text: string): string {
+/**
+ * One line: C0 control characters and DEL to spaces, runs of whitespace to
+ * one, trimmed — never sliced. (C1 controls are left as they are, as they
+ * always were in `bounded`.)
+ */
+function oneLine(text: string): string {
   let out = '';
   for (const ch of text) {
     const code = ch.charCodeAt(0);
     out += code < 0x20 || code === 0x7f ? ' ' : ch;
   }
-  out = out.replace(/\s+/g, ' ').trim();
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+/** Bound and sanitize a fragment for a reason / provenance: no control characters, bounded length. */
+function bounded(text: string): string {
+  const out = oneLine(text);
   return out.length > MERGE_READY_EVIDENCE_MAX
     ? out.slice(0, MERGE_READY_EVIDENCE_MAX - 1) + '…'
     : out;
@@ -1146,7 +1274,17 @@ interface ReadState {
   rollupPresent: boolean;
   rollupState: string | null;
   rollupTotalCount: unknown;
+  /** Every rollup context the read materialised, one entry per node — what the count check judges. */
   checks: CheckEntry[];
+  /**
+   * The checks predicate 1 judges: `checks` with every group of CheckRuns
+   * that share a name AND a producer collapsed to its latest run
+   * (mmnto-ai/totem#2879). Filled once every page is in and the rollup has
+   * accounted for itself.
+   */
+  judgedChecks: CheckEntry[];
+  /** One record per collapsed check (a name under one producer), for the disclosure notices. */
+  supersededRuns: SupersededRun[];
   reviews: ReviewEntry[];
   threads: ThreadEntry[];
   /** Every PR-level comment, accumulated across pages — the discharge's evidence surface. */
@@ -1189,6 +1327,8 @@ function readPullRequest(payload: MergeReadyPayload, runner: GhRunner): ReadOutc
     rollupState: null,
     rollupTotalCount: null,
     checks: [],
+    judgedChecks: [],
+    supersededRuns: [],
     reviews: [],
     threads: [],
     prComments: [],
@@ -1312,6 +1452,21 @@ function readPullRequest(payload: MergeReadyPayload, runner: GhRunner): ReadOutc
         }
       }
 
+      // Same-named CheckRuns collapse to their LATEST run before predicate 1
+      // reads them (mmnto-ai/totem#2879): a workflow's concurrency group
+      // cancels the run a later push or body edit superseded, and the rollup
+      // lists BOTH — the cancelled one is not a failing check, it is a
+      // replaced one. The judgment needs every duplicate's id; a group with
+      // an unreadable id is an unreadable check state, never "the first one".
+      // Runs AFTER the count check on purpose: the rollup accounts for the
+      // nodes it listed, and the collapse is a read of those nodes.
+      const judged = judgeLatestRuns(state.checks);
+      if (!judged.ok) {
+        return { ok: false, detail: judged.detail, pagesRead: state.pagesRead };
+      }
+      state.judgedChecks = judged.judged;
+      state.supersededRuns = judged.collapsed;
+
       // R5's zero-checks FACT applies ONLY where the rollup is consistent about
       // it, and that is exactly two shapes: no rollup at all, or a rollup that
       // reports SUCCESS over an empty context list AND counts zero (the count
@@ -1361,21 +1516,189 @@ const MERGE_STATE_DENY = new Map<string, string>([
   ['DRAFT', 'the pull request is still a draft'],
 ]);
 
-function summarizeChecks(checks: readonly CheckEntry[]): {
+/** A check that ran more than once on the head (one name, one producer), and the run that judged it. */
+interface SupersededRun {
+  name: string;
+  /** The producer for HUMANS (app slug plus the workflow's display name), what the notice prints — not the identity key. */
+  producer: string;
+  runs: number;
+  judgedId: number;
+  kind: CheckEntry['kind'];
+}
+
+/**
+ * Collapse every group of `CheckRun`s that share a NAME and a PRODUCER to its
+ * LATEST run (mmnto-ai/totem#2879). GitHub's rollup `contexts` lists EVERY
+ * check run on the head — a concurrency group's cancelled duplicate beside the
+ * run that superseded it — while `gh pr checks` shows one row per name,
+ * judged by the latest run. The rollup's own order is NOT chronological (on
+ * mmnto-ai/totem#2877's head the later D1 run was listed before the earlier
+ * one), so "last listed wins" is not a rule; the latest run is the one with
+ * the greatest `databaseId`, GitHub's check-run id, a single increasing
+ * sequence.
+ *
+ * The producer is part of the key on purpose: two apps, or two workflows
+ * under one app, may name a job alike, and those are INDEPENDENT checks — a
+ * later success from one must never hide a failure from the other (bot
+ * round 1, Greptile P1). The producer is the app plus the WORKFLOW's id for
+ * Actions, so two workflow files that share a display name stay apart. Same
+ * name, different producer: both judged. Same name, same producer, different
+ * check suites: reruns across workflow runs, the latest judged — and, ruled,
+ * two independent runs of one workflow on one head (a push run beside a
+ * scheduled run) collapse the same way, the way `gh pr checks` and the merge
+ * box take the latest run of a workflow. Same name, same producer, ONE check
+ * suite: two checks of one suite share a name (two jobs of one workflow run,
+ * or two runs of one non-Actions app, which has one suite per head) — the key
+ * cannot tell them apart, an unreadable check state (R2), never a collapse.
+ * Same name, and a member whose producer or suite id did not read: the runs
+ * cannot be placed — unreadable the same way. A group whose members share a
+ * producer and a suite pattern but one lacks a readable id is unreadable too:
+ * the latest cannot be derived, and picking one would be a guess dressed as a
+ * read. A single run needs none of it. Legacy `StatusContext` nodes carry one
+ * state per context already and pass through untouched. Output order is
+ * first-seen order, so the deny reason's name list reads the way the rollup
+ * listed it.
+ */
+function judgeLatestRuns(
+  checks: readonly CheckEntry[],
+): { ok: true; judged: CheckEntry[]; collapsed: SupersededRun[] } | { ok: false; detail: string } {
+  const byName = new Map<string, CheckEntry[]>();
+  const order: Array<{ key: string } | { entry: CheckEntry }> = [];
+  for (const c of checks) {
+    // A legacy status passes through; so does a run whose name did not read —
+    // grouping the placeholder would fabricate an identity two malformed nodes
+    // never shared (leg F10). Keyed on `named`, not on the placeholder text.
+    if (c.typename !== 'CheckRun' || !c.named) {
+      order.push({ entry: c });
+      continue;
+    }
+    const group = byName.get(c.name);
+    if (group === undefined) {
+      byName.set(c.name, [c]);
+      order.push({ key: c.name });
+    } else {
+      group.push(c);
+    }
+  }
+  const judged: CheckEntry[] = [];
+  const collapsed: SupersededRun[] = [];
+  for (const slot of order) {
+    if ('entry' in slot) {
+      judged.push(slot.entry);
+      continue;
+    }
+    const sameName = byName.get(slot.key)!;
+    if (sameName.length === 1) {
+      judged.push(sameName[0]!);
+      continue;
+    }
+    // Two or more runs of one name: split them by producer, first-seen order.
+    const byProducer = new Map<string, CheckEntry[]>();
+    for (const run of sameName) {
+      if (run.producer === null) {
+        return {
+          ok: false,
+          detail:
+            'check ' +
+            bounded(JSON.stringify(slot.key)) +
+            ' ran ' +
+            String(sameName.length) +
+            ' times on the head and one of its runs carries no readable producer (the check suite app, or the workflow id of an Actions run) - reruns of one check cannot be told from independent checks that share the name, the check state is unreadable',
+        };
+      }
+      const sub = byProducer.get(run.producer);
+      if (sub === undefined) byProducer.set(run.producer, [run]);
+      else sub.push(run);
+    }
+    for (const group of byProducer.values()) {
+      if (group.length === 1) {
+        judged.push(group[0]!);
+        continue;
+      }
+      const label = group[0]!.producerLabel ?? group[0]!.producer ?? '(unreadable producer)';
+      const who =
+        'check ' + bounded(JSON.stringify(slot.key)) + ' from ' + bounded(JSON.stringify(label));
+      // Same name, same producer: reruns sit in DIFFERENT check suites (one
+      // per workflow run). Two members in ONE suite are two distinct jobs of
+      // one run that share a display name — independent checks the key cannot
+      // tell apart — and a member with no readable suite cannot be placed at
+      // all: unreadable either way, never a collapse (the re-armed leg's F1).
+      const suites = new Set<number>();
+      for (const run of group) {
+        if (run.suiteId === null) {
+          return {
+            ok: false,
+            detail:
+              who +
+              ' ran ' +
+              String(group.length) +
+              ' times on the head and one of its runs carries no readable check-suite id - reruns cannot be told from independent jobs, the check state is unreadable',
+          };
+        }
+        if (suites.has(run.suiteId)) {
+          return {
+            ok: false,
+            detail:
+              who +
+              ' ran ' +
+              String(group.length) +
+              ' times on the head and two of its runs sit in one check suite - two checks of one suite share the name (two jobs of one workflow run, or two runs of one app), independent checks the key cannot tell apart, the check state is unreadable',
+          };
+        }
+        suites.add(run.suiteId);
+      }
+      let latest: CheckEntry | null = null;
+      for (const run of group) {
+        if (run.runId === null) {
+          return {
+            ok: false,
+            detail:
+              who +
+              ' ran ' +
+              String(group.length) +
+              ' times on the head and one of its runs carries no readable databaseId - the latest run cannot be derived, the check state is unreadable',
+          };
+        }
+        if (latest === null || run.runId > (latest.runId as number)) latest = run;
+      }
+      judged.push(latest as CheckEntry);
+      collapsed.push({
+        name: slot.key,
+        producer: label,
+        runs: group.length,
+        judgedId: (latest as CheckEntry).runId as number,
+        kind: (latest as CheckEntry).kind,
+      });
+    }
+  }
+  return { ok: true, judged, collapsed };
+}
+
+function summarizeChecks(
+  judged: readonly CheckEntry[],
+  materialised: number,
+): {
   total: number;
   success: number;
   pending: number;
   failing: number;
+  superseded: number;
 } {
   let success = 0;
   let pending = 0;
   let failing = 0;
-  for (const c of checks) {
+  for (const c of judged) {
     if (c.kind === 'success') success++;
     else if (c.kind === 'pending') pending++;
     else failing++;
   }
-  return { total: checks.length, success, pending, failing };
+  return {
+    total: judged.length,
+    success,
+    pending,
+    failing,
+    superseded: materialised - judged.length,
+  };
 }
 
 /**
@@ -1589,7 +1912,7 @@ export function evaluateMergeReady(
     repo: parsed.repo,
     pr: parsed.pr,
     headSha: null,
-    checks: { total: 0, success: 0, pending: 0, failing: 0 },
+    checks: { total: 0, success: 0, pending: 0, failing: 0, superseded: 0 },
     threads: { unresolvedBot: 0, pagesRead: 0, complete: false },
     changesRequestedBy: [],
     highInline: 0,
@@ -1670,7 +1993,18 @@ export function evaluateMergeReady(
   detail.pr = state.number;
   detail.headSha = state.headSha;
   detail.mergeStateStatus = state.mergeStateStatus;
-  detail.checks = summarizeChecks(state.checks);
+  detail.checks = summarizeChecks(state.judgedChecks, state.checks.length);
+  // A superseded run is a check the read SAW and set aside; the record must
+  // say so, name by name, and name the run that stood in for it
+  // (mmnto-ai/totem#2879). One line per collapsed name, on purpose: a single
+  // line under the evidence bound lost its tail at three names (leg F1; a
+  // head on main carried five), and a disclosure that trails off is not one.
+  // Each line is sanitised, never sliced — it is a notice, not `matched`.
+  for (const run of state.supersededRuns) {
+    notices.push(
+      `${MERGE_READY_NOTICE_PREFIX} ${parsed.repo}#${state.number} at ${shortSha(state.headSha)}: check ${oneLine(JSON.stringify(run.name))} from ${oneLine(JSON.stringify(run.producer))} ran ${run.runs} times on the head commit — judged by its latest run ${run.judgedId} (${run.kind}), the greatest check-run id; ${run.runs - 1} superseded run(s) not counted (mmnto-ai/totem#2879).`,
+    );
+  }
   detail.threads = {
     unresolvedBot: unresolvedBotThreads(state.threads).length,
     pagesRead: state.pagesRead,
@@ -1801,7 +2135,7 @@ function firstFailure(
 ): Blocked | null {
   // 1. checks
   if (detail.checks.failing > 0) {
-    const names = state.checks
+    const names = state.judgedChecks
       .filter((c) => c.kind === 'failing')
       .map((c) => c.name)
       .join(', ');
@@ -1811,7 +2145,7 @@ function firstFailure(
     };
   }
   if (detail.checks.pending > 0) {
-    const names = state.checks
+    const names = state.judgedChecks
       .filter((c) => c.kind === 'pending')
       .map((c) => c.name)
       .join(', ');
